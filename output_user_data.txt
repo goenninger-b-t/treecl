@@ -1,0 +1,17 @@
+Triage Rust REPL v0.1.0
+Type :q to quit.
+> #<Var: data>
+> Starting Iterated Search (Gens=10, Steps/Gen=100, Pop=5)
+Gen 1: ..... Best: Post=-3.32 n
+Gen 2: ..... Best: Post=-3.32 n
+Gen 3: ..... Best: Post=-3.32 n
+Gen 4: ..... Best: Post=-3.32 n
+Gen 5: ..... Best: Post=-3.32 n
+Gen 6: ..... Best: Post=-3.32 n
+Gen 7: ..... Best: Post=-3.32 n
+Gen 8: ..... Best: Post=-3.32 n
+Gen 9: ..... Best: Post=-3.32 n
+Gen 10: ..... Best: Post=-3.32 n
+(n n ((#<Prim:Cons> n) ((#<Prim:Cons> n) ((#<Prim:Cons> n) ((#<Prim:Cons> n) n)))))
+Steps: 6
+> 

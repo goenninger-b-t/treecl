@@ -1,0 +1,4 @@
+;; User Reproduce Case
+(def data (cons (cons 10 20) n))
+(search-step data n n 1)
+;; EXPECT: Found 1 tasks

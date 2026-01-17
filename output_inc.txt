@@ -1,0 +1,19 @@
+Triage Rust REPL v0.1.0
+Type :q to quit.
+> #<Var: n1>
+> #<Var: n2>
+> #<Var: t1>
+> #<Var: data>
+> #<Var: inc>
+> Parse error: Unexpected EOF
+> #<Var: p>
+> Parse error: Unexpected EOF
+> Parse error: Unexpected EOF
+> Parse error: Unexpected EOF
+> Parse error: Unexpected EOF
+> Parse error: Unexpected EOF
+> Parse error: Unexpected EOF
+> Parse error: Unexpected EOF
+> (#<Prim:Add> (n (n n)) (n (n n)))
+Steps: 2
+> 

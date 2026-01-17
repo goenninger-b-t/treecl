@@ -1,0 +1,2 @@
+(def data (cons (cons 10 20) n))
+(search-step data n n 1000)

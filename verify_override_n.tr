@@ -1,0 +1,4 @@
+
+(def my_nil (take 0 (repeat 1)))
+(def data (cons (cons 10 20) my_nil))
+(search-step data n n 100)

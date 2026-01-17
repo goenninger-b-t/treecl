@@ -1,0 +1,3 @@
+(def t1 (cons 1 (cons 2 n)))
+(def data (cons t1 n))
+(search-step data n n 5000)

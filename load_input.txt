@@ -1,0 +1,4 @@
+:load "smoke.tr"
+test
+list
+:q

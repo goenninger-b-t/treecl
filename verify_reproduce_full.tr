@@ -1,0 +1,29 @@
+(def data 
+  (cons (cons 10 20)
+        (cons (cons 20 30)
+              (cons (cons 100 110) n))))
+
+(def abs (fn x (if (neg? x) (* -1 x) x)))
+
+(def scorer 
+  (fn t 
+    (fn a 
+      (fn p 
+        (fn i
+          (if (= (abs (- t a)) 0)
+            (/ 1000 (+ 1 (size p)))
+            (- 0 (+ 
+              (if (number? a)
+                (abs (- t a))
+                10000) 
+              (size p)
+              (if (contains? p first) 0 10000)
+              (if (contains? p rest) 0 10000)
+              (if (contains? p +) 0 10000)
+            ))))))))
+
+(def p1 n)
+(def p2 (fn x (+ x 1))) 
+(def pop-manual (cons p1 (cons p1 (cons p2 n))))
+
+(search-step data scorer pop-manual 500)

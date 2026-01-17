@@ -1,0 +1,37 @@
+(def a (n 10))   ;; Stem(10)
+(def t 20)
+(def n_val n)
+
+(def diff (- t a)) ;; Should be stuck
+(def abs_diff (abs diff)) ;; Stuck
+(def eq_zero (= abs_diff 0)) ;; Should be False (0)
+
+;; Term 1: If number?
+(def is_num (number? a)) ;; False (0)
+(def term1 (if is_num abs_diff 10000)) ;; Should be 10000
+
+;; Term 2: Size
+(def term2 (size n_val)) ;; 1
+
+;; Term 3: Contains checks
+(def term3 (if (contains? n_val first) 0 10000)) ;; 10000
+(def term4 (if (contains? n_val rest) 0 10000)) ;; 10000
+(def term5 (if (contains? n_val +) 0 10000)) ;; 10000
+
+;; Sum
+(def sum (+ term1 term2 term3 term4 term5))
+
+;; Final score
+(def final_score (- 0 sum))
+
+;; Condition check
+(def cond_res (if eq_zero 500 final_score))
+
+a
+diff
+eq_zero
+term1
+term2
+sum
+final_score
+cond_res

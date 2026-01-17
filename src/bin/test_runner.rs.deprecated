@@ -1,0 +1,104 @@
+use std::fs;
+use std::path::Path;
+use std::io::{self, Write};
+use triage_rs::arena::Graph;
+use triage_rs::engine;
+use triage_rs::parser::Parser;
+use std::collections::HashMap;
+
+fn main() -> io::Result<()> {
+    let test_dir = Path::new("tests/reference");
+    let mut entries: Vec<_> = fs::read_dir(test_dir)?
+        .filter_map(|res| res.ok())
+        .map(|dir| dir.path())
+        .filter(|path| path.extension().map_or(false, |ext| ext == "tr"))
+        .collect();
+
+    entries.sort();
+
+    let mut failed = 0;
+    
+    println!("Running Triage Test Suite...");
+    
+    for path in entries {
+        print!("Testing {:?} ... ", path.file_name().unwrap());
+        io::stdout().flush()?;
+        
+        let code = fs::read_to_string(&path)?;
+        
+        // Setup Engine (similar to main.rs)
+        let mut g = Graph::new();
+        let mut env = HashMap::new();
+        // Just use default env logic setup - ideally refactored from main but for now simplified
+        // We'll trust the verify scripts don't need obscure main.rs aliases if we use core
+        // Actually, tests rely on main.rs prelude/primitives.
+        // We really should link against main's setup if possible, or duplicate it.
+        // Duplication is safer for now to ensure isolation, or we can refactor main later.
+        
+        match run_test(&mut g, &mut env, &code) {
+            Ok(_) => println!("OK"),
+            Err(e) => {
+                println!("FAILED: {}", e);
+                failed += 1;
+            }
+        }
+    }
+    
+    if failed > 0 {
+        println!("\n{} tests failed.", failed);
+        std::process::exit(1);
+    } else {
+        println!("\nAll tests passed.");
+        Ok(())
+    }
+}
+
+fn run_test(g: &mut Graph, env: &mut HashMap<String, triage_rs::arena::NodeId>, code: &str) -> Result<(), String> {
+    // Write code to temporary file
+    let tmp_file = "tests/temp_test.tr";
+    let mut f = fs::File::create(tmp_file).map_err(|e| e.to_string())?;
+    f.write_all(code.as_bytes()).map_err(|e| e.to_string())?;
+    
+    // Invoke cargo run with piped stdin
+    use std::process::{Command, Stdio};
+    use std::io::Write as IoWrite;
+    
+    let mut child = Command::new("cargo")
+        .args(&["run", "--release"]) // No file arg, just REPL
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+        
+    {
+        let stdin = child.stdin.as_mut().ok_or("Failed to open stdin")?;
+        stdin.write_all(code.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        
+    if !output.status.success() {
+        return Err(format!("Process failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Check for "Parse error" or "Error" in output
+    if stdout.contains("Parse error") || stdout.contains("Error:") {
+         return Err(format!("Runtime error in output:\n{}", stdout));
+    }
+
+    // Verify expected output if present in comments
+    // Format: ;; EXPECT: <string>
+    for line in code.lines() {
+        if let Some(pos) = line.find(";; EXPECT: ") {
+            let expected = &line[pos + 11..].trim();
+            if !stdout.contains(expected) {
+                return Err(format!("Missing expected output: '{}'\nActual output:\n{}", expected, stdout));
+            }
+        }
+    }
+
+    Ok(())
+}

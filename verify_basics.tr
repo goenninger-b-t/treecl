@@ -1,0 +1,15 @@
+(def sub_neg (- 0 100))
+(def eq_false (= 10 0))
+(def eq_true (= 10 10))
+(def if_check_false (if eq_false 1 2))
+(def if_check_true (if eq_true 1 2))
+(def call_n (n 10))
+(def is_num_check (number? call_n))
+
+sub_neg
+eq_false
+eq_true
+if_check_false
+if_check_true
+call_n
+is_num_check

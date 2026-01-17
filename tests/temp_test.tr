@@ -1,0 +1,13 @@
+;; Verify n and data
+n
+;; EXPECT: n
+
+(cons n n)
+;; EXPECT: (n n)
+
+(def data 
+  (cons (cons 10 20)
+        (cons (cons 20 30)
+              (cons (cons 100 110) n))))
+data
+;; EXPECT: Found 1 tasks

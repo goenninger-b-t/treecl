@@ -1,0 +1,30 @@
+;; Cons Behavior
+(def p (cons 10 20))
+p
+;; EXPECT: (10 20)
+
+(first p)
+;; EXPECT: 10
+
+(rest p)
+;; EXPECT: 20
+
+;; List Behavior
+(def l (cons (cons 1 2) n))
+l
+;; EXPECT: ((1 2))
+
+(def l_rest (rest l))
+l_rest
+;; EXPECT: n
+
+(first l)
+;; EXPECT: (1 2)
+
+(first (rest l))
+;; EXPECT: 2
+
+;; Search Extraction (The Bug)
+;; Should find 1 task (task=(1, 2))
+(search-step l n n 1)
+;; EXPECT: Found 1 tasks

@@ -1,0 +1,20 @@
+(def assert (fn val (fn expected (fn msg (if (= val expected) "PASS" (cons "FAIL" (cons msg (cons "Expected" (cons expected (cons "Got" val)))))))))
+(def test_float_parse (assert 3.14 3.14 "Float Parse"))
+(def test_arith (assert (+ 1.5 2.5) 4.0 "Float Add"))
+(def test_poly (assert (+ 1 2.5) 3.5 "Poly Add"))
+(def test_neg (assert (neg? -1.5) (neg? -1) "Float Neg?"))
+(def res_floor (floor 3.6))
+(def test_floor (assert res_floor 3.0 "Floor"))
+(def res_int (float->int 3.6))
+(def test_cast (assert res_int 3 "Float->Int"))
+(def test_is_float (assert (float? 3.14) (neg? -1) "Is Float"))
+(def test_is_num (assert (number? 3.14) (number? 1) "Is Number"))
+res_floor
+test_float_parse
+test_arith
+test_poly
+test_neg
+test_floor
+test_cast
+test_is_float
+test_is_num
