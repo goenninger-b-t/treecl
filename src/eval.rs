@@ -10,6 +10,7 @@ use crate::clos::MetaObjectProtocol;
 use crate::conditions::ConditionSystem;
 use crate::arrays::ArrayStore;
 use crate::readtable::Readtable;
+use crate::streams::{StreamManager, StreamId};
 use std::collections::HashMap;
 
 /// Environment for lexical bindings
@@ -197,6 +198,12 @@ pub struct Interpreter {
     pub arrays: ArrayStore,
     pub readtable: Readtable,
     
+    // Streams
+    pub streams: StreamManager,
+    pub standard_output: StreamId,
+    pub standard_input: StreamId,
+    pub error_output: StreamId,
+    
     // GC orchestration
     pub gc_threshold: usize,  // Trigger GC after this many allocations
 }
@@ -249,6 +256,42 @@ impl Interpreter {
         symbols.set_symbol_value(triage_sym, nil_node);
         symbols.export_symbol(triage_sym);
         
+        // Initialize streams
+        let streams = StreamManager::new();
+        let standard_input = streams.stdin_id();
+        let standard_output = streams.stdout_id();
+        let error_output = streams.stderr_id();
+        
+        // Create stream nodes for special variables
+        let stdin_node = arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(standard_input.0)));
+        let stdout_node = arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(standard_output.0)));
+        let stderr_node = arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(error_output.0)));
+        
+        // Bind *STANDARD-INPUT*, *STANDARD-OUTPUT*, *ERROR-OUTPUT*
+        let stdin_sym = symbols.intern_in("*STANDARD-INPUT*", PackageId(1));
+        let stdout_sym = symbols.intern_in("*STANDARD-OUTPUT*", PackageId(1));
+        let stderr_sym = symbols.intern_in("*ERROR-OUTPUT*", PackageId(1));
+        let trace_sym = symbols.intern_in("*TRACE-OUTPUT*", PackageId(1));
+        let query_sym = symbols.intern_in("*QUERY-IO*", PackageId(1));
+        let debug_sym = symbols.intern_in("*DEBUG-IO*", PackageId(1));
+        let terminal_sym = symbols.intern_in("*TERMINAL-IO*", PackageId(1));
+        
+        symbols.set_symbol_value(stdin_sym, stdin_node);
+        symbols.set_symbol_value(stdout_sym, stdout_node);
+        symbols.set_symbol_value(stderr_sym, stderr_node);
+        symbols.set_symbol_value(trace_sym, stdout_node);
+        symbols.set_symbol_value(query_sym, stdout_node);
+        symbols.set_symbol_value(debug_sym, stdout_node);
+        symbols.set_symbol_value(terminal_sym, stdout_node);
+        
+        symbols.export_symbol(stdin_sym);
+        symbols.export_symbol(stdout_sym);
+        symbols.export_symbol(stderr_sym);
+        symbols.export_symbol(trace_sym);
+        symbols.export_symbol(query_sym);
+        symbols.export_symbol(debug_sym);
+        symbols.export_symbol(terminal_sym);
+        
         Self {
             arena,
             symbols,
@@ -265,6 +308,10 @@ impl Interpreter {
             conditions,
             arrays,
             readtable,
+            streams,
+            standard_output,
+            standard_input,
+            error_output,
             gc_threshold: 10000,  // Default: GC after 10k allocations
         }
     }
@@ -1009,7 +1056,7 @@ impl Interpreter {
     }
 
     /// Apply a function to arguments
-    fn apply_function(&mut self, func: NodeId, args: NodeId, env: &Environment) -> EvalResult {
+    pub fn apply_function(&mut self, func: NodeId, args: NodeId, env: &Environment) -> EvalResult {
         let func_node = self.arena.get_unchecked(func).clone();
         
         match func_node {
@@ -1044,10 +1091,58 @@ impl Interpreter {
                     current = rest;
                 }
                 
-                Ok(result)
+                Ok(self.try_reduce_primitive(result, env))
             }
         }
     }
+
+    /// Try to reduce a "stuck" application if the head is a primitive symbol
+    fn try_reduce_primitive(&mut self, root: NodeId, _env: &Environment) -> NodeId {
+        // 1. Flatten the spine: ((f a) b) -> [f, a, b]
+        let mut spine = Vec::new();
+        let mut current = root;
+        while let Node::Fork(l, r) = self.arena.get_unchecked(current).clone() {
+            spine.push(r);
+            current = l;
+        }
+        spine.push(current); // Head
+        spine.reverse(); // [Head, arg1, arg2, ...]
+        
+        if spine.len() < 2 {
+            return root;
+        }
+        
+        let head = spine[0];
+        if let Some(sym) = self.node_to_symbol(head) {
+             // Check primitives
+             if let Some(&prim_fn) = self.primitives.get(&sym) {
+                 // We have a primitive!
+                 let raw_args = &spine[1..];
+                 
+                 // Evaluate arguments (Force strictness for primitives)
+                 // Compiled code reduction is lazy (Normal Order), but primitives expect values.
+                 let mut evaluated_args = Vec::with_capacity(raw_args.len());
+                 for &arg in raw_args {
+                     // We use the passed environment. For compiled code, this usually works
+                     // as free variables are globals.
+                     // Use reduce instead of eval because args are Tree Calculus terms (Forks), not Lisp lists.
+                     let val = crate::search::reduce(&mut self.arena, arg, &mut self.ctx);
+                     evaluated_args.push(val);
+                 }
+                 
+                 
+                 match prim_fn(self, &evaluated_args) {
+                      Ok(res) => return res,
+                      Err(_) => return root, // Fallback on error (keep stuck state)
+                 }
+             }
+        }
+        
+        root
+    }
+
+
+
     
     /// Apply a closure to arguments
     fn apply_closure(&mut self, closure: &Closure, args: NodeId, env: &Environment) -> EvalResult {

@@ -1,116 +1,183 @@
-use crate::arena::{Graph, NodeId};
-use crate::arena::Node::{App, Leaf};
-use smallvec::smallvec;
+use crate::arena::{Arena, Node};
+use crate::types::{NodeId, OpaqueValue};
+use crate::symbol::{SymbolId, SymbolTable};
+use crate::eval::{Interpreter};
 
-// Bracket Expression Types
+
+// Bracket Expression to handle intermediate compilation state
 #[derive(Debug, Clone)]
 enum BExpr {
-    Var(String),
+    Var(SymbolId),
     Const(NodeId),
     App(Box<BExpr>, Box<BExpr>),
 }
 
-// Constructors matching triage/core.clj logic
-
-
-
-fn bexpr_k(g: &mut Graph, u: BExpr) -> BExpr {
-    // K u = ((n n) u)
-    // k_combinator = (n n)
-    let n = g.add(Leaf);
-    let nn = g.add(App { func: n, args: smallvec![n] });
-    let k_node = BExpr::Const(nn);
-    BExpr::App(Box::new(k_node), Box::new(u))
-}
-
-fn bexpr_s(g: &mut Graph, u: BExpr, v: BExpr) -> BExpr {
-    // S u v = ((n (n v)) u)  -- Using D-rule: D v u = u (v)
-    // D v u x = u x (v x) = S u v x
-    let n = g.add(Leaf);
-    let n_node = BExpr::Const(n);
-    // (n v)
-    let nv = BExpr::App(Box::new(n_node.clone()), Box::new(v));
-    // (n (n v))
-    let nnv = BExpr::App(Box::new(n_node), Box::new(nv));
-    // ((n (n v)) u)
-    BExpr::App(Box::new(nnv), Box::new(u))
-}
-
-fn bexpr_i(g: &mut Graph) -> BExpr {
-    // I = S (n n) n
-    let n = g.add(Leaf);
-    let nn = g.add(App { func: n, args: smallvec![n] });
-    let nn_expr = BExpr::Const(nn);
-    let n_expr = BExpr::Const(n);
-    bexpr_s(g, nn_expr, n_expr)
-}
-
-fn bexpr_occurs(name: &str, e: &BExpr) -> bool {
-    match e {
-        BExpr::Var(n) => n == name,
-        BExpr::Const(_) => false,
-        BExpr::App(l, r) => bexpr_occurs(name, l) || bexpr_occurs(name, r),
+impl BExpr {
+    fn occurs(&self, sym: SymbolId) -> bool {
+        match self {
+            BExpr::Var(s) => *s == sym,
+            BExpr::Const(_) => false,
+            BExpr::App(l, r) => l.occurs(sym) || r.occurs(sym),
+        }
     }
 }
 
-fn bexpr_abstract(g: &mut Graph, name: &str, e: BExpr) -> BExpr {
-    if !bexpr_occurs(name, &e) {
-        bexpr_k(g, e)
-    } else {
-        match e {
-            BExpr::Var(_) => bexpr_i(g), // If occurs, must be the var itself
-            BExpr::App(l, r) => {
-                // Optimization: eta-reduction-like check?
-                // Clojure: if r is var and name==r.name and !occurs(name, l) -> l
-                if let BExpr::Var(rn) = &*r {
-                    if rn == name && !bexpr_occurs(name, &*l) {
-                        return *l;
+pub struct Compiler<'a> {
+    arena: &'a mut Arena,
+    symbols: &'a SymbolTable,
+    nil_node: NodeId,
+}
+
+impl<'a> Compiler<'a> {
+    pub fn new(interp: &'a mut Interpreter) -> Self {
+        Self {
+            arena: &mut interp.arena,
+            symbols: &interp.symbols,
+            nil_node: interp.nil_node,
+        }
+    }
+
+    fn make_leaf(&mut self) -> NodeId {
+        self.nil_node
+    }
+
+    fn make_app(&mut self, f: NodeId, a: NodeId) -> NodeId {
+        self.arena.alloc(Node::Fork(f, a))
+    }
+
+    fn bexpr_i(&mut self) -> BExpr {
+        // I = △ △
+        // In search.rs: ((△ △) y) -> y
+        let n = self.make_leaf();
+        let nn = self.make_app(n, n);
+        BExpr::Const(nn)
+    }
+
+    fn bexpr_k(&mut self, u: BExpr) -> BExpr {
+        // K u = △ (△ u)
+        // In search.rs: ((△ (△ u)) y) -> u
+        let n = self.make_leaf();
+        let n_node = BExpr::Const(n);
+        // (△ u)
+        let nu = BExpr::App(Box::new(n_node.clone()), Box::new(u));
+        // (△ (△ u))
+        BExpr::App(Box::new(n_node), Box::new(nu))
+    }
+
+    fn bexpr_s(&mut self, z: BExpr, w: BExpr) -> BExpr {
+        // S z w = △ (△ z w) = △ ((△ z) w)
+        // In search.rs: △ (△ z w) y -> ((z y) (w y))
+        let n = self.make_leaf();
+        let n_node = BExpr::Const(n);
+        
+        // (△ z)
+        let nz = BExpr::App(Box::new(n_node.clone()), Box::new(z));
+        // ((△ z) w)
+        let nzw = BExpr::App(Box::new(nz), Box::new(w));
+        // (△ ((△ z) w))
+        let op = BExpr::App(Box::new(n_node), Box::new(nzw));
+        op
+    }
+
+    fn abstract_var(&mut self, name: SymbolId, e: BExpr) -> BExpr {
+        if !e.occurs(name) {
+            self.bexpr_k(e)
+        } else {
+            match e {
+                BExpr::Var(_) => self.bexpr_i(), // Must be the var itself if occurs
+                BExpr::App(l, r) => {
+                    // Optimization: eta-reduction \x. f x -> f if x not free in f
+                    if let BExpr::Var(v_sym) = *r {
+                        if v_sym == name && !l.occurs(name) {
+                            return *l;
+                        }
                     }
+                    
+                    let al = self.abstract_var(name, *l);
+                    let ar = self.abstract_var(name, *r);
+                    self.bexpr_s(al, ar)
                 }
-                let al = bexpr_abstract(g, name, *l);
-                let ar = bexpr_abstract(g, name, *r);
-                bexpr_s(g, al, ar)
+                BExpr::Const(_) => self.bexpr_k(e), // Should be covered by !occurs
             }
-            BExpr::Const(_) => bexpr_k(g, e), // Should be covered by !occurs
+        }
+    }
+
+    // Convert an AST node (from eval) to BExpr
+    fn compile_to_bexpr(&mut self, expr: NodeId, params: &[SymbolId]) -> Result<BExpr, String> {
+        let node = self.arena.get_unchecked(expr).clone();
+        match node {
+            Node::Leaf(val) => {
+                match val {
+                    OpaqueValue::Symbol(id) => {
+                        let sym_id = SymbolId(id);
+                        if params.contains(&sym_id) {
+                            Ok(BExpr::Var(sym_id))
+                        } else {
+                            // Free variable: resolve to value if possible, or keep as Const
+                            if let Some(val) = self.symbols.symbol_value(sym_id) {
+                                Ok(BExpr::Const(val))
+                            } else {
+                                Ok(BExpr::Const(expr))
+                            }
+                        }
+                    }
+                    _ => Ok(BExpr::Const(expr)),
+                }
+            }
+            Node::Stem(_) => Ok(BExpr::Const(expr)),
+            Node::Fork(_, _) => {
+                // Application (f x y ...) logic
+                // Check for proper list
+                let mut items = Vec::new();
+                let mut current = expr;
+                while let Node::Fork(h, t) = self.arena.get_unchecked(current).clone() {
+                    items.push(h);
+                    current = t;
+                }
+                if let Node::Leaf(OpaqueValue::Nil) = self.arena.get_unchecked(current) {
+                    if items.is_empty() {
+                        return Ok(BExpr::Const(self.nil_node));
+                    }
+                    
+                    // (f a b) -> ((f a) b)
+                    let func_expr = items[0];
+                    let mut curr_bexpr = self.compile_to_bexpr(func_expr, params)?;
+                    
+                    for arg in &items[1..] {
+                        let arg_bexpr = self.compile_to_bexpr(*arg, params)?;
+                        curr_bexpr = BExpr::App(Box::new(curr_bexpr), Box::new(arg_bexpr));
+                    }
+                    Ok(curr_bexpr)
+                } else {
+                     // Dotted list -> Treat as data constant?
+                     // Or error? compile only supports standard code lists.
+                     Ok(BExpr::Const(expr))
+                }
+            }
+        }
+    }
+
+    fn bexpr_to_node(&mut self, e: BExpr) -> Result<NodeId, String> {
+        match e {
+            BExpr::Const(n) => Ok(n),
+            BExpr::App(l, r) => {
+                let ln = self.bexpr_to_node(*l)?;
+                let rn = self.bexpr_to_node(*r)?;
+                Ok(self.make_app(ln, rn))
+            }
+            BExpr::Var(sym) => Err(format!("Unbound variable remaining after compilation: {:?}", sym)),
         }
     }
 }
 
-pub enum CompileTerm {
-    Var(String),
-    Const(NodeId),
-    App(Box<CompileTerm>, Box<CompileTerm>),
-    Lam(String, Box<CompileTerm>),
-}
-
-fn compile_to_bexpr(g: &mut Graph, t: CompileTerm) -> BExpr {
-    match t {
-        CompileTerm::Var(s) => BExpr::Var(s),
-        CompileTerm::Const(n) => BExpr::Const(n),
-        CompileTerm::App(f, a) => BExpr::App(
-            Box::new(compile_to_bexpr(g, *f)),
-            Box::new(compile_to_bexpr(g, *a))
-        ),
-        CompileTerm::Lam(name, body) => {
-            let body_bexpr = compile_to_bexpr(g, *body);
-            bexpr_abstract(g, &name, body_bexpr)
-        }
+pub fn compile_func(interp: &mut Interpreter, params: &[SymbolId], body: NodeId) -> Result<NodeId, String> {
+    let mut compiler = Compiler::new(interp);
+    let mut bexpr = compiler.compile_to_bexpr(body, params)?;
+    
+    // Abstract variables in reverse order (inner to outer)
+    for &param in params.iter().rev() {
+        bexpr = compiler.abstract_var(param, bexpr);
     }
-}
-
-fn bexpr_to_node(g: &mut Graph, e: BExpr) -> Result<NodeId, String> {
-    match e {
-        BExpr::Const(n) => Ok(n),
-        BExpr::App(l, r) => {
-            let ln = bexpr_to_node(g, *l)?;
-            let rn = bexpr_to_node(g, *r)?;
-            Ok(g.add(App { func: ln, args: smallvec![rn] }))
-        }
-        BExpr::Var(name) => Err(format!("Unbound variable after compilation: {}", name)),
-    }
-}
-
-pub fn compile(g: &mut Graph, t: CompileTerm) -> Result<NodeId, String> {
-    let bexpr = compile_to_bexpr(g, t);
-    bexpr_to_node(g, bexpr)
+    
+    compiler.bexpr_to_node(bexpr)
 }

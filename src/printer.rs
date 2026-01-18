@@ -205,6 +205,9 @@ impl<'a> Printer<'a> {
             OpaqueValue::BigInt(n) => {
                 self.output.push_str(&n.to_string());
             }
+            OpaqueValue::StreamHandle(id) => {
+                self.output.push_str(&format!("#<stream:{}>", id));
+            }
         }
     }
     
@@ -333,6 +336,75 @@ pub fn format(arena: &Arena, symbols: &SymbolTable, control: &str, args: &[NodeI
     }
     
     output
+}
+
+/// Structural Tree Printer (n / (l r))
+struct TreePrinter<'a> {
+    arena: &'a Arena,
+    output: String,
+    depth: usize,
+    max_depth: usize,
+}
+
+impl<'a> TreePrinter<'a> {
+    fn new(arena: &'a Arena) -> Self {
+        Self {
+            arena,
+            output: String::new(),
+            depth: 0,
+            max_depth: 1000,
+        }
+    }
+
+    fn print(&mut self, node: NodeId) {
+        if self.depth > self.max_depth {
+            self.output.push_str("...");
+            return;
+        }
+        self.depth += 1;
+
+        match self.arena.get_unchecked(node) {
+            Node::Leaf(val) => {
+                if let OpaqueValue::Nil = val {
+                    self.output.push('n');
+                } else {
+                    // Use standard printer for other values
+                    // We need a temporary printer or just format it
+                    // Simple approach: use the primitive printer helpers or just debug format
+                    // Re-using Printer? We don't have easy access to symbols/options here.
+                    // But we can just use a simple formatter.
+                    match val {
+                        OpaqueValue::Symbol(id) => { self.output.push_str(&format!("sym:{}", id)); } // We don't have symbol table here easily?
+                        // Wait, tree_format signature is just (arena, node).
+                        // If we want symbols, we need symbol table.
+                        // Let's just print a generic placeholder or the raw value if simple.
+                        OpaqueValue::Integer(i) => self.output.push_str(&i.to_string()),
+                        _ => self.output.push_str("atom"),
+                    }
+                }
+            }
+            Node::Stem(inner) => {
+                // Stem is effectively (n inner)
+                self.output.push_str("(n ");
+                self.print(*inner);
+                self.output.push(')');
+            }
+            Node::Fork(l, r) => {
+                self.output.push('(');
+                self.print(*l);
+                self.output.push(' ');
+                self.print(*r);
+                self.output.push(')');
+            }
+        }
+        self.depth -= 1;
+    }
+}
+
+pub fn tree_format(arena: &Arena, node: NodeId) -> String {
+    let mut p = TreePrinter::new(arena);
+    p.print(node);
+    p.output
 }
 
 #[cfg(test)]

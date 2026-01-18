@@ -79,6 +79,7 @@ pub fn register_primitives(interp: &mut Interpreter) {
     interp.register_primitive("PRINT", cl, prim_print);
     interp.register_primitive("PRINC", cl, prim_princ);
     interp.register_primitive("TERPRI", cl, prim_terpri);
+    interp.register_primitive("FORMAT", cl, prim_format);
     
     // CLOS
     interp.register_primitive("FIND-CLASS", cl, prim_find_class);
@@ -103,6 +104,21 @@ pub fn register_primitives(interp: &mut Interpreter) {
     interp.register_primitive("SET-MACRO-CHARACTER", cl, prim_set_macro_character);
     interp.register_primitive("GET-MACRO-CHARACTER", cl, prim_get_macro_character);
     interp.register_primitive("SET-SYNTAX-FROM-CHAR", cl, prim_set_syntax_from_char);
+    
+    // Tools
+    interp.register_primitive("COMPILE", cl, prim_compile);
+    interp.register_primitive("TREE-STRING", cl, prim_tree_string);
+    interp.register_primitive("FUNCALL", cl, prim_funcall);
+    interp.register_primitive("APPLY", cl, prim_apply);
+    
+    // Streams
+    interp.register_primitive("MAKE-STRING-OUTPUT-STREAM", cl, prim_make_string_output_stream);
+    interp.register_primitive("GET-OUTPUT-STREAM-STRING", cl, prim_get_output_stream_string);
+    interp.register_primitive("MAKE-STRING-INPUT-STREAM", cl, prim_make_string_input_stream);
+    interp.register_primitive("CLOSE", cl, prim_close);
+    interp.register_primitive("WRITE-STRING", cl, prim_write_string);
+    interp.register_primitive("WRITE-CHAR", cl, prim_write_char);
+    interp.register_primitive("FRESH-LINE", cl, prim_fresh_line);
 }
 
 // ============================================================================
@@ -546,12 +562,32 @@ fn prim_not(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
 // I/O Primitives
 // ============================================================================
 
+/// Get the current output stream from *STANDARD-OUTPUT*
+fn get_current_output_stream(interp: &Interpreter) -> crate::streams::StreamId {
+    use crate::symbol::PackageId;
+    
+    // Look up *STANDARD-OUTPUT* symbol in COMMON-LISP package
+    if let Some(pkg) = interp.symbols.get_package(PackageId(1)) {
+        if let Some(sym) = pkg.find_symbol("*STANDARD-OUTPUT*") {
+            if let Some(node) = interp.symbols.symbol_value(sym) {
+                if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(node) {
+                    return crate::streams::StreamId(*id);
+                }
+            }
+        }
+    }
+    // Fallback to the fixed stdout
+    interp.standard_output
+}
+
 fn prim_print(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     use crate::printer::print_to_string;
     
     if let Some(&arg) = args.first() {
         let s = print_to_string(&interp.arena, &interp.symbols, arg);
-        println!("{}", s);
+        let out_id = get_current_output_stream(interp);
+        let _ = interp.streams.write_string(out_id, &s);
+        let _ = interp.streams.write_newline(out_id);
         Ok(arg)
     } else {
         Ok(interp.nil_node)
@@ -563,7 +599,8 @@ fn prim_princ(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     
     if let Some(&arg) = args.first() {
         let s = princ_to_string(&interp.arena, &interp.symbols, arg);
-        print!("{}", s);
+        let out_id = get_current_output_stream(interp);
+        let _ = interp.streams.write_string(out_id, &s);
         Ok(arg)
     } else {
         Ok(interp.nil_node)
@@ -571,8 +608,422 @@ fn prim_princ(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
 }
 
 fn prim_terpri(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
-    println!();
+    let out_id = get_current_output_stream(interp);
+    let _ = interp.streams.write_newline(out_id);
     Ok(interp.nil_node)
+}
+
+/// (format destination control-string &rest args)
+/// Implements common CL format directives:
+/// ~A - Aesthetic (princ-style, no escaping)
+/// ~S - Standard (prin1-style, with escaping)
+/// ~D - Decimal integer
+/// ~B - Binary integer
+/// ~O - Octal integer
+/// ~X - Hexadecimal integer
+/// ~F - Floating point
+/// ~% - Newline
+/// ~& - Fresh line (newline if not at column 0)
+/// ~~ - Literal tilde
+fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    use crate::printer::{print_to_string, princ_to_string};
+    
+    if args.len() < 2 {
+        return interp.signal_error("FORMAT requires at least 2 arguments (destination control-string)");
+    }
+    
+    let dest = args[0];
+    let control_string_node = args[1];
+    let format_args = &args[2..];
+    
+    // Get the control string
+    let control_string = match interp.arena.get_unchecked(control_string_node) {
+        Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+        _ => return interp.signal_error("FORMAT: control-string must be a string"),
+    };
+    
+    // Process the format string
+    let mut result = String::new();
+    let mut arg_index = 0;
+    let chars: Vec<char> = control_string.chars().collect();
+    let mut i = 0;
+    
+    while i < chars.len() {
+        if chars[i] == '~' {
+            i += 1;
+            if i >= chars.len() {
+                return interp.signal_error("FORMAT: unexpected end of control string after ~");
+            }
+            
+            // Parse optional parameters (mincol, colinc, minpad, padchar)
+            // For simplicity, we skip complex parameter parsing and handle basic directives
+            let mut colon = false;
+            let mut at_sign = false;
+            
+            // Check for modifiers
+            while i < chars.len() && (chars[i] == ':' || chars[i] == '@') {
+                if chars[i] == ':' { colon = true; }
+                if chars[i] == '@' { at_sign = true; }
+                i += 1;
+            }
+            
+            if i >= chars.len() {
+                return interp.signal_error("FORMAT: unexpected end of control string");
+            }
+            
+            let directive = chars[i].to_ascii_uppercase();
+            
+            match directive {
+                'A' => {
+                    // Aesthetic output (princ)
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~A");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    
+                    if colon && matches!(interp.arena.get_unchecked(arg), Node::Leaf(OpaqueValue::Nil)) {
+                        result.push_str("()");
+                    } else {
+                        result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg));
+                    }
+                }
+                'S' => {
+                    // Standard output (prin1)
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~S");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    result.push_str(&print_to_string(&interp.arena, &interp.symbols, arg));
+                }
+                'D' => {
+                    // Decimal integer
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~D");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            if at_sign && *n >= 0 {
+                                result.push('+');
+                            }
+                            result.push_str(&n.to_string());
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                'B' => {
+                    // Binary integer
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~B");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            result.push_str(&format!("{:b}", n));
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                'O' => {
+                    // Octal integer
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~O");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            result.push_str(&format!("{:o}", n));
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                'X' => {
+                    // Hexadecimal integer
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~X");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            result.push_str(&format!("{:x}", n));
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                'F' => {
+                    // Floating point
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~F");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Float(f)) => {
+                            result.push_str(&format!("{}", f));
+                        }
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            result.push_str(&format!("{}.0", n));
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                'C' => {
+                    // Character
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~C");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            if let Some(c) = char::from_u32(*n as u32) {
+                                result.push(c);
+                            }
+                        }
+                        Node::Leaf(OpaqueValue::String(s)) => {
+                            if let Some(c) = s.chars().next() {
+                                result.push(c);
+                            }
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                '%' => {
+                    // Newline
+                    result.push('\n');
+                }
+                '&' => {
+                    // Fresh line (for simplicity, just add newline if result doesn't end with one)
+                    if !result.ends_with('\n') {
+                        result.push('\n');
+                    }
+                }
+                '~' => {
+                    // Literal tilde
+                    result.push('~');
+                }
+                'R' => {
+                    // Radix (basic support: just decimal for now)
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~R");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    match interp.arena.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => {
+                            result.push_str(&n.to_string());
+                        }
+                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                    }
+                }
+                '*' => {
+                    // Goto (skip/backup args)
+                    if colon {
+                        // ~:* - backup one argument
+                        if arg_index > 0 {
+                            arg_index -= 1;
+                        }
+                    } else if at_sign {
+                        // ~@* - goto absolute position (not fully implemented)
+                        arg_index = 0;
+                    } else {
+                        // ~* - skip one argument
+                        if arg_index < format_args.len() {
+                            arg_index += 1;
+                        }
+                    }
+                }
+                '?' => {
+                    // Recursive format (not fully implemented - treat as ~A)
+                    if arg_index >= format_args.len() {
+                        return interp.signal_error("FORMAT: not enough arguments for ~?");
+                    }
+                    let arg = format_args[arg_index];
+                    arg_index += 1;
+                    result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg));
+                }
+                _ => {
+                    // Unknown directive - just output it
+                    result.push('~');
+                    result.push(directive);
+                }
+            }
+        } else {
+            result.push(chars[i]);
+        }
+        i += 1;
+    }
+    
+    // Handle destination
+    let is_nil = matches!(interp.arena.get_unchecked(dest), Node::Leaf(OpaqueValue::Nil));
+    let is_t = if let Node::Leaf(OpaqueValue::Symbol(id)) = interp.arena.get_unchecked(dest) {
+        SymbolId(*id) == interp.t_sym
+    } else {
+        false
+    };
+    let stream_id = if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(dest) {
+        Some(crate::streams::StreamId(*id))
+    } else {
+        None
+    };
+    
+    if is_nil {
+        // Return the formatted string
+        Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::String(result))))
+    } else if is_t {
+        // Output to standard output
+        let out_id = interp.standard_output;
+        let _ = interp.streams.write_string(out_id, &result);
+        Ok(interp.nil_node)
+    } else if let Some(id) = stream_id {
+        // Output to specified stream
+        let _ = interp.streams.write_string(id, &result);
+        Ok(interp.nil_node)
+    } else {
+        // For unknown destinations, output to stdout
+        let out_id = interp.standard_output;
+        let _ = interp.streams.write_string(out_id, &result);
+        Ok(interp.nil_node)
+    }
+}
+
+// ============================================================================
+// Stream Primitives
+// ============================================================================
+
+/// (make-string-output-stream) -> stream
+fn prim_make_string_output_stream(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
+    use crate::streams::Stream;
+    
+    let stream = Stream::StringOutputStream { buffer: String::new() };
+    let id = interp.streams.alloc(stream);
+    Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))))
+}
+
+/// (get-output-stream-string stream) -> string
+fn prim_get_output_stream_string(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(arg) {
+            let stream_id = crate::streams::StreamId(*id);
+            if let Some(s) = interp.streams.get_output_stream_string(stream_id) {
+                return Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::String(s))));
+            } else {
+                return interp.signal_error("GET-OUTPUT-STREAM-STRING: not a string output stream");
+            }
+        }
+    }
+    interp.signal_error("GET-OUTPUT-STREAM-STRING requires a stream argument")
+}
+
+/// (make-string-input-stream string) -> stream
+fn prim_make_string_input_stream(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    use crate::streams::Stream;
+    
+    if let Some(&arg) = args.first() {
+        if let Node::Leaf(OpaqueValue::String(s)) = interp.arena.get_unchecked(arg) {
+            let stream = Stream::StringInputStream { 
+                buffer: s.clone(), 
+                position: 0 
+            };
+            let id = interp.streams.alloc(stream);
+            return Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))));
+        }
+    }
+    interp.signal_error("MAKE-STRING-INPUT-STREAM requires a string argument")
+}
+
+/// (close stream) -> t
+fn prim_close(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(arg) {
+            let stream_id = crate::streams::StreamId(*id);
+            if interp.streams.close(stream_id) {
+                return Ok(interp.t_node);
+            }
+        }
+    }
+    Ok(interp.nil_node)
+}
+
+/// (write-string string &optional stream) -> string
+fn prim_write_string(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if args.is_empty() {
+        return interp.signal_error("WRITE-STRING requires at least 1 argument");
+    }
+    
+    let string_arg = args[0];
+    let stream_id = if args.len() > 1 {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(args[1]) {
+            crate::streams::StreamId(*id)
+        } else {
+            interp.standard_output
+        }
+    } else {
+        interp.standard_output
+    };
+    
+    if let Node::Leaf(OpaqueValue::String(s)) = interp.arena.get_unchecked(string_arg) {
+        let s_clone = s.clone();
+        let _ = interp.streams.write_string(stream_id, &s_clone);
+        Ok(string_arg)
+    } else {
+        use crate::printer::princ_to_string;
+        let s = princ_to_string(&interp.arena, &interp.symbols, string_arg);
+        let _ = interp.streams.write_string(stream_id, &s);
+        Ok(string_arg)
+    }
+}
+
+/// (write-char char &optional stream) -> char
+fn prim_write_char(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if args.is_empty() {
+        return interp.signal_error("WRITE-CHAR requires at least 1 argument");
+    }
+    
+    let char_arg = args[0];
+    let stream_id = if args.len() > 1 {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(args[1]) {
+            crate::streams::StreamId(*id)
+        } else {
+            interp.standard_output
+        }
+    } else {
+        interp.standard_output
+    };
+    
+    let c = match interp.arena.get_unchecked(char_arg) {
+        Node::Leaf(OpaqueValue::Integer(n)) => char::from_u32(*n as u32).unwrap_or('?'),
+        Node::Leaf(OpaqueValue::String(s)) => s.chars().next().unwrap_or('?'),
+        _ => '?',
+    };
+    
+    let _ = interp.streams.write_char(stream_id, c);
+    Ok(char_arg)
+}
+
+/// (fresh-line &optional stream) -> generalized-boolean
+fn prim_fresh_line(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    let stream_id = if !args.is_empty() {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(args[0]) {
+            crate::streams::StreamId(*id)
+        } else {
+            interp.standard_output
+        }
+    } else {
+        interp.standard_output
+    };
+    
+    match interp.streams.fresh_line(stream_id) {
+        Ok(true) => Ok(interp.t_node),
+        Ok(false) => Ok(interp.nil_node),
+        Err(_) => Ok(interp.nil_node),
+    }
 }
 
 // ============================================================================
@@ -1073,6 +1524,110 @@ fn extract_number(arena: &Arena, node: NodeId) -> NumVal {
         Node::Leaf(OpaqueValue::Float(f)) => NumVal::Float(*f),
         _ => NumVal::None,
     }
+}
+
+fn prim_compile(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        let node = interp.arena.get_unchecked(arg).clone();
+            
+        let target_closure = match node {
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                let sym = SymbolId(id);
+                if let Some(func_node) = interp.symbols.symbol_function(sym) {
+                    if let Node::Leaf(OpaqueValue::Closure(idx)) = interp.arena.get_unchecked(func_node) {
+                         Some(*idx)
+                    } else {
+                        return interp.signal_error("COMPILE: Symbol function is not a closure (maybe already compiled or primitive?)");
+                    }
+                } else {
+                     return interp.signal_error("COMPILE: Symbol has no function definition");
+                }
+            }
+            Node::Leaf(OpaqueValue::Closure(idx)) => {
+                Some(idx)
+            }
+            _ => {
+                return interp.signal_error("COMPILE: Argument must be a symbol or closure");
+            }
+        };
+        
+        if let Some(idx) = target_closure {
+             let (params, body) = {
+                 // Clone to avoid borrow conflict
+                 let closure = &interp.closures[idx as usize];
+                 (closure.params.clone(), closure.body)
+             };
+             
+             match crate::compiler::compile_func(interp, &params, body) {
+                 Ok(compiled_node) => return Ok(compiled_node),
+                 Err(e) => return interp.signal_error(&format!("Compilation failed: {}", e)),
+             }
+        }
+    }
+    
+    interp.signal_error("COMPILE: Invalid argument")
+}
+
+
+
+fn prim_tree_string(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        let s = crate::printer::tree_format(&interp.arena, arg);
+        Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::String(s))))
+    } else {
+        Err(crate::eval::ControlSignal::Error("TREE-STRING requires 1 argument".to_string()))
+    }
+}
+
+/// (funcall function arg1 arg2 ...)
+fn prim_funcall(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if args.is_empty() {
+        return Err(crate::eval::ControlSignal::Error("FUNCALL requires at least 1 argument".to_string()));
+    }
+    
+    let func = args[0];
+    let func_args = if args.len() > 1 {
+        interp.list(&args[1..])
+    } else {
+        interp.nil_node
+    };
+    
+    // We need an environment for apply_function.
+    // Primitives usually run in the current environment context, which is passed in?
+    // Wait, prim functions signature is (interp, args). No env.
+    // But apply_function takes env.
+    // We can pass a new empty environment or try to get current?
+    // Interpreter struct has ctx (EvalContext) but not Environment.
+    // Closures capture environment.
+    // Evaluated arguments are already values, so environment shouldn't matter for application unless it's a macro or special form that needs it?
+    // But apply_function takes it.
+    // Let's pass a new empty environment for now.
+    
+    let env = crate::eval::Environment::new();
+    interp.apply_function(func, func_args, &env)
+}
+
+/// (apply function arg1 ... argn-1 list)
+fn prim_apply(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+    if args.len() < 2 {
+         return Err(crate::eval::ControlSignal::Error("APPLY requires at least 2 arguments".to_string()));
+    }
+    
+    let func = args[0];
+    let last_arg = args[args.len() - 1]; // The list argument
+    
+    // Check if last_arg is a proper list?
+    // We don't strictly enforce proper list for Tree Calculus, just use it.
+    
+    // Construct argument list. 
+    // args[1..args.len()-1] are single arguments. last_arg is a list.
+    let mut final_args = last_arg;
+    for &arg in args[1..args.len()-1].iter().rev() {
+        final_args = interp.cons(arg, final_args);
+    }
+    
+    let env = crate::eval::Environment::new();
+    interp.apply_function(func, final_args, &env)
 }
 
 #[cfg(test)]

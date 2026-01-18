@@ -1,0 +1,26 @@
+(print "Testing Stream Variables...")
+
+;; Check that stream variables exist
+(print *standard-output*)
+(print *standard-input*)
+(print *error-output*)
+(print *trace-output*)
+(print *query-io*)
+
+;; Test rebinding *standard-output*
+(print "Testing output redirection...")
+(let ((capture (make-string-output-stream)))
+  (setq *standard-output* capture)
+  (print "This goes to the string stream")
+  (princ "And this too")
+  (setq *standard-output* #<stream:1>)  ; Restore - we'll use direct value
+  ;; Note: Can't easily restore without saving first
+  )
+
+;; Better test - with-output-to-string style
+(print "Testing with explicit stream...")
+(let ((s (make-string-output-stream)))
+  (format s "Captured: ~A" 42)
+  (print (get-output-stream-string s)))
+
+(print "Done!")

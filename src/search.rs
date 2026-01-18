@@ -359,6 +359,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Class(id) => format!("#<class:{}>", id),
             OpaqueValue::Symbol(id) => format!("#<symbol:{}>", id),
             OpaqueValue::BigInt(n) => n.to_string(),
+            OpaqueValue::StreamHandle(id) => format!("#<stream:{}>", id),
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!("({} . {})", 

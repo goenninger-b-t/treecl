@@ -1,0 +1,42 @@
+(print "Testing FORMAT primitive...")
+
+;; Basic ~A (aesthetic)
+(print (format nil "Hello, ~A!" "World"))
+;; Expected: "Hello, World!"
+
+;; Basic ~S (standard/readable)
+(print (format nil "Value: ~S" "test"))
+;; Expected: "Value: \"test\""
+
+;; Numeric ~D (decimal)
+(print (format nil "Count: ~D items" 42))
+;; Expected: "Count: 42 items"
+
+;; ~@D with sign
+(print (format nil "Change: ~@D" 5))
+;; Expected: "Change: +5"
+
+;; ~X (hex)
+(print (format nil "Hex: ~X" 255))
+;; Expected: "Hex: ff"
+
+;; ~B (binary)
+(print (format nil "Binary: ~B" 10))
+;; Expected: "Binary: 1010"
+
+;; ~% (newline)
+(print (format nil "Line1~%Line2"))
+;; Expected: "Line1\nLine2"
+
+;; ~~ (tilde)
+(print (format nil "50~~ discount"))
+;; Expected: "50~ discount"
+
+;; Multiple args
+(print (format nil "Name: ~A, Age: ~D, Score: ~F" "Alice" 30 95.5))
+;; Expected: "Name: Alice, Age: 30, Score: 95.5"
+
+;; Output to T (stdout)
+(format t "Direct output: ~A~%" "works!")
+
+(print "Done!")

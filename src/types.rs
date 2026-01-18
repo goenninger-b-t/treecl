@@ -20,6 +20,7 @@ pub enum OpaqueValue {
     Class(u32),              // Handle to Class (CLOS)
     Symbol(u32),             // Symbol ID
     BigInt(num_bigint::BigInt), // Arbitrary precision integer
+    StreamHandle(u32),       // Handle to Stream
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)

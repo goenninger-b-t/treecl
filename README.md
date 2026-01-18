@@ -42,6 +42,7 @@ The foundation is **canonical Tree Calculus** with a single operator `△` and t
 - **Lists**: Cons-cell lists as `Fork(Head, Tail)`
 - **Arrays (Vectors)**: O(1) access, syntax `#(1 2 3)` or `[1 2 3]`
 - **Closures**: Functions with captured environments
+- **Streams**: I/O abstractions (see Streams section)
 - **CLOS Instances**: Objects with class and slots
 
 ### 4. Standard Library (Primitives)
@@ -56,13 +57,82 @@ The foundation is **canonical Tree Calculus** with a single operator `△` and t
 `null`, `atom`, `consp`, `listp`, `numberp`, `symbolp`, `eq`, `eql`, `equal`
 
 #### I/O
-`print`, `princ`, `terpri`, `format`
+`print`, `princ`, `terpri`, `format`, `write-string`, `write-char`, `fresh-line`
 
 #### System
 - `(gc)` — Force garbage collection, returns freed nodes count
 - `(room)` — Display memory statistics
 
-### 5. Memory Management
+### 5. Streams
+
+TreeCL implements ANSI CL-style streams for I/O operations.
+
+#### Stream Types
+- **Standard Streams**: `*standard-input*`, `*standard-output*`, `*error-output*`
+- **String Streams**: In-memory I/O to/from strings
+- **File Streams**: (Basic support)
+- **Broadcast Streams**: Write to multiple destinations
+
+#### Stream Variables
+```lisp
+*standard-input*   ; #<stream:0> - stdin
+*standard-output*  ; #<stream:1> - stdout
+*error-output*     ; #<stream:2> - stderr
+*trace-output*     ; Same as stdout
+*query-io*         ; Same as stdout
+*debug-io*         ; Same as stdout
+*terminal-io*      ; Same as stdout
+```
+
+#### Stream Functions
+| Function | Description |
+|----------|-------------|
+| `(make-string-output-stream)` | Create stream that writes to string |
+| `(get-output-stream-string stream)` | Get accumulated string |
+| `(make-string-input-stream string)` | Create stream that reads from string |
+| `(close stream)` | Close a stream |
+| `(write-string string [stream])` | Write string to stream |
+| `(write-char char [stream])` | Write character to stream |
+| `(fresh-line [stream])` | Newline only if not at column 0 |
+
+#### Format Function
+```lisp
+(format destination control-string &rest args)
+```
+
+**Destinations:**
+- `nil` — Return formatted string
+- `t` — Write to `*standard-output*`
+- `stream` — Write to specified stream
+
+**Format Directives:**
+| Directive | Description |
+|-----------|-------------|
+| `~A` | Aesthetic (human-readable) |
+| `~S` | Standard (readable with escapes) |
+| `~D` | Decimal integer |
+| `~B` | Binary integer |
+| `~O` | Octal integer |
+| `~X` | Hexadecimal integer |
+| `~F` | Floating point |
+| `~C` | Character |
+| `~%` | Newline |
+| `~&` | Fresh line |
+| `~~` | Literal tilde |
+
+**Examples:**
+```lisp
+(format nil "Hello, ~A!" "World")  ; => "Hello, World!"
+(format nil "Hex: ~X" 255)          ; => "Hex: ff"
+(format t "Count: ~D~%" 42)         ; prints "Count: 42\n"
+
+;; Capture output to string
+(let ((s (make-string-output-stream)))
+  (format s "Value: ~D" 42)
+  (get-output-stream-string s))     ; => "Value: 42"
+```
+
+### 6. Memory Management
 - **Arena-based Allocation**: All nodes in central `Arena`
 - **Automatic GC**: Triggered after 10,000 allocations (configurable)
 - **Mark-and-Sweep**: Traces roots (symbols, closures, conditions, arrays)
@@ -81,7 +151,7 @@ GC:
   Allocs since GC: 156
 ```
 
-### 6. Object System (CLOS)
+### 7. Object System (CLOS)
 Subset of Common Lisp Object System:
 - `(defclass name (supers) (slots))`
 - `(defgeneric name (args))`
@@ -90,16 +160,25 @@ Subset of Common Lisp Object System:
 - `(slot-value instance 'slot-name)`
 - `(find-class 'name)`, `(class-of instance)`
 
-### 7. Error Handling (Conditions)
+### 8. Error Handling (Conditions)
 - `(error "message")` — Signal errors
 - `(handler-bind ...)` — Intercept conditions
 - `(restart-bind ...)` — Recovery infrastructure
 
-### 8. Programmable Reader
+### 9. Programmable Reader
 - **Readtable**: Controls parsing per-character
 - **Standard Macros**: `( )`, `'`, `;`, `"`, `` ` ``, `,`, `,@`
 - **Dispatch `#`**: `#'`, `#\`, `#(`, `#:`
 - **Programmable**: `(set-macro-character char fn)`
+
+### 10. Compiler
+Compile Lisp functions to Tree Calculus combinators:
+```lisp
+(defun square (x) (* x x))
+(compile 'square)           ; Returns combinator
+(tree-string (compile 'square))  ; "(n ((n sym:*) (n n)))"
+(funcall (compile 'square) 5)    ; => 25
+```
 
 ## 🚀 Usage
 
@@ -127,6 +206,10 @@ CL-USER> (defun fact (n) (if (< n 2) 1 (* n (fact (1- n)))))
 FACT
 CL-USER> (fact 10)
 3628800
+CL-USER> *standard-output*
+#<stream:1>
+CL-USER> (format nil "Hello, ~A!" "Lisp")
+"Hello, Lisp!"
 ```
 
 ## 🏗 Architecture
@@ -139,6 +222,8 @@ CL-USER> (fact 10)
 | `src/primitives.rs` | Native function registry |
 | `src/printer.rs` | S-expression output with combinator detection |
 | `src/reader.rs` | Parser & readtable logic |
+| `src/streams.rs` | Stream abstraction layer |
+| `src/compiler.rs` | Lisp-to-combinator compiler |
 | `src/clos.rs` | Object system (MOP) |
 | `src/conditions.rs` | Condition signaling |
 | `src/arrays.rs` | Dynamic array storage |
@@ -147,6 +232,9 @@ CL-USER> (fact 10)
 ## Status
 - **Core Engine**: Canonical Tree Calculus reduction ✓
 - **Lisp Evaluator**: Full evaluation with closures ✓
+- **Streams**: ANSI CL stream abstraction ✓
+- **Format**: Common format directives ✓
+- **Compiler**: Bracket abstraction to combinators ✓
 - **CLOS**: Basic object system ✓
 - **Conditions**: Error handling ✓
 - **Automatic GC**: Threshold-based collection ✓

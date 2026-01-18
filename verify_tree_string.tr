@@ -1,0 +1,49 @@
+(print "Verifying TREE-STRING...")
+(terpri)
+
+(defun test-tree-string (val expected)
+   (let ((res (tree-string val)))
+      (princ "Value: ") (print val)
+      (princ " Tree: ") (print res)
+      (if (string= res expected)
+          (print " [OK]")
+          (progn (print " [FAIL] Expected: ") (print expected)))))
+
+(terpri)
+(print "Test 1: Leaf")
+;; 'n' is a leaf? No, 'n' is a symbol. 
+;; In TreeCL, primitives are leaves (usually). 
+;; But wait, 'n' is just a symbol here unless I have a way to make a raw leaf?
+;; 42 is a leaf (Integer).
+(test-tree-string 42 "n")
+
+(terpri)
+(print "Test 2: List (top level)")
+;; List (1 2) = (1 . (2 . nil)) = (1 . (2 . n)) if nil is leaf
+;; Fork(1, Fork(2, nil))
+;; (tree(1) tree(Fork(2, nil)))
+;; (n (tree(2) tree(nil)))
+;; (n (n n))
+(test-tree-string '(1 2) "(n (n n))")
+
+(terpri)
+(print "Test 3: Compiled K")
+(defun k (x y) x)
+(let ((c (compile 'k)))
+  ;; K = (n n)
+  (test-tree-string c "(n n)"))
+
+(terpri)
+(print "Test 4: Compiled I")
+(defun i (x) x)
+(let ((c (compile 'i)))
+  ;; I = (n n) ? No I = ((n n) (n n)) or similar.
+  ;; Wait, I = △ △ = (n n) ?
+  ;; search.rs says: △ △ y -> y.
+  ;; So I = (n n).
+  ;; Let's check what it actually is outputted as.
+  (print "Compiled I:")
+  (print (tree-string c)))
+
+(terpri)
+(print "Done.")

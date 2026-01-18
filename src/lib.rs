@@ -14,8 +14,9 @@ pub mod clos;
 pub mod conditions;
 pub mod arrays;
 pub mod readtable;
+pub mod streams;
 
 // Legacy modules disabled - they use incompatible Node structure
 // pub mod engine;
 // pub mod parser;
-// pub mod compiler;
+pub mod compiler;
