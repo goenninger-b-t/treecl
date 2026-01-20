@@ -20,6 +20,7 @@ pub mod streams;
 // pub mod engine;
 // pub mod parser;
 pub mod compiler;
+pub mod debug;
 pub mod process;
 pub mod scheduler;
 pub mod context;

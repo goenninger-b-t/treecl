@@ -28,6 +28,16 @@ pub enum Status {
     Sleeping(u64), // Timer
     Terminated,
     Failed(String), // Crash reason
+    Paused,         // Debugger paused
+}
+
+/// Stepping mode for debugger
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMode {
+    Continue,
+    StepInto,
+    StepOver(usize), // Target stack depth
+    StepOut(usize),  // Target stack depth
 }
 
 /// Result of a time slice execution
@@ -37,6 +47,7 @@ pub enum ExecutionResult {
     Terminated,   // Finished (Normal Form)
     Blocked,      // Waiting for IO/Message
     SysCall(crate::syscall::SysCall), // Kernel request
+    Paused,       // Debugger pause
 }
 
 /// A message sent between processes
@@ -145,6 +156,11 @@ pub struct Process {
     
     /// Pending SysCall info (if stopped)
     pub pending_syscall: Option<crate::syscall::SysCall>,
+
+    /// Debugger State
+    pub debug_mode: bool,
+    pub step_mode: StepMode,
+    pub paused: bool,
 }
 
 impl Process {
@@ -186,6 +202,9 @@ impl Process {
             reduction_count: 0,
             pending_redex: None,
             pending_syscall: None,
+            debug_mode: false,
+            step_mode: StepMode::Continue,
+            paused: false,
         };
         
         // Create T and NIL in local arena
@@ -227,7 +246,19 @@ impl Process {
                 self.mark_node(plist, &mut marked);
             }
         }
+
+        // Stack (EvalContext)
+        for &node in &self.eval_context.stack {
+            self.mark_node(node, &mut marked);
+        }
+
+        // 2. Mark Heap
+        // We use a simple mark-and-sweep or just counting for now?
+        // Arena doesn't support sweep well unless strict freelist.
+        // For now, these roots are just "kept alive".
+        // Real GC requires moving collector or freelist sweep.
         
+
         // Mark Condition System Roots
         for root in self.conditions.iter_roots() {
             self.mark_node(root, &mut marked);
@@ -242,9 +273,22 @@ impl Process {
         // We do NOT scan all closures to allow collecting unreachable ones.
         
         // 2. Sweep
+        // Array Store Sweep (stub)
+        self.arrays.sweep(&marked);
+        
         let freed = self.arena.inner.sweep(&marked);
         self.arena.inner.reset_alloc_count();
         freed
+    }
+
+    /// introspection: Get current stack frames
+    pub fn get_stack_frames(&self) -> Vec<NodeId> {
+        self.eval_context.stack.clone()
+    }
+
+    /// introspection: Get current bindings
+    pub fn get_bindings(&self) -> &HashMap<SymbolId, SymbolBindings> {
+        &self.dictionary
     }
 
     fn mark_node(&self, node_id: NodeId, marked: &mut HashSet<u32>) {
@@ -355,57 +399,111 @@ impl Process {
 
     /// Execute the process for a given budget (reductions)
     pub fn execute_slice(&mut self, globals: &crate::context::GlobalContext, budget: usize) -> ExecutionResult {
+        if self.paused {
+            return ExecutionResult::Paused;
+        }
+        
         if self.status != Status::Runnable {
             return ExecutionResult::Blocked;
         }
         
-        // Resume from SysCall if needed? 
-        // No, the scheduler should have cleared pending_syscall before calling us if it was handled.
+        let start_total_steps = self.eval_context.steps;
+        let mut steps_left = budget;
         
-        let mut ctx = EvalContext {
-            steps: 0,
-            max_steps: budget,
-        };
-        
-        // 1. Run Tree Calculus Reduction
-        // Pass context to track steps
-        self.program = crate::search::reduce(&mut self.arena.inner, self.program, &mut ctx);
-        self.reduction_count += ctx.steps;
-        
-        // 2. Check for SysCall Interruption
-        // If primitive triggered SysCall, search::reduce returns the root (unmodified or partially reduced).
-        // But we set `pending_syscall` in `try_reduce_primitive`.
-        if let Some(syscall) = self.pending_syscall.take() {
-             return ExecutionResult::SysCall(syscall);
-        }
-        
-        // 3. Check for Primitives (Stuck state)
-        // If we stopped before budget, we might be stuck on a primitive
-        if ctx.steps < budget {
-            // Check if head is primitive
-             {
-                 let mut interpreter = crate::eval::Interpreter::new(self, globals);
-                 // Try one primitive reduction
-                 let new_root = interpreter.try_reduce_primitive(interpreter.process.program, &crate::eval::Environment::new());
-                 
-                 // Check if THAT triggered syscall
-                 if let Some(syscall) = interpreter.process.pending_syscall.take() {
-                      return ExecutionResult::SysCall(syscall);
+        while steps_left > 0 {
+            // Setup step limit
+            if self.debug_mode && (self.step_mode == StepMode::StepInto || matches!(self.step_mode, StepMode::StepOver(_)) || matches!(self.step_mode, StepMode::StepOut(_))) {
+                // In debug stepping modes, we run 1 reduction at a time
+                self.eval_context.max_steps = self.eval_context.steps + 1;
+            } else {
+                // Batch execution
+                self.eval_context.max_steps = self.eval_context.steps + steps_left;
+            }
+            
+            // Run Reduction
+            self.program = crate::search::reduce(&mut self.arena.inner, self.program, &mut self.eval_context);
+            self.reduction_count = self.eval_context.steps;
+            
+            // Calculate steps taken in this iteration
+            let steps_taken = self.reduction_count - start_total_steps - (budget - steps_left);
+            if steps_taken > steps_left {
+                steps_left = 0; // Should not happen if logic is correct
+            } else {
+                steps_left -= steps_taken;
+            }
+            
+            // Check for SysCall from Primitives (set during reduction?)
+            // Normally primitives are handled below, but if reduce calls something that sets it? 
+            if let Some(syscall) = self.pending_syscall.take() {
+                 return ExecutionResult::SysCall(syscall);
+            }
+            
+            // Check for Primitives (Stuck state) or Normal Form
+            let stopped_early = self.eval_context.steps < self.eval_context.max_steps;
+            
+                if stopped_early {
+                // Check if head is primitive
+                 {
+                     let mut interpreter = crate::eval::Interpreter::new(self, globals);
+                     let old_root = interpreter.process.program;
+                     
+                     // Try one primitive reduction
+                     let new_root = interpreter.try_reduce_primitive(interpreter.process.program, &crate::eval::Environment::new());
+                     
+                     // Check if THAT triggered syscall
+                     if let Some(syscall) = interpreter.process.pending_syscall.take() {
+                          return ExecutionResult::SysCall(syscall);
+                     }
+                     
+                     if new_root == old_root {
+                         // No primitive reduction happened either.
+                         // Steps taken was 0 (stopped_early) and no primitive. 
+                         // We are DONE.
+                         return ExecutionResult::Terminated;
+                     }
+                     
+                     interpreter.process.program = new_root;
                  }
-                 
-                 interpreter.process.program = new_root;
-             }
+            }
+            
+            // Debugger Pausing Logic
+            if self.debug_mode {
+                match self.step_mode {
+                    StepMode::StepInto => {
+                        self.paused = true;
+                        return ExecutionResult::Paused;
+                    }
+                    StepMode::StepOver(_) | StepMode::StepOut(_) => {
+                        // Fallback to StepInto behavior for now as we don't track stack frames yet
+                        self.paused = true;
+                        return ExecutionResult::Paused;
+                    }
+                    _ => {}
+                }
+                
+                // If we are single stepping but budget ran out (e.g. 1 step took 1 budget), break loop
+                if steps_left == 0 {
+                    break;
+                }
+            } else {
+                // If not debugging, and we finished a batch, we are done with this slice
+                 break;
+            }
+            
+            // If we stopped early (Normal Form) and Primitive didn't run effectively (or it did), 
+            // check if we are truly done.
+            if self.eval_context.steps < self.eval_context.max_steps && self.status == Status::Runnable {
+                 // Terminated (Normal Form)
+                 self.status = Status::Terminated;
+                 return ExecutionResult::Terminated;
+            }
         }
         
-        if ctx.steps >= budget {
-             ExecutionResult::Yielded
-        } else if self.status == Status::Runnable {
-             // Terminated (Normal Form)
-             self.status = Status::Terminated;
-             ExecutionResult::Terminated
-        } else {
-             // Status changed (e.g. Failed, Blocked, SysCall pending)
-             ExecutionResult::Terminated 
+        if self.status != Status::Runnable {
+             // Status changed (e.g. Failed, Blocked)
+             return ExecutionResult::Terminated;
         }
+        
+        ExecutionResult::Yielded
     }
 }

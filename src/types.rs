@@ -1,9 +1,18 @@
 use std::ffi::c_void;
+use serde::{Serialize, Deserialize};
 
 pub use crate::symbol::SymbolId;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
 
 #[derive(Clone, Debug, PartialEq)] // Removed Copy because StringHandle/VectorHandle might imply ownership semantics later, but for now they are indices.
 pub enum OpaqueValue {

@@ -8,17 +8,44 @@ use triage_rs::primitives::register_primitives;
 use triage_rs::context::GlobalContext;
 use triage_rs::process::{Status};
 use triage_rs::scheduler::Scheduler;
+use triage_rs::debug::{DebugServer, DebugCommand};
+use std::sync::mpsc;
+use clap::Parser;
+
+/// TreeCL REPL and Runtime
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Enable the debug server
+    #[arg(long)]
+    debug: bool,
+
+    /// Port for the debug server
+    #[arg(long, default_value_t = 9000)]
+    port: u16,
+}
 
 fn main() -> io::Result<()> {
     println!("TreeCL v0.2.0 - ANSI Common Lisp on Tree Calculus");
     println!("Type (quit) or Ctrl-D to exit");
     println!();
     
+    let args = Args::parse();
+    
     let mut globals = GlobalContext::new();
     // Register all built-in primitives
     register_primitives(&mut globals);
     
     let mut scheduler = Scheduler::new();
+    
+    // Start Debug Server if requested
+    if args.debug {
+        let (tx, rx) = mpsc::channel();
+        let debug_server = DebugServer::new(tx, args.port);
+        debug_server.start(); // Spawns thread
+        scheduler.set_debug_receiver(rx);
+        println!("Debug Server started on port {}", args.port);
+    }
     
     // Create main process (REPL Worker)
     // We keep it in the scheduler mostly, but need to borrow it for parsing?

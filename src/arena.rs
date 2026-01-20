@@ -1,4 +1,4 @@
-use crate::types::{NodeId, OpaqueValue};
+use crate::types::{NodeId, OpaqueValue, SourceLocation};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
@@ -21,7 +21,8 @@ pub struct ArenaStats {
 }
 
 pub struct Arena {
-    nodes: Vec<Entry>,
+    pub nodes: Vec<Entry>, // Made public for easier access if needed, or keep private? The planned use might valid.
+    source_map: Vec<Option<SourceLocation>>,
     free_head: Option<u32>,
     allocs_since_gc: usize,
 }
@@ -30,12 +31,17 @@ impl Arena {
     pub fn new() -> Self {
         Self {
             nodes: Vec::with_capacity(1024),
+            source_map: Vec::with_capacity(1024),
             free_head: None,
             allocs_since_gc: 0,
         }
     }
 
     pub fn alloc(&mut self, node: Node) -> NodeId {
+        self.alloc_with_location(node, None)
+    }
+
+    pub fn alloc_with_location(&mut self, node: Node, loc: Option<SourceLocation>) -> NodeId {
         match self.free_head {
             Some(idx) => {
                 let entry = &mut self.nodes[idx as usize];
@@ -45,16 +51,29 @@ impl Arena {
                 };
                 self.free_head = next_free;
                 *entry = Entry::Occupied(node);
+                
+                // Ensure source_map is large enough (it should be, but safe to check?)
+                // It should be parallel.
+                if idx as usize >= self.source_map.len() {
+                    self.source_map.resize(idx as usize + 1, None);
+                }
+                self.source_map[idx as usize] = loc;
+
                 self.allocs_since_gc += 1;
                 NodeId(idx)
             }
             None => {
                 let idx = self.nodes.len() as u32;
                 self.nodes.push(Entry::Occupied(node));
+                self.source_map.push(loc);
                 self.allocs_since_gc += 1;
                 NodeId(idx)
             }
         }
+    }
+
+    pub fn get_location(&self, id: NodeId) -> Option<&SourceLocation> {
+        self.source_map.get(id.0 as usize).and_then(|opt| opt.as_ref())
     }
 
     pub fn overwrite(&mut self, id: NodeId, node: Node) {

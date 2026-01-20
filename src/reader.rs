@@ -42,6 +42,10 @@ pub struct Reader<'a> {
     readtable: &'a Readtable,
     arrays: Option<&'a mut ArrayStore>,
     nil_node: NodeId,
+    // Source tracking
+    file: String,
+    line: u32,
+    col: u32,
 }
 
 impl<'a> Reader<'a> {
@@ -56,8 +60,31 @@ impl<'a> Reader<'a> {
             readtable,
             arrays,
             nil_node,
+            file: "REPL".to_string(),
+            line: 1,
+            col: 1,
         }
     }
+
+    fn consume_char(&mut self) -> Option<char> {
+        let c = self.input.next()?;
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(c)
+    }
+
+    fn get_location(&self) -> crate::types::SourceLocation {
+        crate::types::SourceLocation {
+            file: self.file.clone(),
+            line: self.line,
+            col: self.col,
+        }
+    }
+
     
     /// Read a single expression
     pub fn read(&mut self) -> ReaderResult {
@@ -69,7 +96,7 @@ impl<'a> Reader<'a> {
                 let syntax = self.readtable.get_syntax_type(c);
                 match syntax {
                     SyntaxType::TerminatingMacro | SyntaxType::NonTerminatingMacro => {
-                        // Dispatch macro
+                            // Dispatch macro
                         // Note: Macros consume the char, so we need to consume it?
                         // Standard: macro fn(stream, char)
                         // If we call the macro, it should consume 'c' if needed?
@@ -79,7 +106,7 @@ impl<'a> Reader<'a> {
                         // Actually, standard CL reader macros are called with char already peeped/consumed?
                         // "The reader macro function is called with the stream and the character that caused the dispatch."
                         // So we consume it.
-                        let ch = self.input.next().unwrap();
+                        let ch = self.consume_char().unwrap();
                         
                         // Look up function
                         // Simplified: hardcode standard macros for Phase 10 to bootstrap,
@@ -114,7 +141,7 @@ impl<'a> Reader<'a> {
                         }
                     }
                     SyntaxType::Whitespace => {
-                        self.input.next();
+                        self.consume_char();
                         self.read()
                     }
                     _ => self.read_atom(), // Constituent, Escape
@@ -122,12 +149,13 @@ impl<'a> Reader<'a> {
             }
         }
     }
+
     
     /// Skip whitespace and comments
     fn skip_whitespace(&mut self) {
         while let Some(&c) = self.input.peek() {
             if c.is_whitespace() {
-                self.input.next();
+                self.consume_char();
             } else {
                 break;
             }
@@ -136,7 +164,7 @@ impl<'a> Reader<'a> {
     
     /// Skip line comment (;...)
     fn skip_line_comment(&mut self) {
-        while let Some(c) = self.input.next() {
+        while let Some(c) = self.consume_char() {
             if c == '\n' {
                 break;
             }
@@ -145,10 +173,11 @@ impl<'a> Reader<'a> {
     
     /// Read a list: (a b c)
     fn read_list(&mut self) -> ReaderResult {
+        let list_start = self.get_location();
         self.skip_whitespace();
         
         if let Some(&')') = self.input.peek() {
-            self.input.next();
+            self.consume_char();
             return Ok(self.nil_node);
         }
         
@@ -161,12 +190,12 @@ impl<'a> Reader<'a> {
             match self.input.peek() {
                 None => return Err(ReaderError::UnbalancedParen),
                 Some(&')') => {
-                    self.input.next();
+                    self.consume_char();
                     break;
                 }
                 Some(&'.') => {
                     // Check for dotted pair
-                    self.input.next();
+                    self.consume_char();
                     if let Some(&c) = self.input.peek() {
                         if c.is_whitespace() || c == ')' {
                             // Dotted pair
@@ -176,7 +205,7 @@ impl<'a> Reader<'a> {
                             if self.input.peek() != Some(&')') {
                                 return Err(ReaderError::UnexpectedChar('.'));
                             }
-                            self.input.next();
+                            self.consume_char();
                             break;
                         } else {
                             // Symbol starting with dot
@@ -194,7 +223,10 @@ impl<'a> Reader<'a> {
         // Build list from elements
         let mut result = dotted_cdr.unwrap_or(self.nil_node);
         for elem in elements.into_iter().rev() {
-            result = self.arena.alloc(Node::Fork(elem, result));
+            // Note: Cons cells inherit location from the list start? 
+            // Or better yet, we don't have exact locations for intermediate cons cells easily unless we track them.
+            // Let's use list_start for all cons cells in this list for now.
+            result = self.arena.alloc_with_location(Node::Fork(elem, result), Some(list_start.clone()));
         }
         
         Ok(result)
@@ -202,41 +234,46 @@ impl<'a> Reader<'a> {
     
     /// Read a quoted expression: 'x -> (quote x)
     fn read_quote(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         let expr = self.read()?;
-        let quote_sym = self.make_symbol("QUOTE");
-        Ok(self.list(&[quote_sym, expr]))
+        let quote_sym = self.make_symbol_at("QUOTE", &loc);
+        Ok(self.list_at(&[quote_sym, expr], &loc))
     }
     
     /// Read a quasiquoted expression: `x -> (quasiquote x)
     fn read_quasiquote(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         let expr = self.read()?;
-        let qq_sym = self.make_symbol("QUASIQUOTE");
-        Ok(self.list(&[qq_sym, expr]))
+        let qq_sym = self.make_symbol_at("QUASIQUOTE", &loc);
+        Ok(self.list_at(&[qq_sym, expr], &loc))
     }
     
     /// Read an unquoted expression: ,x or ,@x
     fn read_unquote(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         let splice = self.input.peek() == Some(&'@');
         if splice {
-            self.input.next();
+            self.consume_char();
         }
         let expr = self.read()?;
-        let sym_name = if splice { "UNQUOTE-SPLICING" } else { "UNQUOTE" };
-        let uq_sym = self.make_symbol(sym_name);
-        Ok(self.list(&[uq_sym, expr]))
+        let sym_name = if splice { "UNQUOTE-SPLICE" } else { "UNQUOTE" };
+        let sym = self.make_symbol_at(sym_name, &loc);
+         Ok(self.list_at(&[sym, expr], &loc))
     }
+
     
     /// Read a string: "hello"
     fn read_string(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         let mut s = String::new();
         
         loop {
-            match self.input.next() {
+            match self.consume_char() {
                 None => return Err(ReaderError::UnexpectedEof),
                 Some('"') => break,
                 Some('\\') => {
                     // Escape sequence
-                    match self.input.next() {
+                    match self.consume_char() {
                         None => return Err(ReaderError::UnexpectedEof),
                         Some('n') => s.push('\n'),
                         Some('t') => s.push('\t'),
@@ -251,23 +288,24 @@ impl<'a> Reader<'a> {
         }
         
         // Store string content directly
-        Ok(self.arena.alloc(Node::Leaf(OpaqueValue::String(s))))
+        Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::String(s)), Some(loc.clone())))
     }
     
     /// Read dispatch macro: #...
     fn read_dispatch(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         match self.input.peek() {
             None => Err(ReaderError::UnexpectedEof),
             Some(&'\'') => {
                 // #'fn -> (function fn)
-                self.input.next();
+                self.consume_char();
                 let name = self.read()?;
-                let func_sym = self.make_symbol("FUNCTION");
-                Ok(self.list(&[func_sym, name]))
+                let func_sym = self.make_symbol_at("FUNCTION", &loc);
+                Ok(self.list_at(&[func_sym, name], &loc))
             }
             Some(&'\\') => {
                 // #\char
-                self.input.next();
+                self.consume_char();
                 self.read_character()
             }
             Some(&'(') => {
@@ -276,7 +314,7 @@ impl<'a> Reader<'a> {
             }
             Some(&':') => {
                 // #:uninterned-symbol
-                self.input.next();
+                self.consume_char();
                 self.read_uninterned_symbol()
             }
             Some(&c) if c.is_ascii_digit() => {
@@ -289,12 +327,13 @@ impl<'a> Reader<'a> {
     
     /// Read a character literal: #\x or #\space
     fn read_character(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         let mut name = String::new();
         
         while let Some(&c) = self.input.peek() {
             if c.is_alphanumeric() || c == '-' {
                 name.push(c);
-                self.input.next();
+                self.consume_char();
             } else {
                 break;
             }
@@ -310,11 +349,12 @@ impl<'a> Reader<'a> {
         };
         
         // Store character as integer (code point)
-        Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(ch as i64))))
+        Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Integer(ch as i64)), Some(loc.clone())))
     }
     
     /// Read a vector literal: #(1 2 3)
     fn read_vector(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         self.skip_whitespace();
         
         let mut elements = Vec::new();
@@ -324,7 +364,7 @@ impl<'a> Reader<'a> {
             match self.input.peek() {
                 None => return Err(ReaderError::UnbalancedParen),
                 Some(&')') => {
-                    self.input.next();
+                    self.consume_char();
                     break;
                 }
                 _ => {
@@ -335,23 +375,8 @@ impl<'a> Reader<'a> {
         
         // Create vector in ArrayStore
         if let Some(store) = self.arrays.as_mut() {
-            // Allocate vector
-            // What about size? It's dynamic here. 
-            // ArrayStore expects size + initial.
-            // We need a method to alloc from Vec<NodeId>.
-            // ArrayStore currently has `alloc(size, initial)`.
-            // We need `alloc_from_vec(vec)`.
-            // I need to add `alloc_from_vec` to ArrayStore. 
-            // BUT I can't modify ArrayStore here.
-            // Wait, I can modify `read_vector` to assume `alloc_from_vec` exists, then go add it.
-            
-            // Temporary hack: use `alloc` then `set_aref` loop? Inefficient.
-            // Better: Add `alloc_from_vec` to `ArrayStore` in next step.
-            // For now, just generate error if no store.
-            
-            // Assume the method exists.
             let vec_id = store.alloc_from_vec(elements);
-             Ok(self.arena.alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
+             Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0)), Some(loc.clone())))
         } else {
              Err(ReaderError::InvalidChar("Vectors not supported without ArrayStore".to_string()))
         }
@@ -359,6 +384,7 @@ impl<'a> Reader<'a> {
     
     /// Read [ ... ] as vector
     pub fn read_left_bracket(&mut self, _char: char) -> ReaderResult {
+        let loc = self.get_location();
         // Read until ]
         let mut elements = Vec::new();
         
@@ -367,7 +393,7 @@ impl<'a> Reader<'a> {
              match self.input.peek() {
                 None => return Err(ReaderError::UnexpectedEof),
                 Some(&']') => {
-                    self.input.next();
+                    self.consume_char();
                     break;
                 }
                 _ => {
@@ -379,11 +405,12 @@ impl<'a> Reader<'a> {
         // Create vector
         if let Some(store) = self.arrays.as_mut() {
             let vec_id = store.alloc_from_vec(elements);
-            Ok(self.arena.alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
+            Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0)), Some(loc.clone())))
         } else {
             Err(ReaderError::InvalidChar("Vectors not supported without ArrayStore".to_string()))
         }
     }
+
     
     /// Error on unmatched ]
     pub fn read_right_bracket(&mut self, _char: char) -> ReaderResult {
@@ -405,19 +432,20 @@ impl<'a> Reader<'a> {
     
     /// Read an atom (number or symbol)
     fn read_atom(&mut self) -> ReaderResult {
+        let loc = self.get_location();
         let s = self.read_symbol_name();
-        self.parse_atom(&s)
+        self.parse_atom_at(&s, &loc)
     }
     
     /// Read atom with a prefix character
     fn read_atom_with_prefix(&mut self, prefix: char) -> ReaderResult {
+        let loc = self.get_location();
         let mut s = String::new();
         s.push(prefix);
         s.push_str(&self.read_symbol_name());
-        self.parse_atom(&s)
+        self.parse_atom_at(&s, &loc)
     }
-    
-    /// Read a symbol name (until delimiter)
+
     /// Check if character is a delimiter (based on readtable)
     fn is_delimiter(&self, c: char) -> bool {
         match self.readtable.get_syntax_type(c) {
@@ -435,41 +463,60 @@ impl<'a> Reader<'a> {
                 break;
             }
             name.push(c);
-            self.input.next();
+            self.consume_char();
         }
         
         name
     }
     
-    /// Parse an atom string as number or symbol
+    /// Parse an atom string as number or symbol with location
     fn parse_atom(&mut self, s: &str) -> ReaderResult {
+        // Fallback for internal calls
+        // Actually, internal calls should use parse_atom_at if they have location.
+        // We'll define a dummy location or reuse current?
+        // Let's just create a dummy one or use current state. `get_location` captures "current" which might be end of token.
+        // Ideally `read_atom` captures start loc.
+        let loc = self.get_location(); // This is end of token potentially? No, read_atom calls get_location BEFORE reading.
+        self.parse_atom_at(s, &loc)
+    }
+
+    fn parse_atom_at(&mut self, s: &str, loc: &crate::types::SourceLocation) -> ReaderResult {
         let upper = s.to_uppercase();
         
         // Check for NIL
         if upper == "NIL" {
-            return Ok(self.nil_node);
+            // Should we return nil_node or alloc new one with location?
+            // Existing logic uses shared nil_node.
+            // If we want stepping on NIL, it needs location.
+            // But nil is unique. 
+            // We can allocate a new leaf with NIL value and location.
+            // But OpaqueValue::Nil is value.
+            // `nil_node` is shared, so it has one location (creation time).
+            // For debugger, maybe it's fine if NIL steps to "somewhere"?
+            // Or alloc new Nil node.
+            return Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Nil), Some(loc.clone())));
         }
         
         // Try integer
         if let Ok(n) = s.parse::<i64>() {
-            return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n))));
+            return Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Integer(n)), Some(loc.clone())));
         }
         
         // Try big integer
         if let Ok(bn) = s.parse::<num_bigint::BigInt>() {
-             return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(bn))));
+             return Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::BigInt(bn)), Some(loc.clone())));
         }
         
         // Try float
         if let Ok(f) = s.parse::<f64>() {
-            return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Float(f))));
+            return Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Float(f)), Some(loc.clone())));
         }
         
         // Check for keyword
         if s.starts_with(':') {
             let key_name = &s[1..];
             let sym_id = self.symbols.intern_keyword(key_name);
-            return self.symbol_to_node(sym_id);
+            return Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Symbol(sym_id.0)), Some(loc.clone())));
         }
         
         // Check for package-qualified symbol
@@ -482,13 +529,13 @@ impl<'a> Reader<'a> {
             
             if let Some(pkg_id) = self.symbols.find_package(pkg_name) {
                 let sym_id = self.symbols.intern_in(sym_name, pkg_id);
-                return self.symbol_to_node(sym_id);
+                return Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Symbol(sym_id.0)), Some(loc.clone())));
             }
         }
         
         // Regular symbol in current package
         let sym_id = self.symbols.intern(&upper);
-        self.symbol_to_node(sym_id)
+        Ok(self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Symbol(sym_id.0)), Some(loc.clone())))
     }
     
     /// Convert a SymbolId to a Node representation
@@ -510,6 +557,21 @@ impl<'a> Reader<'a> {
             result = self.arena.alloc(Node::Fork(item, result));
         }
         result
+    }
+
+    /// Create a list from nodes with location info
+    fn list_at(&mut self, nodes: &[NodeId], loc: &crate::types::SourceLocation) -> NodeId {
+        let mut result = self.nil_node;
+        for &elem in nodes.iter().rev() {
+            result = self.arena.alloc_with_location(Node::Fork(elem, result), Some(loc.clone()));
+        }
+        result
+    }
+
+    /// Intern a symbol and return a node with location
+    fn make_symbol_at(&mut self, name: &str, loc: &crate::types::SourceLocation) -> NodeId {
+        let sym_id = self.symbols.intern_in(name, self.readtable.package);
+        self.arena.alloc_with_location(Node::Leaf(OpaqueValue::Symbol(sym_id.0)), Some(loc.clone()))
     }
 }
 

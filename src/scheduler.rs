@@ -1,6 +1,8 @@
-use crate::process::{Process, Pid, Priority, Status, ExecutionResult};
+use crate::process::{Process, Pid, Priority, Status, ExecutionResult, StepMode};
 use crate::types::{NodeId, OpaqueValue};
 use crate::syscall::SysCall;
+use crate::debug::DebugCommand;
+use std::sync::mpsc::Receiver;
 use std::collections::{HashMap, VecDeque};
 
 /// Scheduler managing processes
@@ -21,6 +23,9 @@ pub struct Scheduler {
     
     /// Current Tick (for timing/preemption context)
     tick: u64,
+    
+    /// Debugger Communication
+    debug_rx: Option<Receiver<DebugCommand>>,
 }
 
 impl Scheduler {
@@ -34,7 +39,12 @@ impl Scheduler {
             next_pid: 1,
             node_id: 0,
             tick: 0,
+            debug_rx: None,
         }
+    }
+
+    pub fn set_debug_receiver(&mut self, rx: Receiver<DebugCommand>) {
+        self.debug_rx = Some(rx);
     }
     
     /// Spawn a new process
@@ -144,6 +154,19 @@ impl Scheduler {
     pub fn run_tick(&mut self, globals: &mut crate::context::GlobalContext) -> bool {
         self.tick += 1;
         
+        // 0. Handle Debugger Commands
+        // We collect commands first to avoid double borrow of self (debug_rx vs handle_debug_command)
+        let mut commands = Vec::new();
+        if let Some(rx) = &self.debug_rx {
+             while let Ok(cmd) = rx.try_recv() {
+                 commands.push(cmd);
+             }
+        }
+        
+        for cmd in commands {
+            self.handle_debug_command(cmd);
+        }
+        
         // 1. Pick a process
         // Priority: High > Normal > Low
         let next = self.high_queue.pop_front()
@@ -176,6 +199,12 @@ impl Scheduler {
                         // Handle SysCall
                         self.handle_syscall(pid, proc, syscall, globals);
                     }
+                    ExecutionResult::Paused => {
+                        // Debugger paused the process
+                        proc.status = Status::Paused;
+                        self.registry.insert(pid, proc);
+                        // Do not reschedule. Debugger must resume it.
+                    }
                 }
                 return true;
             }
@@ -185,6 +214,68 @@ impl Scheduler {
     
     pub fn run_until_empty(&mut self, globals: &mut crate::context::GlobalContext) {
         while self.run_tick(globals) {}
+    }
+
+    fn handle_debug_command(&mut self, cmd: DebugCommand) {
+        match cmd {
+            DebugCommand::Pause(pid) => {
+                if let Some(mut proc) = self.registry.remove(&pid) {
+                    proc.paused = true;
+                    proc.status = Status::Paused;
+                    self.registry.insert(pid, proc);
+                }
+            }
+            DebugCommand::Resume(pid) => {
+                 if let Some(mut proc) = self.registry.remove(&pid) {
+                    proc.paused = false;
+                    proc.step_mode = StepMode::Continue;
+                    proc.status = Status::Runnable;
+                    self.registry.insert(pid, proc);
+                    self.schedule(pid);
+                }
+            }
+            DebugCommand::StepInto(pid) => {
+                if let Some(mut proc) = self.registry.remove(&pid) {
+                     proc.paused = false;
+                     proc.step_mode = StepMode::StepInto;
+                     proc.status = Status::Runnable;
+                     self.registry.insert(pid, proc);
+                     self.schedule(pid);
+                 }
+            }
+            DebugCommand::StepOver(pid) => {
+                 if let Some(mut proc) = self.registry.remove(&pid) {
+                     proc.paused = false;
+                     // For now, StepOver behaves like StepInto until stack frame logic is robust
+                     // In future: capture current stack depth, set StepMode::StepOver(depth)
+                     proc.step_mode = StepMode::StepOver(proc.eval_context.depth);
+                     proc.status = Status::Runnable;
+                     self.registry.insert(pid, proc);
+                     self.schedule(pid);
+                 }
+            }
+            DebugCommand::StepOut(pid) => {
+                 if let Some(mut proc) = self.registry.remove(&pid) {
+                     proc.paused = false;
+                     proc.step_mode = StepMode::StepOut(proc.eval_context.depth);
+                     proc.status = Status::Runnable;
+                     self.registry.insert(pid, proc);
+                     self.schedule(pid);
+                 }
+            }
+            DebugCommand::GetStack(pid, sender) => {
+                if let Some(proc) = self.registry.get(&pid) {
+                    let frames = proc.get_stack_frames();
+                    let _ = sender.send(frames);
+                } else {
+                    let _ = sender.send(vec![]);
+                }
+            }
+            DebugCommand::GetBindings(pid, sender) => {
+                 // Return placeholder for now
+                 let _ = sender.send("{}".to_string());
+            }
+        }
     }
 
     fn handle_syscall(&mut self, pid: Pid, mut proc: Process, syscall: SysCall, globals: &mut crate::context::GlobalContext) {

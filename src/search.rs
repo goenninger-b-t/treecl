@@ -4,6 +4,8 @@ use crate::types::{NodeId, OpaqueValue};
 pub struct EvalContext {
     pub steps: usize,
     pub max_steps: usize,
+    pub depth: usize,
+    pub stack: Vec<NodeId>,
 }
 
 impl Default for EvalContext {
@@ -11,6 +13,8 @@ impl Default for EvalContext {
         Self {
             steps: 0,
             max_steps: 10000,
+            depth: 0,
+            stack: Vec::new(),
         }
     }
 }
@@ -42,7 +46,11 @@ pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId 
             Node::Fork(left, y) => {
                 // We have an application (left y)
                 // Reduce left to WHNF first
+                ctx.depth += 1;
+                ctx.stack.push(left);
                 let reduced_left = reduce_whnf(arena, left, ctx);
+                ctx.stack.pop();
+                ctx.depth -= 1;
                 
                 // Check if reduced_left is of form (△ x) = Fork(nil, x)
                 if let Node::Fork(op, x) = arena.get_unchecked(reduced_left).clone() {
@@ -50,7 +58,11 @@ pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId 
                     if let Node::Leaf(OpaqueValue::Nil) = arena.get_unchecked(op) {
                         // We have ((△ x) y) - this is a redex!
                         // Dispatch based on structure of x
+                        ctx.depth += 1;
+                        ctx.stack.push(x);
                         let reduced_x = reduce_whnf(arena, x, ctx);
+                        ctx.stack.pop();
+                        ctx.depth -= 1;
                         
                         match arena.get_unchecked(reduced_x).clone() {
                             Node::Leaf(OpaqueValue::Nil) => {
@@ -111,7 +123,12 @@ pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId 
             }
             Node::Stem(inner) => {
                 // Reduce inside Stem for full normalization
+                // Reduce inside Stem for full normalization
+                ctx.depth += 1;
+                ctx.stack.push(inner);
                 let reduced_inner = reduce(arena, inner, ctx);
+                ctx.stack.pop();
+                ctx.depth -= 1;
                 if reduced_inner != inner {
                     return arena.alloc(Node::Stem(reduced_inner));
                 }
@@ -133,13 +150,21 @@ pub fn reduce_whnf(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> No
         
         match arena.get_unchecked(current).clone() {
             Node::Fork(left, y) => {
+                ctx.depth += 1;
+                ctx.stack.push(left);
                 let reduced_left = reduce_whnf(arena, left, ctx);
+                ctx.stack.pop();
+                ctx.depth -= 1;
                 
                 // Check if reduced_left is of form (△ x) = Fork(nil, x)
                 if let Node::Fork(op, x) = arena.get_unchecked(reduced_left).clone() {
                     if let Node::Leaf(OpaqueValue::Nil) = arena.get_unchecked(op) {
                         // We have ((△ x) y) - check for redex
+                        ctx.depth += 1;
+                        ctx.stack.push(x);
                         let reduced_x = reduce_whnf(arena, x, ctx);
+                        ctx.stack.pop();
+                        ctx.depth -= 1;
                         
                         match arena.get_unchecked(reduced_x).clone() {
                             Node::Leaf(OpaqueValue::Nil) => {

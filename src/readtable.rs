@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use crate::reader::{Reader, ReaderResult};
+use crate::symbol::PackageId;
 
 /// Character Syntax Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub struct Readtable {
     syntax_types: HashMap<char, SyntaxType>,
     macro_functions: HashMap<char, ReaderMacroFn>,
     default_syntax: SyntaxType,
+    pub package: PackageId,
 }
 
 impl Readtable {
@@ -34,10 +36,12 @@ impl Readtable {
             syntax_types: HashMap::new(),
             macro_functions: HashMap::new(),
             default_syntax: SyntaxType::Constituent,
+            package: PackageId(1), // Default to COMMON-LISP (usually 1, KEYWORD is 0)
         };
         rt.initialize_standard();
         rt
     }
+
     
     fn initialize_standard(&mut self) {
         // Whitespace
