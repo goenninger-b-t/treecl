@@ -3,7 +3,6 @@
 // Implements ANSI CL symbol/package semantics with O(1) comparison.
 
 use std::collections::HashMap;
-use crate::types::NodeId;
 
 /// Unique identifier for a symbol (index into symbol table)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -13,19 +12,14 @@ pub struct SymbolId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PackageId(pub u32);
 
-/// A Common Lisp symbol
+/// A Common Lisp symbol (Immutable Metadata only)
 #[derive(Debug, Clone)]
 pub struct Symbol {
     /// The symbol's name (e.g., "CAR", "MY-VAR")
     pub name: String,
     /// The home package (None for uninterned symbols)
     pub package: Option<PackageId>,
-    /// Value cell (for special/dynamic variables)
-    pub value: Option<NodeId>,
-    /// Function cell (for defun/defmacro)
-    pub function: Option<NodeId>,
-    /// Property list (stored as NodeId pointing to an alist)
-    pub plist: Option<NodeId>,
+    // Removed: value, function, plist (Moved to ProcessDictionary)
 }
 
 impl Symbol {
@@ -33,25 +27,12 @@ impl Symbol {
         Self {
             name,
             package,
-            value: None,
-            function: None,
-            plist: None,
         }
     }
     
     /// Check if symbol is a keyword
     pub fn is_keyword(&self) -> bool {
         self.package == Some(PackageId(0)) // KEYWORD is package 0
-    }
-    
-    /// Check if symbol is bound (has a value)
-    pub fn is_bound(&self) -> bool {
-        self.value.is_some()
-    }
-    
-    /// Check if symbol has a function definition
-    pub fn is_fbound(&self) -> bool {
-        self.function.is_some()
     }
 }
 
@@ -255,15 +236,7 @@ impl SymbolTable {
     
     /// Intern a keyword (in KEYWORD package)
     pub fn intern_keyword(&mut self, name: &str) -> SymbolId {
-        let sym_id = self.intern_in(name, PackageId(0));
-        
-        // Keywords are self-evaluating: their value is themselves
-        // We store the SymbolId in a special way
-        if let Some(_sym) = self.symbols.get_mut(sym_id.0 as usize) {
-            // For keywords, we just mark them; actual self-eval happens in evaluator
-        }
-        
-        sym_id
+        self.intern_in(name, PackageId(0))
     }
     
     /// Create an uninterned symbol (gensym)
@@ -272,30 +245,6 @@ impl SymbolTable {
         let symbol = Symbol::new(name.to_uppercase(), None);
         self.symbols.push(symbol);
         sym_id
-    }
-    
-    /// Get or set the value of a symbol
-    pub fn symbol_value(&self, id: SymbolId) -> Option<NodeId> {
-        self.get_symbol(id).and_then(|s| s.value)
-    }
-    
-    /// Set the value of a symbol
-    pub fn set_symbol_value(&mut self, id: SymbolId, value: NodeId) {
-        if let Some(sym) = self.get_symbol_mut(id) {
-            sym.value = Some(value);
-        }
-    }
-    
-    /// Get the function of a symbol
-    pub fn symbol_function(&self, id: SymbolId) -> Option<NodeId> {
-        self.get_symbol(id).and_then(|s| s.function)
-    }
-    
-    /// Set the function of a symbol
-    pub fn set_symbol_function(&mut self, id: SymbolId, func: NodeId) {
-        if let Some(sym) = self.get_symbol_mut(id) {
-            sym.function = Some(func);
-        }
     }
     
     /// Get the name of a symbol
@@ -356,17 +305,6 @@ mod tests {
         let kw = table.intern_keyword("TEST");
         let sym = table.get_symbol(kw).unwrap();
         assert!(sym.is_keyword());
-    }
-    
-    #[test]
-    fn test_symbol_value() {
-        let mut table = SymbolTable::new();
-        let sym = table.intern("MY-VAR");
-        
-        assert!(table.symbol_value(sym).is_none());
-        
-        table.set_symbol_value(sym, NodeId(42));
-        assert_eq!(table.symbol_value(sym), Some(NodeId(42)));
     }
     
     #[test]

@@ -15,6 +15,12 @@ impl Default for EvalContext {
     }
 }
 
+impl EvalContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Perform reduction on the given root until normal form or step limit.
 /// 
 /// Implements canonical Tree Calculus reduction rules:
