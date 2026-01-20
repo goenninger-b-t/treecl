@@ -202,6 +202,28 @@ impl ConditionSystem {
             format_arguments: args,
         }
     }
+    /// Get GC roots (functions in handlers and restarts)
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        for cluster in &self.handler_stack {
+            for handler in cluster {
+                roots.push(handler.function);
+            }
+        }
+        
+        for cluster in &self.restart_stack {
+            for restart in cluster {
+                roots.push(restart.function);
+                if let Some(node) = restart.interactive {
+                    roots.push(node);
+                }
+                if let Some(node) = restart.test {
+                    roots.push(node);
+                }
+            }
+        }
+        roots
+    }
 }
 
 impl Default for ConditionSystem {

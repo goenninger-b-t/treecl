@@ -1,7 +1,7 @@
 use crate::symbol::{SymbolTable, SymbolId, PackageId};
 use crate::types::NodeId;
 use crate::process::Process;
-use crate::eval::{EvalResult, Environment, SpecialForms};
+use crate::eval::{EvalResult, SpecialForms};
 use std::collections::HashMap;
 
 /// Type for primitive functions
@@ -29,6 +29,20 @@ impl GlobalContext {
         // Export NIL and T
         symbols.export_symbol(nil_sym);
         symbols.export_symbol(t_sym);
+        
+        // Register Protected Combinator Keywords
+        let kw = PackageId(0); // KEYWORD
+        let s_comb = symbols.intern_in("S-COMBINATOR", kw);
+        symbols.protect_symbol(s_comb);
+        
+        let k_comb = symbols.intern_in("K-COMBINATOR", kw);
+        symbols.protect_symbol(k_comb);
+        
+        let i_comb = symbols.intern_in("I-COMBINATOR", kw);
+        symbols.protect_symbol(i_comb);
+        
+        let triage_comb = symbols.intern_in("TRIAGE-COMBINATOR", kw);
+        symbols.protect_symbol(triage_comb);
         
         Self {
             symbols,

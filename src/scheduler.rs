@@ -1,5 +1,5 @@
 use crate::process::{Process, Pid, Priority, Status, ExecutionResult};
-use crate::types::{NodeId};
+use crate::types::{NodeId, OpaqueValue};
 use crate::syscall::SysCall;
 use std::collections::{HashMap, VecDeque};
 
@@ -15,6 +15,9 @@ pub struct Scheduler {
     
     /// PID Counter
     next_pid: u32,
+
+    /// Node ID (for distributed PID)
+    node_id: u32,
     
     /// Current Tick (for timing/preemption context)
     tick: u64,
@@ -27,7 +30,9 @@ impl Scheduler {
             low_queue: VecDeque::new(),
             normal_queue: VecDeque::new(),
             high_queue: VecDeque::new(),
+
             next_pid: 1,
+            node_id: 0,
             tick: 0,
         }
     }
@@ -36,7 +41,7 @@ impl Scheduler {
     /// Returns the Pid of the spawned process. 
     /// The process is NOT started automatically. Caller must setup arena/program and call schedule().
     pub fn spawn(&mut self, globals: &mut crate::context::GlobalContext) -> Pid {
-        let pid = Pid(self.next_pid);
+        let pid = Pid { node: self.node_id, id: self.next_pid, serial: 0 };
         self.next_pid += 1;
         
         // Initialize with placeholder program (will be overwritten by loader)
@@ -163,7 +168,7 @@ impl Scheduler {
                         println!("Process {:?} terminated.", pid);
                     }
                     ExecutionResult::Blocked => {
-                        proc.status = Status::Waiting;
+                        proc.status = Status::Waiting(None);
                         self.registry.insert(pid, proc);
                         // Do not reschedule. It waits for message.
                     }
@@ -175,7 +180,7 @@ impl Scheduler {
                 return true;
             }
         }
-        false // Idle
+        return false; // Idle
     }
     
     pub fn run_until_empty(&mut self, globals: &mut crate::context::GlobalContext) {
@@ -185,7 +190,7 @@ impl Scheduler {
     fn handle_syscall(&mut self, pid: Pid, mut proc: Process, syscall: SysCall, globals: &mut crate::context::GlobalContext) {
         match syscall {
             SysCall::Spawn(func) => {
-                 let new_pid = Pid(self.next_pid);
+                 let new_pid = Pid { node: self.node_id, id: self.next_pid, serial: 0 };
                  self.next_pid += 1;
                  
                  // Create new process with placeholder
@@ -207,25 +212,45 @@ impl Scheduler {
                  self.schedule(new_pid);
                  
                  // Return New PID to Parent
-                 // We need to construct a Node for the PID in parent's arena?
-                 // Currently just integer.
-                 let pid_val = proc.make_integer(new_pid.0 as i64);
+                 let pid_val = proc.arena.inner.alloc(crate::arena::Node::Leaf(OpaqueValue::Pid(new_pid)));
                  self.resume_process(pid, proc, pid_val);
             }
             SysCall::Send { target, message } => {
-                let success = if let Some(mut target_proc) = self.registry.remove(&target) {
+                let _success = if let Some(mut target_proc) = self.registry.remove(&target) {
                     let copied = crate::arena::deep_copy(
                         &proc.arena.inner,
                         message,
                         &mut target_proc.arena.inner
                     );
-                    target_proc.send(pid, copied);
-                    self.registry.insert(target, target_proc);
                     
-                    // Wake up target if needed
-                    if let Some(p) = self.registry.get(&target) {
-                         if p.status == Status::Runnable {
+                    let mut wake = false;
+                    if let Status::Waiting(pat) = target_proc.status {
+                        let matches = if let Some(pattern) = pat {
+                            crate::arena::deep_equal(&target_proc.arena.inner, pattern, copied)
+                        } else { true };
+                        if matches { wake = true; }
+                    }
+                    
+                    if wake {
+                         // Wake up and deliver result directly
+                         if let Some(redex) = target_proc.pending_redex.take() {
+                              // Identify the result node in target arena
+                              let result_node = target_proc.arena.inner.get_unchecked(copied).clone();
+                              target_proc.arena.inner.overwrite(redex, result_node);
+                         }
+                         target_proc.status = Status::Runnable;
+                         self.registry.insert(target, target_proc);
+                         self.schedule(target);
+                    } else {
+                         // Enqueue in mailbox
+                         target_proc.send(pid, copied);
+                         // If already runnable, ensure it's in a queue (idempotent schedule check usually)
+                         // But we removed it from registry.
+                         if target_proc.status == Status::Runnable {
+                             self.registry.insert(target, target_proc);
                              self.schedule(target);
+                         } else {
+                             self.registry.insert(target, target_proc);
                          }
                     }
                     true
@@ -233,20 +258,25 @@ impl Scheduler {
                     false
                 };
                 
-                // Return Message to Sender (Standard Actor Model behavior often implies send returns msg or true)
-                // TreeCL: (send pid msg) -> msg
+                // Return Message to Sender
                 self.resume_process(pid, proc, message); 
             }
-            SysCall::Receive { pattern: _ } => {
-                if let Some(msg) = proc.mailbox.pop_front() {
-                    // Match pattern? (TODO)
-                    // For now, take first.
+            SysCall::Receive { pattern } => {
+                let mut found = None;
+                for (i, msg) in proc.mailbox.iter().enumerate() {
+                    let matches = if let Some(pat) = pattern {
+                        crate::arena::deep_equal(&proc.arena.inner, pat, msg.payload)
+                    } else { true };
+                    
+                    if matches { found = Some(i); break; }
+                }
+                
+                if let Some(i) = found {
+                    let msg = proc.mailbox.remove(i).unwrap();
                     self.resume_process(pid, proc, msg.payload);
                 } else {
-                    // No message. Block.
-                    proc.status = Status::Waiting;
+                    proc.status = Status::Waiting(pattern);
                     self.registry.insert(pid, proc);
-                    // Do not schedule.
                 }
             }
             SysCall::Sleep(ms) => {
@@ -256,7 +286,7 @@ impl Scheduler {
                  self.resume_process(pid, proc, nil);
             }
             SysCall::SelfPid => {
-                 let pid_val = proc.make_integer(pid.0 as i64);
+                 let pid_val = proc.arena.inner.alloc(crate::arena::Node::Leaf(OpaqueValue::Pid(pid)));
                  self.resume_process(pid, proc, pid_val);
             }
         }

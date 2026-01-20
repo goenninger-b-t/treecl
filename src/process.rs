@@ -1,11 +1,15 @@
-use crate::arena::{Arena, Node, ArenaStats};
+use crate::arena::{Arena, Node};
 use crate::types::{NodeId, OpaqueValue, SymbolId};
-use crate::search::{reduce, EvalContext};
+use crate::search::EvalContext;
 use std::collections::{VecDeque, HashMap, HashSet};
 
 /// Process ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Pid(pub u32);
+pub struct Pid {
+    pub node: u32,
+    pub id: u32,
+    pub serial: u32,
+}
 
 /// Process Priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,7 +24,7 @@ pub enum Priority {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
     Runnable,
-    Waiting, // Waiting for message
+    Waiting(Option<NodeId>), // Waiting for message (optional pattern)
     Sleeping(u64), // Timer
     Terminated,
     Failed(String), // Crash reason
@@ -145,7 +149,7 @@ pub struct Process {
 
 impl Process {
     pub fn new(pid: Pid, program: NodeId, globals: &mut crate::context::GlobalContext) -> Self {
-        let mut arena = ProcessArena::new();
+        let arena = ProcessArena::new();
         
         // Initialize streams (Stdio)
         let streams = crate::streams::StreamManager::new();
@@ -224,16 +228,18 @@ impl Process {
             }
         }
         
-        // Closures
-        for closure in &self.closures {
-            self.mark_node(closure.body, &mut marked);
-            // Mark environment
-            for root in closure.env.iter_roots() {
-                 self.mark_node(root, &mut marked);
-            }
+        // Mark Condition System Roots
+        for root in self.conditions.iter_roots() {
+            self.mark_node(root, &mut marked);
         }
         
-        // TODO: Mark Arrays, Conditions, Streams buffers
+        // Mark MOP Roots
+        for root in self.mop.iter_roots() {
+            self.mark_node(root, &mut marked);
+        }
+        
+        // Closures are now traced via reachability in mark_node.
+        // We do NOT scan all closures to allow collecting unreachable ones.
         
         // 2. Sweep
         let freed = self.arena.inner.sweep(&marked);
@@ -262,8 +268,35 @@ impl Process {
                     Node::Stem(child) => {
                         stack.push(*child);
                     }
-                    Node::Leaf(_) => {
-                         // TODO: If leaf is Array/Vector handle, mark it?
+                    Node::Leaf(val) => {
+                         // Trace complex leaves
+                         match val {
+                             OpaqueValue::VectorHandle(id) => {
+                                 // Trace vector content
+                                 if let Some(vec) = self.arrays.get(crate::arrays::VectorId(*id)) {
+                                     for &child in vec {
+                                         stack.push(child);
+                                     }
+                                 }
+                             }
+                             OpaqueValue::Instance(id) => {
+                                 // Trace instance slots
+                                 if let Some(inst) = self.mop.get_instance(*id as usize) {
+                                     for &slot in &inst.slots {
+                                         stack.push(slot);
+                                     }
+                                 }
+                             }
+                             OpaqueValue::Closure(id) => {
+                                 // Trace closure environment
+                                 if let Some(closure) = self.closures.get(*id as usize) {
+                                     for root in closure.env.iter_roots() {
+                                         stack.push(root);
+                                     }
+                                 }
+                             }
+                             _ => {}
+                         }
                     }
                 }
             }
@@ -276,10 +309,7 @@ impl Process {
             sender,
             payload: msg_root,
         });
-        // Wake up if waiting
-        if matches!(self.status, Status::Waiting) {
-            self.status = Status::Runnable;
-        }
+        // Wakeup logic is handled by Scheduler (checking patterns)
     }
     
     // Symbol Helpers
@@ -369,10 +399,13 @@ impl Process {
         
         if ctx.steps >= budget {
              ExecutionResult::Yielded
-        } else {
+        } else if self.status == Status::Runnable {
              // Terminated (Normal Form)
              self.status = Status::Terminated;
              ExecutionResult::Terminated
+        } else {
+             // Status changed (e.g. Failed, Blocked, SysCall pending)
+             ExecutionResult::Terminated 
         }
     }
 }

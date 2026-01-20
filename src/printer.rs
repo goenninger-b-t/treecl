@@ -102,13 +102,13 @@ impl<'a> Printer<'a> {
     fn detect_combinator(&self, node: NodeId) -> Option<&'static str> {
         // Check for K = Fork(Nil, Nil)
         if self.is_k(node) {
-            return Some("K");
+            return Some(":K-COMBINATOR");
         }
         
         // Check for I = Fork(K, K)
         if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
             if self.is_k(*left) && self.is_k(*right) {
-                return Some("I");
+                return Some(":I-COMBINATOR");
             }
         }
         
@@ -207,6 +207,9 @@ impl<'a> Printer<'a> {
             }
             OpaqueValue::StreamHandle(id) => {
                 self.output.push_str(&format!("#<stream:{}>", id));
+            }
+            OpaqueValue::Pid(pid) => {
+                self.output.push_str(&format!("#<{}.{}.{}>", pid.node, pid.id, pid.serial));
             }
         }
     }

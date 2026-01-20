@@ -26,6 +26,7 @@ impl BExpr {
 pub struct Compiler<'a> {
     arena: &'a mut Arena,
     symbols: &'a SymbolTable,
+    primitives: &'a std::collections::HashMap<SymbolId, crate::context::PrimitiveFn>,
     nil_node: NodeId,
 }
 
@@ -35,6 +36,7 @@ impl<'a> Compiler<'a> {
         Self {
             arena: &mut proc.arena.inner,
             symbols: &ctx.symbols,
+            primitives: &ctx.primitives,
             nil_node,
         }
     }
@@ -114,10 +116,74 @@ impl<'a> Compiler<'a> {
                         let sym_id = SymbolId(id);
                         if params.contains(&sym_id) {
                             Ok(BExpr::Var(sym_id))
+                        } else if self.primitives.contains_key(&sym_id) {
+                             // Global primitive function: compile as constant (symbol itself)
+                             Ok(BExpr::Const(expr))
                         } else {
-                            // Free variable: resolve to value if possible, or keep as Const
-                            // Global constants are resolved at runtime now.
-                            Ok(BExpr::Const(expr))
+                            // Free variable: resolve to value using SYMBOL-VALUE
+                            // This ensures we get dynamic lookup and errors for unbound variables.
+                            
+                            // Find SYMBOL-VALUE symbol
+                            // We assume it's in COMMON-LISP (Package 1)
+                            // We construct an application: (SYMBOL-VALUE 'sym)
+                            // 'sym is just the symbol leaf (OpaqueValue::Symbol already)
+                            
+                            // We need to look up SYMBOL-VALUE symbol ID. 
+                            // Since we don't have direct access to ctx.symbol_table by name easily without iter?
+                            // Actually Compiler has &GlobalContext.
+                            // But we need to be careful about borrowing.
+                            // Compiler struct: pub symbols: &'a SymbolTable
+                            
+                            // We can use a predetermined ID if we knew it, but it's dynamic.
+                            // Safer to treat `SYMBOL-VALUE` as a known primitive wrapper if possible?
+                            // Or just emit a special Node? 
+                            // No, we emit BExpr::App.
+                            
+                            // Let's create a temporary node for SYMBOL-VALUE?
+                            // We can't easily look up mutable from here.
+                            
+                            // Workaround: We emit a specific primitive call pattern?
+                            // Or we modify BExpr to support "Global Lookup"?
+                            
+                            // BExpr::Var is for lambda parameters (bound variables via De Bruijn or named params).
+                            // BExpr::Const is for constants.
+                            
+                            // If we return BExpr::Const(expr), it evaluates to the symbol.
+                            
+                            // We want (SYMBOL-VALUE sym).
+                            // Let's assume we can resolve "SYMBOL-VALUE" from symbols table.
+                            // Be careful: symbols is `&SymbolTable`.
+                            
+                            if let Some(pkg) = self.symbols.get_package(crate::symbol::PackageId(1)) {
+                                if let Some(sv_sym) = pkg.find_symbol("SYMBOL-VALUE") {
+                                    // Create nodes for (SYMBOL-VALUE 'sym)
+                                    // We can't create new nodes in `self.arena` easily inside `match node` due to borrow?
+                                    // self.arena is `&mut ProcessArena`.
+                                    // But `node` is a clone of the value, so we are fine on borrow of `expr`.
+                                    // But `self.arena` is borrowed mutably? 
+                                    // Wait, `compile_to_bexpr` takes `&mut self`.
+                                    
+                                    // Make leaf for SYMBOL-VALUE
+                                    let sv_leaf = self.arena.alloc(Node::Leaf(OpaqueValue::Symbol(sv_sym.0)));
+                                    
+                                    // Make leaf for Quoted Argument?
+                                    // SYMBOL-VALUE takes a symbol. In TC, (f a) applies f to a.
+                                    // If a is a symbol node, it evaluates to itself initially?
+                                    // Wait, if we just pass `expr` (the symbol node), `SYMBOL-VALUE` will receive `Symbol(id)`.
+                                    // That is what we want.
+                                    
+                                    // (SYMBOL-VALUE sym)
+                                    let sv_node = BExpr::Const(sv_leaf);
+                                    let arg_node = BExpr::Const(expr);
+                                    
+                                    Ok(BExpr::App(Box::new(sv_node), Box::new(arg_node)))
+                                } else {
+                                    // Fallback if SYMBOL-VALUE not found (shouldn't happen)
+                                    Ok(BExpr::Const(expr))
+                                }
+                            } else {
+                                Ok(BExpr::Const(expr))
+                            }
                         }
                     }
                     _ => Ok(BExpr::Const(expr)),
@@ -170,7 +236,7 @@ impl<'a> Compiler<'a> {
                                  // `abstract_var` converts `Var(id)` to S/K/I structure.
                                  
                                  // So we just need to abstract the *new* parameters in reverse order.
-                                 let added_len = new_params.len() - params.len();
+                                 let _added_len = new_params.len() - params.len();
                                  let inner_params = &new_params[params.len()..];
                                  
                                  for &param in inner_params.iter().rev() {
@@ -202,9 +268,15 @@ impl<'a> Compiler<'a> {
                         let func_expr = items[0];
                         let mut curr_bexpr = self.compile_to_bexpr(func_expr, params)?;
                         
-                        for arg in &items[1..] {
-                            let arg_bexpr = self.compile_to_bexpr(*arg, params)?;
-                            curr_bexpr = BExpr::App(Box::new(curr_bexpr), Box::new(arg_bexpr));
+                        // Handle 0-arity function calls (f) -> (f nil)
+                        // In Tree Calculus, we must apply to something to trigger evaluation of the function
+                        if items_len == 1 {
+                             curr_bexpr = BExpr::App(Box::new(curr_bexpr), Box::new(BExpr::Const(self.nil_node)));
+                        } else {
+                            for arg in &items[1..] {
+                                let arg_bexpr = self.compile_to_bexpr(*arg, params)?;
+                                curr_bexpr = BExpr::App(Box::new(curr_bexpr), Box::new(arg_bexpr));
+                            }
                         }
                         Ok(curr_bexpr)
                     } else {

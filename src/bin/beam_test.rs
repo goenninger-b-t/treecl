@@ -1,5 +1,5 @@
 use triage_rs::scheduler::Scheduler;
-use triage_rs::process::{Status, ExecutionResult};
+use triage_rs::process::Status;
 use triage_rs::arena::Node;
 use triage_rs::types::OpaqueValue;
 use triage_rs::context::GlobalContext;

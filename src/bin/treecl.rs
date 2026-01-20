@@ -100,13 +100,15 @@ fn main() -> io::Result<()> {
                                 scheduler.run_until_empty(&mut globals);
                                 
                                 // Retrieve REPL process to print result
-                                if let Some(mut proc) = scheduler.registry.remove(&repl_pid) {
+                                if let Some(proc) = scheduler.registry.get(&repl_pid) {
                                     // Print result (program is now the normal form)
-                                    // TODO: If proc failed/panicked? Status would be Terminated.
-                                    // We assume generic success for now.
-                                    let output = print_to_string(&proc.arena.inner, &globals.symbols, proc.program);
-                                    println!("{}", output);
-                                    process = proc; // Keep for next loop
+                                    // Print result (program is now the normal form)
+                                    if let Status::Failed(ref msg) = proc.status {
+                                        println!("Process Crashed: {}", msg);
+                                    } else {
+                                        let output = print_to_string(&proc.arena.inner, &globals.symbols, proc.program);
+                                        println!("{}", output);
+                                    }
                                 } else {
                                     println!("REPL Process lost!");
                                     break;
@@ -125,13 +127,9 @@ fn main() -> io::Result<()> {
                     }
                  }
                  
-                 // Retrieve process for next iteration
-                 if let Some(p) = scheduler.registry.remove(&repl_pid) {
-                     process = p;
-                 } else {
-                     println!("REPL Process lost!");
-                     break;
-                 }
+                 // Process is already returned to registry (or lost) in all paths above.
+                 // We rely on 'scheduler.registry.remove(&repl_pid)' at the start of the loop
+                 // to fail if something went wrong.
              } else {
                  println!("REPL Process died!");
                  break;

@@ -7,9 +7,7 @@ use crate::types::{NodeId, OpaqueValue};
 use crate::symbol::{SymbolTable, SymbolId, PackageId};
 use crate::process::Process;
 use crate::context::GlobalContext;
-use crate::reader::Reader;
 
-use crate::context::PrimitiveFn;
 use std::collections::HashMap;
 
 /// Environment for lexical bindings
@@ -200,14 +198,21 @@ impl<'a> Interpreter<'a> {
                         }
                         // If T or NIL
                         if sym_id == self.globals.t_sym || sym_id == self.globals.nil_sym {
-                            // They evaluate to themselves (which should be bound in process or just return expr)
                              return Ok(expr);
                         }
                         
+                        // Keywords evaluate to themselves
+                        if let Some(sym) = self.globals.symbols.get_symbol(sym_id) {
+                            if sym.is_keyword() {
+                                return Ok(expr);
+                            }
+                        }
+                        
                         // Unbound variable
-                        Ok(expr) // Self-evaluating unbound symbol for TC
+                        let name = self.globals.symbols.symbol_name(sym_id).unwrap_or("???");
+                        Err(ControlSignal::Error(format!("Variable '{}' is not bound", name)))
                     }
-                    _ => Ok(expr), // Self-evaluating
+                    _ => Ok(expr), // Self-evaluating (e.g. Pid)
                 }
             }
             
@@ -224,7 +229,7 @@ impl<'a> Interpreter<'a> {
     }
     
     /// Evaluate a function application or special form
-    fn eval_application(&mut self, op: NodeId, args: NodeId, env: &Environment) -> EvalResult {
+    pub fn eval_application(&mut self, op: NodeId, args: NodeId, env: &Environment) -> EvalResult {
         // First, check if operator is a symbol that's a special form
         if let Some(sym_id) = self.node_to_symbol(op) {
             // Check special forms
@@ -413,6 +418,14 @@ impl<'a> Interpreter<'a> {
                     if let Node::Fork(val_node, next) = self.process.arena.get_unchecked(rest).clone() {
                         // Get symbol
                         if let Some(sym) = self.node_to_symbol(var_node) {
+                            // Check for protected symbol
+                            if self.globals.symbols.is_protected(sym) {
+                                return Err(ControlSignal::Error(
+                                    format!("SETQ: cannot set protected symbol {:?}", 
+                                        self.globals.symbols.get_symbol(sym).map(|s| s.name.as_str()).unwrap_or("?"))
+                                ));
+                            }
+
                             let val = self.eval(val_node, env)?;
                             // Set in Process Dictionary
                             self.process.set_value(sym, val);
@@ -759,8 +772,8 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Node::Leaf(OpaqueValue::Generic(id)) => {
-                // self.apply_generic(id, args, env) // TODO: Port MOP
-                Ok(self.process.make_nil())
+                self.apply_generic(id, args, env)
+                // Ok(self.process.make_nil())
             }
             _ => {
                 // Fall back to tree calculus reduction
@@ -805,6 +818,36 @@ impl<'a> Interpreter<'a> {
         
         let head = spine[0];
         if let Some(sym) = self.node_to_symbol(head) {
+             // 0. Check for Special Forms (Lisp) via eval_application
+             // Only if structure allows it (Head + args)
+             // Tree Calculus Reader produces left-associative application: ((f a) b)
+             // Spine: [f, a, b]
+             // Lisp eval expects (f . (a . (b . nil)))
+             if spine.len() >= 1 {
+                 // Check if symbol is a special form
+                 let is_sf = {
+                     let sf = &self.globals.special_forms;
+                     sym == sf.setq || sym == sf.r#let || sym == sf.quote || 
+                     sym == sf.r#if || sym == sf.progn || sym == sf.function ||
+                     sym == sf.defun || sym == sf.defmacro || sym == sf.defclass ||
+                     sym == sf.defmethod
+                 };
+                 
+                 if is_sf {
+                     // Reconstruct Lisp-style arg list from spine[1..]
+                     let args_list = self.process.make_list(&spine[1..]);
+                     
+                     match self.eval_application(head, args_list, _env) {
+                          Ok(res) => return res,
+                          Err(ControlSignal::Error(msg)) => {
+                               self.process.status = crate::process::Status::Failed(msg);
+                               return root;
+                          }
+                          Err(_) => return root,
+                     }
+                 }
+             }
+
              // Check primitives
              if let Some(&prim_fn) = self.globals.primitives.get(&sym) {
                  // We have a primitive!
@@ -828,6 +871,10 @@ impl<'a> Interpreter<'a> {
                       Err(ControlSignal::SysCall(sc)) => {
                           self.process.pending_redex = Some(redex);
                           self.process.pending_syscall = Some(sc);
+                          return root;
+                      }
+                      Err(ControlSignal::Error(msg)) => {
+                          self.process.status = crate::process::Status::Failed(msg);
                           return root;
                       }
                       Err(_) => return root, // Fallback on error (keep stuck state)
@@ -860,7 +907,7 @@ impl<'a> Interpreter<'a> {
     }
     
     /// Apply a macro closure to arguments (no eval of args)
-    fn apply_macro(&mut self, closure: &Closure, args: NodeId) -> EvalResult {
+    fn _apply_macro(&mut self, closure: &Closure, args: NodeId) -> EvalResult {
         // Create environment from closure's captured environment
         let mut new_env = Environment::with_parent(closure.env.clone());
         
@@ -1249,38 +1296,127 @@ pub struct SpecialForms {
 
 impl SpecialForms {
     pub fn new(symbols: &mut SymbolTable) -> Self {
+        let mut intern_exported = |name: &str| {
+            let sym = symbols.intern_in(name, PackageId(1)); // COMMON-LISP
+            symbols.export_symbol(sym);
+            sym
+        };
+
         Self {
-            quote: symbols.intern_in("QUOTE", PackageId(1)),
-            r#if: symbols.intern_in("IF", PackageId(1)),
-            progn: symbols.intern_in("PROGN", PackageId(1)),
-            setq: symbols.intern_in("SETQ", PackageId(1)),
-            r#let: symbols.intern_in("LET", PackageId(1)),
-            lambda: symbols.intern_in("LAMBDA", PackageId(1)),
-            function: symbols.intern_in("FUNCTION", PackageId(1)),
-            defun: symbols.intern_in("DEFUN", PackageId(1)),
-            defclass: symbols.intern_in("DEFCLASS", PackageId(1)),
-            defmethod: symbols.intern_in("DEFMETHOD", PackageId(1)),
-            definitions: symbols.intern_in("DEFINITIONS", PackageId(1)),
-            block: symbols.intern_in("BLOCK", PackageId(1)),
-            return_from: symbols.intern_in("RETURN-FROM", PackageId(1)),
-            tagbody: symbols.intern_in("TAGBODY", PackageId(1)),
-            go: symbols.intern_in("GO", PackageId(1)),
-            catch: symbols.intern_in("CATCH", PackageId(1)),
-            throw: symbols.intern_in("THROW", PackageId(1)),
-            unwind_protect: symbols.intern_in("UNWIND-PROTECT", PackageId(1)),
-            defmacro: symbols.intern_in("DEFMACRO", PackageId(1)),
-            handler_bind: symbols.intern_in("HANDLER-BIND", PackageId(1)),
-            eval_when: symbols.intern_in("EVAL-WHEN", PackageId(1)),
-            multiple_value_bind: symbols.intern_in("MULTIPLE-VALUE-BIND", PackageId(1)),
-            multiple_value_call: symbols.intern_in("MULTIPLE-VALUE-CALL", PackageId(1)),
-            values: symbols.intern_in("VALUES", PackageId(1)),
-            locally: symbols.intern_in("LOCALLY", PackageId(1)),
-            flet: symbols.intern_in("FLET", PackageId(1)),
-            labels: symbols.intern_in("LABELS", PackageId(1)),
-            macrolet: symbols.intern_in("MACROLET", PackageId(1)),
-            symbol_macrolet: symbols.intern_in("SYMBOL-MACROLET", PackageId(1)),
-            load_time_value: symbols.intern_in("LOAD-TIME-VALUE", PackageId(1)),
-            progression_list: symbols.intern_in("PROGV", PackageId(1)),
+            quote: intern_exported("QUOTE"),
+            r#if: intern_exported("IF"),
+            progn: intern_exported("PROGN"),
+            setq: intern_exported("SETQ"),
+            r#let: intern_exported("LET"),
+            lambda: intern_exported("LAMBDA"),
+            function: intern_exported("FUNCTION"),
+            defun: intern_exported("DEFUN"),
+            defclass: intern_exported("DEFCLASS"),
+            defmethod: intern_exported("DEFMETHOD"),
+            definitions: intern_exported("DEFINITIONS"),
+            block: intern_exported("BLOCK"),
+            return_from: intern_exported("RETURN-FROM"),
+            tagbody: intern_exported("TAGBODY"),
+            go: intern_exported("GO"),
+            catch: intern_exported("CATCH"),
+            throw: intern_exported("THROW"),
+            unwind_protect: intern_exported("UNWIND-PROTECT"),
+            defmacro: intern_exported("DEFMACRO"),
+            handler_bind: intern_exported("HANDLER-BIND"),
+            eval_when: intern_exported("EVAL-WHEN"),
+            multiple_value_bind: intern_exported("MULTIPLE-VALUE-BIND"),
+            multiple_value_call: intern_exported("MULTIPLE-VALUE-CALL"),
+            values: intern_exported("VALUES"),
+            locally: intern_exported("LOCALLY"),
+            flet: intern_exported("FLET"),
+            labels: intern_exported("LABELS"),
+            macrolet: intern_exported("MACROLET"),
+            symbol_macrolet: intern_exported("SYMBOL-MACROLET"),
+            load_time_value: intern_exported("LOAD-TIME-VALUE"),
+            progression_list: intern_exported("PROGV"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::Pid;
+    use crate::reader::read_from_string;
+    
+    
+
+    fn setup_env() -> (Process, GlobalContext) {
+        let mut globals = GlobalContext::new();
+        // Register primitives if needed, but for special forms handled in eval, maybe not strictly required
+        // unless compiled code uses them.
+        let proc = Process::new(Pid { node: 0, id: 1, serial: 0 }, NodeId(0), &mut globals);
+        (proc, globals)
+    }
+
+    #[test]
+    fn test_setq_protected_symbol() {
+        let (mut proc, mut globals) = setup_env();
+        
+        // Ensure we are in CL-USER (Package 2)
+        globals.symbols.set_current_package(PackageId(2));
+        
+        // Input: (setq :s-combinator 1)
+        // :s-combinator is protected in GlobalContext::new
+        let input = "(setq :s-combinator 1)";
+        let expr = read_from_string(input, &mut proc.arena.inner, &mut globals.symbols).unwrap();
+        
+        // Use Interpreter directly on parsing output (no need to compile for this test if we use eval)
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+        
+        let result = interpreter.eval(expr, &env);
+        
+        match result {
+             Err(ControlSignal::Error(msg)) => {
+                 assert!(msg.to_string().contains("protected symbol"), "Expected protected symbol error, got: {}", msg);
+             }
+             Ok(_) => panic!("Refused to fail! :s-combinator should be protected"),
+             Err(e) => panic!("Unexpected error type: {:?}", e),
+        }
+    }
+    
+    #[test]
+    fn test_setq_unprotected_symbol() {
+        let (mut proc, mut globals) = setup_env();
+        globals.symbols.set_current_package(PackageId(2));
+        
+        let input = "(setq x 1)";
+        let expr = read_from_string(input, &mut proc.arena.inner, &mut globals.symbols).unwrap();
+        
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+        
+        let result = interpreter.eval(expr, &env);
+        // Should succeed (returns 1)
+        assert!(result.is_ok()); 
+    }
+
+
+    #[test]
+    fn test_undefined_variable_error() {
+        let (mut proc, mut globals) = setup_env();
+        globals.symbols.set_current_package(PackageId(2));
+        
+        let input = "some-undefined-var";
+        let expr = read_from_string(input, &mut proc.arena.inner, &mut globals.symbols).unwrap();
+        
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+        
+        let result = interpreter.eval(expr, &env);
+        
+        match result {
+             Err(ControlSignal::Error(msg)) => {
+                 assert!(msg.to_string().contains("not bound"), "Expected 'not bound' error, got: {}", msg);
+             }
+             Ok(_) => panic!("Refused to fail! Undefined variable should error."),
+             Err(e) => panic!("Unexpected error type: {:?}", e),
         }
     }
 }

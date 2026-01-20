@@ -354,7 +354,7 @@ impl StreamManager {
     }
     
     /// Unread a character (push back)
-    pub fn unread_char(&mut self, id: StreamId, c: char) -> io::Result<()> {
+    pub fn unread_char(&mut self, id: StreamId, _c: char) -> io::Result<()> {
         match self.get_mut(id) {
             Some(Stream::StringInputStream { position, .. }) => {
                 if *position > 0 {

@@ -19,6 +19,8 @@ pub struct Symbol {
     pub name: String,
     /// The home package (None for uninterned symbols)
     pub package: Option<PackageId>,
+    /// Protected status (cannot be redefined, uninterned, or set)
+    pub is_protected: bool,
     // Removed: value, function, plist (Moved to ProcessDictionary)
 }
 
@@ -27,6 +29,7 @@ impl Symbol {
         Self {
             name,
             package,
+            is_protected: false,
         }
     }
     
@@ -127,6 +130,26 @@ impl SymbolTable {
         table
     }
     
+    
+    /// Get mutable symbol data (INTERNAL USE ONLY)
+    // Protected symbols should typically not be mutated, but we might need
+    // to separate this text later.
+    pub fn get_mut(&mut self, id: SymbolId) -> Option<&mut Symbol> {
+        self.symbols.get_mut(id.0 as usize)
+    }
+
+    /// Mark a symbol as protected
+    pub fn protect_symbol(&mut self, id: SymbolId) {
+        if let Some(sym) = self.symbols.get_mut(id.0 as usize) {
+            sym.is_protected = true;
+        }
+    }
+    
+    /// Check if a symbol is protected
+    pub fn is_protected(&self, id: SymbolId) -> bool {
+        self.get_symbol(id).map(|s| s.is_protected).unwrap_or(false)
+    }
+
     /// Create a new package
     pub fn create_package(&mut self, name: &str) -> PackageId {
         let id = PackageId(self.packages.len() as u32);

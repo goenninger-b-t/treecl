@@ -1,7 +1,6 @@
 use triage_rs::scheduler::Scheduler;
-use triage_rs::process::{Status, ExecutionResult, Pid, Process};
 use triage_rs::arena::Node; // Use standard Node
-use triage_rs::types::{OpaqueValue, NodeId};
+use triage_rs::types::OpaqueValue;
 use triage_rs::context::GlobalContext;
 use triage_rs::primitives::register_primitives;
 

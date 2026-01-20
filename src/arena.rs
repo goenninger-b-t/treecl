@@ -199,3 +199,16 @@ fn deep_copy_recursive(
     copied.insert(src_id, new_id);
     new_id
 }
+
+/// Deep equality check for pattern matching
+pub fn deep_equal(arena: &Arena, a: NodeId, b: NodeId) -> bool {
+    if a == b { return true; }
+    match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+         (Node::Leaf(v1), Node::Leaf(v2)) => v1 == v2,
+         (Node::Stem(c1), Node::Stem(c2)) => deep_equal(arena, *c1, *c2),
+         (Node::Fork(l1, r1), Node::Fork(l2, r2)) => {
+             deep_equal(arena, *l1, *l2) && deep_equal(arena, *r1, *r2)
+         }
+         _ => false
+    }
+}

@@ -20,6 +20,7 @@ pub enum OpaqueValue {
     Symbol(u32),             // Symbol ID
     BigInt(num_bigint::BigInt), // Arbitrary precision integer
     StreamHandle(u32),       // Handle to Stream
+    Pid(crate::process::Pid), // Process ID
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)
@@ -27,6 +28,18 @@ impl PartialOrd for OpaqueValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         use num_traits::ToPrimitive;
         match (self, other) {
+            (OpaqueValue::Pid(a), OpaqueValue::Pid(b)) => {
+                 // Lexicographical comparison for PIDs
+                 match a.node.partial_cmp(&b.node) {
+                     Some(core::cmp::Ordering::Equal) => {
+                         match a.id.partial_cmp(&b.id) {
+                             Some(core::cmp::Ordering::Equal) => a.serial.partial_cmp(&b.serial),
+                             other => other,
+                         }
+                     }
+                     other => other,
+                 }
+            }
             (OpaqueValue::Integer(a), OpaqueValue::Integer(b)) => a.partial_cmp(b),
             (OpaqueValue::BigInt(a), OpaqueValue::BigInt(b)) => a.partial_cmp(b),
             (OpaqueValue::Integer(a), OpaqueValue::BigInt(b)) => {

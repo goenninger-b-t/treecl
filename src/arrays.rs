@@ -125,4 +125,12 @@ impl ArrayStore {
     pub fn total_elements(&self) -> usize {
         self.vectors.iter().map(|v| v.len()).sum()
     }
+    /// Trace nodes in a specific vector
+    pub fn trace_vector(&self, id: VectorId, marked: &mut std::collections::HashSet<u32>) {
+        if let Some(vec) = self.vectors.get(id.0 as usize) {
+            for &node in vec {
+                marked.insert(node.0);
+            }
+        }
+    }
 }
