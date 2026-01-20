@@ -5,10 +5,26 @@
 use crate::arena::{Arena, Node};
 use crate::types::{NodeId, OpaqueValue};
 use crate::symbol::{SymbolId, PackageId};
-use crate::eval::{Interpreter, EvalResult, PrimitiveFn, ControlSignal};
+use crate::eval::{Interpreter, EvalResult, ControlSignal};
+use crate::context::PrimitiveFn;
 use std::collections::HashMap;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use crate::process::Process;
+use crate::context::GlobalContext;
+use crate::syscall::SysCall;
+
+fn err_helper(msg: &str) -> EvalResult {
+    Err(ControlSignal::Error(msg.to_string()))
+}
+
+fn node_to_symbol(proc: &Process, node: NodeId) -> Option<SymbolId> {
+    if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(node) {
+        Some(SymbolId(*id))
+    } else {
+        None
+    }
+}
 
 /// Registry of primitive functions
 pub struct Primitives {
@@ -32,328 +48,350 @@ impl Primitives {
 }
 
 /// Register all standard primitives
-pub fn register_primitives(interp: &mut Interpreter) {
+pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     let cl = PackageId(1);
     
     // Arithmetic
-    interp.register_primitive("+", cl, prim_add);
-    interp.register_primitive("-", cl, prim_sub);
-    interp.register_primitive("*", cl, prim_mul);
-    interp.register_primitive("/", cl, prim_div);
-    interp.register_primitive("1+", cl, prim_1plus);
-    interp.register_primitive("1-", cl, prim_1minus);
-    interp.register_primitive("MOD", cl, prim_mod);
+    globals.register_primitive("+", cl, prim_add);
+    globals.register_primitive("-", cl, prim_sub);
+    globals.register_primitive("*", cl, prim_mul);
+    globals.register_primitive("/", cl, prim_div);
+    globals.register_primitive("1+", cl, prim_1plus);
+    globals.register_primitive("1-", cl, prim_1minus);
+    globals.register_primitive("MOD", cl, prim_mod);
     
     // Comparison
-    interp.register_primitive("=", cl, prim_num_eq);
-    interp.register_primitive("<", cl, prim_lt);
-    interp.register_primitive(">", cl, prim_gt);
-    interp.register_primitive("<=", cl, prim_le);
-    interp.register_primitive(">=", cl, prim_ge);
+    globals.register_primitive("=", cl, prim_num_eq);
+    globals.register_primitive("<", cl, prim_lt);
+    globals.register_primitive(">", cl, prim_gt);
+    globals.register_primitive("<=", cl, prim_le);
+    globals.register_primitive(">=", cl, prim_ge);
     
     // List operations
-    interp.register_primitive("CONS", cl, prim_cons);
-    interp.register_primitive("CAR", cl, prim_car);
-    interp.register_primitive("CDR", cl, prim_cdr);
-    interp.register_primitive("LIST", cl, prim_list);
-    interp.register_primitive("LENGTH", cl, prim_length);
-    interp.register_primitive("APPEND", cl, prim_append);
-    interp.register_primitive("REVERSE", cl, prim_reverse);
-    interp.register_primitive("NTH", cl, prim_nth);
+    globals.register_primitive("CONS", cl, prim_cons);
+    globals.register_primitive("CAR", cl, prim_car);
+    globals.register_primitive("CDR", cl, prim_cdr);
+    globals.register_primitive("LIST", cl, prim_list);
+    globals.register_primitive("LENGTH", cl, prim_length);
+    globals.register_primitive("APPEND", cl, prim_append);
+    globals.register_primitive("REVERSE", cl, prim_reverse);
+    globals.register_primitive("NTH", cl, prim_nth);
     
     // Predicates
-    interp.register_primitive("NULL", cl, prim_null);
-    interp.register_primitive("ATOM", cl, prim_atom);
-    interp.register_primitive("CONSP", cl, prim_consp);
-    interp.register_primitive("LISTP", cl, prim_listp);
-    interp.register_primitive("NUMBERP", cl, prim_numberp);
-    interp.register_primitive("SYMBOLP", cl, prim_symbolp);
-    interp.register_primitive("EQ", cl, prim_eq);
-    interp.register_primitive("EQL", cl, prim_eql);
-    interp.register_primitive("EQUAL", cl, prim_equal);
+    globals.register_primitive("NULL", cl, prim_null);
+    globals.register_primitive("ATOM", cl, prim_atom);
+    globals.register_primitive("CONSP", cl, prim_consp);
+    globals.register_primitive("LISTP", cl, prim_listp);
+    globals.register_primitive("NUMBERP", cl, prim_numberp);
+    globals.register_primitive("SYMBOLP", cl, prim_symbolp);
+    globals.register_primitive("EQ", cl, prim_eq);
+    globals.register_primitive("EQL", cl, prim_eql);
+    globals.register_primitive("EQUAL", cl, prim_equal);
     
     // Logic
-    interp.register_primitive("NOT", cl, prim_not);
+    globals.register_primitive("NOT", cl, prim_not);
     
     // I/O
-    interp.register_primitive("PRINT", cl, prim_print);
-    interp.register_primitive("PRINC", cl, prim_princ);
-    interp.register_primitive("TERPRI", cl, prim_terpri);
-    interp.register_primitive("FORMAT", cl, prim_format);
+    globals.register_primitive("PRINT", cl, prim_print);
+    globals.register_primitive("PRINC", cl, prim_princ);
+    globals.register_primitive("TERPRI", cl, prim_terpri);
+    globals.register_primitive("FORMAT", cl, prim_format);
     
     // CLOS
-    interp.register_primitive("FIND-CLASS", cl, prim_find_class);
-    interp.register_primitive("MAKE-INSTANCE", cl, prim_make_instance);
-    interp.register_primitive("CLASS-OF", cl, prim_class_of);
-    interp.register_primitive("SLOT-VALUE", cl, prim_slot_value);
-    interp.register_primitive("SET-SLOT-VALUE", cl, prim_set_slot_value);
+    globals.register_primitive("FIND-CLASS", cl, prim_find_class);
+    globals.register_primitive("MAKE-INSTANCE", cl, prim_make_instance);
+    globals.register_primitive("CLASS-OF", cl, prim_class_of);
+    globals.register_primitive("SLOT-VALUE", cl, prim_slot_value);
+    globals.register_primitive("SET-SLOT-VALUE", cl, prim_set_slot_value);
     
     // Error handling
-    interp.register_primitive("ERROR", cl, prim_error);
+    globals.register_primitive("ERROR", cl, prim_error);
 
     // System
-    interp.register_primitive("GC", cl, prim_gc);
-    interp.register_primitive("ROOM", cl, prim_room);
+    globals.register_primitive("GC", cl, prim_gc);
+    globals.register_primitive("ROOM", cl, prim_room);
     
     // Arrays
-    interp.register_primitive("MAKE-ARRAY", cl, prim_make_array);
-    interp.register_primitive("AREF", cl, prim_aref);
-    interp.register_primitive("SET-AREF", cl, prim_set_aref);
+    globals.register_primitive("MAKE-ARRAY", cl, prim_make_array);
+    globals.register_primitive("AREF", cl, prim_aref);
+    globals.register_primitive("SET-AREF", cl, prim_set_aref);
     
     // Readtable
-    interp.register_primitive("SET-MACRO-CHARACTER", cl, prim_set_macro_character);
-    interp.register_primitive("GET-MACRO-CHARACTER", cl, prim_get_macro_character);
-    interp.register_primitive("SET-SYNTAX-FROM-CHAR", cl, prim_set_syntax_from_char);
+    globals.register_primitive("SET-MACRO-CHARACTER", cl, prim_set_macro_character);
+    globals.register_primitive("GET-MACRO-CHARACTER", cl, prim_get_macro_character);
+    globals.register_primitive("SET-SYNTAX-FROM-CHAR", cl, prim_set_syntax_from_char);
     
     // Tools
-    interp.register_primitive("COMPILE", cl, prim_compile);
-    interp.register_primitive("TREE-STRING", cl, prim_tree_string);
-    interp.register_primitive("FUNCALL", cl, prim_funcall);
-    interp.register_primitive("APPLY", cl, prim_apply);
+    globals.register_primitive("COMPILE", cl, prim_compile);
+    globals.register_primitive("TREE-STRING", cl, prim_tree_string);
+    globals.register_primitive("FUNCALL", cl, prim_funcall);
+    globals.register_primitive("APPLY", cl, prim_apply);
     
     // Streams
-    interp.register_primitive("MAKE-STRING-OUTPUT-STREAM", cl, prim_make_string_output_stream);
-    interp.register_primitive("GET-OUTPUT-STREAM-STRING", cl, prim_get_output_stream_string);
-    interp.register_primitive("MAKE-STRING-INPUT-STREAM", cl, prim_make_string_input_stream);
-    interp.register_primitive("CLOSE", cl, prim_close);
-    interp.register_primitive("WRITE-STRING", cl, prim_write_string);
-    interp.register_primitive("WRITE-CHAR", cl, prim_write_char);
-    interp.register_primitive("FRESH-LINE", cl, prim_fresh_line);
+    globals.register_primitive("MAKE-STRING-OUTPUT-STREAM", cl, prim_make_string_output_stream);
+    globals.register_primitive("GET-OUTPUT-STREAM-STRING", cl, prim_get_output_stream_string);
+    globals.register_primitive("MAKE-STRING-INPUT-STREAM", cl, prim_make_string_input_stream);
+    globals.register_primitive("CLOSE", cl, prim_close);
+    globals.register_primitive("WRITE-STRING", cl, prim_write_string);
+    globals.register_primitive("WRITE-CHAR", cl, prim_write_char);
+    globals.register_primitive("FRESH-LINE", cl, prim_fresh_line);
+
+    // Concurrency
+    globals.register_primitive("SPAWN", cl, prim_spawn);
+    globals.register_primitive("SEND", cl, prim_send);
+    globals.register_primitive("RECEIVE", cl, prim_receive);
+    globals.register_primitive("SELF", cl, prim_self);
+    globals.register_primitive("SLEEP", cl, prim_sleep);
 }
 
 // ============================================================================
 // Arithmetic Primitives
 // ============================================================================
 
-fn prim_add(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_add(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     let mut sum = NumVal::Int(0);
     
     for &arg in args {
-        let val = extract_number(&interp.arena, arg);
+        let val = extract_number(&proc.arena.inner, arg);
         sum = sum.add(val);
     }
     
-    Ok(sum.to_node(&mut interp.arena))
+    Ok(sum.to_node(&mut proc.arena.inner))
 }
 
-fn prim_sub(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_sub(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return Ok(interp.make_integer(0));
+        return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(0))));
     }
     
-    let first = extract_number(&interp.arena, args[0]);
+    let first = extract_number(&proc.arena.inner, args[0]);
     
     if args.len() == 1 {
         // Unary minus
         match first {
             NumVal::Int(n) => {
                 match n.checked_neg() {
-                    Some(res) => Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Integer(res)))),
-                    None => Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Float(-(n as f64))))),
+                    Some(res) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(res)))),
+                    None => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(-(n as f64))))),
                 }
             }
-            NumVal::Big(n) => Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::BigInt(-n)))),
-            NumVal::Float(f) => Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Float(-f)))),
-            NumVal::None => Ok(interp.nil_node),
+            NumVal::Big(n) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::BigInt(-n)))),
+            NumVal::Float(f) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(-f)))),
+            NumVal::None => return err_helper("Arithmetic error: non-numeric argument"),
+            // GlobalContext holds nil_sym, but nil_node is in process arena?
+            // Actually context.rs line 26: nil_sym.
+            // But we need NodeId.
+            // We can alloc NIL value.
         }
     } else {
         let mut result = first;
         for &arg in &args[1..] {
-            let val = extract_number(&interp.arena, arg);
+            let val = extract_number(&proc.arena.inner, arg);
             result = result.sub(val);
         }
-        Ok(result.to_node(&mut interp.arena))
+        Ok(result.to_node(&mut proc.arena.inner))
     }
 }
 
-fn prim_mul(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+// Note: To support "ctx.nil_node", we either need to alloc NIL,
+// or check if Process has cached NIL.
+// For now, let's assume we alloc new NILs. Leaf(Nil) is small.
+fn make_nil(proc: &mut crate::process::Process) -> NodeId {
+    proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Nil))
+}
+
+fn prim_mul(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     let mut product = NumVal::Int(1);
     
     for &arg in args {
-        let val = extract_number(&interp.arena, arg);
+        let val = extract_number(&proc.arena.inner, arg);
         product = product.mul(val);
     }
     
-    Ok(product.to_node(&mut interp.arena))
+    Ok(product.to_node(&mut proc.arena.inner))
 }
 
-fn prim_div(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_div(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return Ok(interp.make_integer(1));
+        return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(1))));
     }
     
-    let first = extract_number(&interp.arena, args[0]);
+    let first = extract_number(&proc.arena.inner, args[0]);
     
     if args.len() == 1 {
         // Reciprocal
         match first {
-            NumVal::Int(n) if n != 0 => Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Float(1.0 / n as f64)))),
-            NumVal::Float(f) => Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Float(1.0 / f)))),
-            _ => Ok(interp.nil_node),
+            NumVal::Int(n) if n != 0 => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(1.0 / n as f64)))),
+            NumVal::Float(f) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(1.0 / f)))),
+            _ => Ok(make_nil(proc)),
         }
     } else {
         let mut result = first;
         for &arg in &args[1..] {
-            let val = extract_number(&interp.arena, arg);
+            let val = extract_number(&proc.arena.inner, arg);
             result = result.div(val);
         }
-        Ok(result.to_node(&mut interp.arena))
+        Ok(result.to_node(&mut proc.arena.inner))
     }
 }
 
-fn prim_1plus(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_1plus(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let val = extract_number(&interp.arena, arg);
-        Ok(val.add(NumVal::Int(1)).to_node(&mut interp.arena))
+        let val = extract_number(&proc.arena.inner, arg);
+        Ok(val.add(NumVal::Int(1)).to_node(&mut proc.arena.inner))
     } else {
-        Ok(interp.nil_node)
+        Ok(make_nil(proc))
     }
 }
 
-fn prim_1minus(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_1minus(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let val = extract_number(&interp.arena, arg);
-        Ok(val.sub(NumVal::Int(1)).to_node(&mut interp.arena))
+        let val = extract_number(&proc.arena.inner, arg);
+        Ok(val.sub(NumVal::Int(1)).to_node(&mut proc.arena.inner))
     } else {
-        Ok(interp.nil_node)
+        Ok(make_nil(proc))
     }
 }
 
-fn prim_mod(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_mod(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() >= 2 {
-        let a_val = extract_number(&interp.arena, args[0]);
-        let b_val = extract_number(&interp.arena, args[1]);
+        let a_val = extract_number(&proc.arena.inner, args[0]);
+        let b_val = extract_number(&proc.arena.inner, args[1]);
         
         match (a_val, b_val) {
             (NumVal::Int(a), NumVal::Int(b)) if b != 0 => {
-                return Ok(interp.make_integer(a % b));
+                return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(a % b))));
             }
             (NumVal::Big(a), NumVal::Big(b)) if b != BigInt::from(0) => {
-                return Ok(NumVal::Big(a % b).to_node(&mut interp.arena));
+                return Ok(NumVal::Big(a % b).to_node(&mut proc.arena.inner));
             }
             (NumVal::Big(a), NumVal::Int(b)) if b != 0 => {
-                return Ok(NumVal::Big(a % BigInt::from(b)).to_node(&mut interp.arena));
+                return Ok(NumVal::Big(a % BigInt::from(b)).to_node(&mut proc.arena.inner));
             }
             (NumVal::Int(a), NumVal::Big(b)) if b != BigInt::from(0) => {
-                return Ok(NumVal::Big(BigInt::from(a) % b).to_node(&mut interp.arena));
+                return Ok(NumVal::Big(BigInt::from(a) % b).to_node(&mut proc.arena.inner));
             }
             _ => {}
         }
     }
-    Ok(interp.nil_node)
+    Ok(make_nil(proc))
 }
 
 // ============================================================================
 // Comparison Primitives
 // ============================================================================
 
-fn prim_num_eq(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+// ============================================================================
+// Comparison Primitives
+// ============================================================================
+
+fn prim_num_eq(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() < 2 {
-        return Ok(interp.t_node);
+        return Ok(proc.make_t(ctx));
     }
     
-    let first = extract_number(&interp.arena, args[0]);
+    let first = extract_number(&proc.arena.inner, args[0]);
     for &arg in &args[1..] {
-        let val = extract_number(&interp.arena, arg);
+        let val = extract_number(&proc.arena.inner, arg);
         if !first.eq(&val) {
-            return Ok(interp.nil_node);
+            return Ok(proc.make_nil());
         }
     }
-    Ok(interp.t_node)
+    Ok(proc.make_t(ctx))
 }
 
-fn prim_lt(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
-    compare_chain(interp, args, |a, b| a < b)
+fn prim_lt(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
+    compare_chain(proc, ctx, args, |a, b| a < b)
 }
 
-fn prim_gt(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
-    compare_chain(interp, args, |a, b| a > b)
+fn prim_gt(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
+    compare_chain(proc, ctx, args, |a, b| a > b)
 }
 
-fn prim_le(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
-    compare_chain(interp, args, |a, b| a <= b)
+fn prim_le(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
+    compare_chain(proc, ctx, args, |a, b| a <= b)
 }
 
-fn prim_ge(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
-    compare_chain(interp, args, |a, b| a >= b)
+fn prim_ge(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
+    compare_chain(proc, ctx, args, |a, b| a >= b)
 }
 
-fn compare_chain<F>(interp: &mut Interpreter, args: &[NodeId], cmp: F) -> EvalResult
+fn compare_chain<F>(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId], cmp: F) -> EvalResult
 where
     F: Fn(&NumVal, &NumVal) -> bool,
 {
     if args.len() < 2 {
-        return Ok(interp.t_node);
+        return Ok(proc.make_t(ctx));
     }
     
-    let mut prev = extract_number(&interp.arena, args[0]);
+    let mut prev = extract_number(&proc.arena.inner, args[0]);
     for &arg in &args[1..] {
-        let curr = extract_number(&interp.arena, arg);
+        let curr = extract_number(&proc.arena.inner, arg);
         if !cmp(&prev, &curr) {
-            return Ok(interp.nil_node);
+            return Ok(proc.make_nil());
         }
         prev = curr;
     }
-    Ok(interp.t_node)
+    Ok(proc.make_t(ctx))
 }
 
 // ============================================================================
 // List Primitives
 // ============================================================================
 
-fn prim_cons(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_cons(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() >= 2 {
-        Ok(interp.arena.alloc(Node::Fork(args[0], args[1])))
+        Ok(proc.arena.inner.alloc(Node::Fork(args[0], args[1])))
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_car(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_car(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
+        match proc.arena.inner.get_unchecked(arg) {
             Node::Fork(car, _) => Ok(*car),
-            Node::Leaf(OpaqueValue::Nil) => Ok(interp.nil_node),
-            _ => interp.signal_error("CAR: Argument is not a list"),
+            Node::Leaf(OpaqueValue::Nil) => Ok(proc.make_nil()),
+            _ => Err(ControlSignal::Error("CAR: Argument is not a list".to_string())),
         }
     } else {
-        interp.signal_error("CAR: Too few arguments")
+        Err(ControlSignal::Error("CAR: Too few arguments".to_string()))
     }
 }
 
-fn prim_cdr(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_cdr(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
+        match proc.arena.inner.get_unchecked(arg) {
             Node::Fork(_, cdr) => Ok(*cdr),
-            Node::Leaf(OpaqueValue::Nil) => Ok(interp.nil_node),
-            _ => interp.signal_error("CDR: Argument is not a list"),
+            Node::Leaf(OpaqueValue::Nil) => Ok(proc.make_nil()),
+            _ => Err(ControlSignal::Error("CDR: Argument is not a list".to_string())),
         }
     } else {
-        interp.signal_error("CDR: Too few arguments")
+        Err(ControlSignal::Error("CDR: Too few arguments".to_string()))
     }
 }
 
-fn prim_list(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
-    Ok(interp.list(args))
+fn prim_list(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
+    Ok(proc.make_list(args))
 }
 
-fn prim_length(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_length(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
         let mut len = 0;
         let mut current = arg;
-        while let Node::Fork(_, cdr) = interp.arena.get_unchecked(current).clone() {
+        while let Node::Fork(_, cdr) = proc.arena.inner.get_unchecked(current).clone() {
             len += 1;
             current = cdr;
         }
-        Ok(interp.make_integer(len))
+        Ok(proc.make_integer(len))
     } else {
-        Ok(interp.make_integer(0))
+        Ok(proc.make_integer(0))
     }
 }
 
-fn prim_append(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_append(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return Ok(interp.nil_node);
+        return Ok(proc.make_nil());
     }
     
     // Collect all elements
@@ -366,160 +404,162 @@ fn prim_append(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
             }
             let mut result = arg;
             for elem in all_elements.into_iter().rev() {
-                result = interp.arena.alloc(Node::Fork(elem, result));
+                result = proc.arena.inner.alloc(Node::Fork(elem, result));
             }
             return Ok(result);
         }
         
         let mut current = arg;
-        while let Node::Fork(car, cdr) = interp.arena.get_unchecked(current).clone() {
+        while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(current).clone() {
             all_elements.push(car);
             current = cdr;
         }
     }
     
-    Ok(interp.list(&all_elements))
+    Ok(proc.make_list(&all_elements))
 }
 
-fn prim_reverse(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_reverse(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
         let mut elements = Vec::new();
         let mut current = arg;
-        while let Node::Fork(car, cdr) = interp.arena.get_unchecked(current).clone() {
+        while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(current).clone() {
             elements.push(car);
             current = cdr;
         }
         elements.reverse();
-        Ok(interp.list(&elements))
+        Ok(proc.make_list(&elements))
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_nth(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_nth(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() >= 2 {
-        if let NumVal::Int(n) = extract_number(&interp.arena, args[0]) {
+        if let NumVal::Int(n) = extract_number(&proc.arena.inner, args[0]) {
             let mut current = args[1];
             for _ in 0..n {
-                if let Node::Fork(_, cdr) = interp.arena.get_unchecked(current).clone() {
+                if let Node::Fork(_, cdr) = proc.arena.inner.get_unchecked(current).clone() {
                     current = cdr;
                 } else {
-                    return Ok(interp.nil_node);
+                    return Ok(proc.make_nil());
                 }
             }
-            if let Node::Fork(car, _) = interp.arena.get_unchecked(current).clone() {
+            if let Node::Fork(car, _) = proc.arena.inner.get_unchecked(current).clone() {
                 return Ok(car);
             }
         }
     }
-    Ok(interp.nil_node)
+    Ok(proc.make_nil())
 }
 
 // ============================================================================
 // Predicates
 // ============================================================================
 
-fn prim_null(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_null(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        if arg == interp.nil_node {
-            Ok(interp.t_node)
-        } else if let Node::Leaf(OpaqueValue::Nil) = interp.arena.get_unchecked(arg) {
-            Ok(interp.t_node)
+        // Need to check if arg is NIL node (which is distinct now) or Leaf(Nil)
+        if let Node::Leaf(OpaqueValue::Nil) = proc.arena.inner.get_unchecked(arg) {
+            Ok(proc.make_t(ctx))
         } else {
-            Ok(interp.nil_node)
+            Ok(proc.make_nil())
         }
     } else {
-        Ok(interp.t_node)
+        Ok(proc.make_t(ctx))
     }
 }
 
-fn prim_atom(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_atom(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
-            Node::Fork(_, _) => Ok(interp.nil_node),
-            _ => Ok(interp.t_node),
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Fork(_, _) => Ok(proc.make_nil()),
+            _ => Ok(proc.make_t(ctx)),
         }
     } else {
-        Ok(interp.t_node)
+        Ok(proc.make_t(ctx))
     }
 }
 
-fn prim_consp(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_consp(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
-            Node::Fork(_, _) => Ok(interp.t_node),
-            _ => Ok(interp.nil_node),
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Fork(_, _) => Ok(proc.make_t(ctx)),
+            _ => Ok(proc.make_nil()),
         }
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_listp(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_listp(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
-            Node::Fork(_, _) => Ok(interp.t_node),
-            Node::Leaf(OpaqueValue::Nil) => Ok(interp.t_node),
-            _ => Ok(interp.nil_node),
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Fork(_, _) => Ok(proc.make_t(ctx)),
+            Node::Leaf(OpaqueValue::Nil) => Ok(proc.make_t(ctx)),
+            _ => Ok(proc.make_nil()),
         }
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_numberp(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_numberp(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
+        match proc.arena.inner.get_unchecked(arg) {
             Node::Leaf(OpaqueValue::Integer(_)) |
-            Node::Leaf(OpaqueValue::Float(_)) => Ok(interp.t_node),
-            _ => Ok(interp.nil_node),
+            Node::Leaf(OpaqueValue::Float(_)) => Ok(proc.make_t(ctx)),
+            _ => Ok(proc.make_nil()),
         }
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_symbolp(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_symbolp(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        match interp.arena.get_unchecked(arg) {
-            Node::Stem(_) => Ok(interp.t_node),
-            _ => Ok(interp.nil_node),
+        match proc.arena.inner.get_unchecked(arg) {
+             // Symbols are OpaqueValue::Symbol now
+             Node::Leaf(OpaqueValue::Symbol(_)) => Ok(proc.make_t(ctx)),
+             Node::Leaf(OpaqueValue::Nil) => Ok(proc.make_t(ctx)), // NIL is a symbol
+             // T? T is OpaqueValue::Symbol.
+            _ => Ok(proc.make_nil()),
         }
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_eq(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_eq(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() >= 2 && args[0] == args[1] {
-        Ok(interp.t_node)
+        Ok(proc.make_t(ctx))
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_eql(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_eql(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() < 2 {
-        return Ok(interp.t_node);
+        return Ok(proc.make_t(ctx));
     }
     
     if args[0] == args[1] {
-        return Ok(interp.t_node);
+        return Ok(proc.make_t(ctx));
     }
     
     // Check numeric equality
-    let a = extract_number(&interp.arena, args[0]);
-    let b = extract_number(&interp.arena, args[1]);
+    let a = extract_number(&proc.arena.inner, args[0]);
+    let b = extract_number(&proc.arena.inner, args[1]);
     if a.eq(&b) {
-        return Ok(interp.t_node);
+        return Ok(proc.make_t(ctx));
     }
     
-    Ok(interp.nil_node)
+    Ok(proc.make_nil())
 }
 
-fn prim_equal(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_equal(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() < 2 {
-        return Ok(interp.t_node);
+        return Ok(proc.make_t(ctx));
     }
     
     fn equal_rec(arena: &Arena, a: NodeId, b: NodeId) -> bool {
@@ -537,24 +577,22 @@ fn prim_equal(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
         }
     }
     
-    if equal_rec(&interp.arena, args[0], args[1]) {
-        Ok(interp.t_node)
+    if equal_rec(&proc.arena.inner, args[0], args[1]) {
+        Ok(proc.make_t(ctx))
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_not(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_not(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        if arg == interp.nil_node {
-            Ok(interp.t_node)
-        } else if let Node::Leaf(OpaqueValue::Nil) = interp.arena.get_unchecked(arg) {
-            Ok(interp.t_node)
+        if let Node::Leaf(OpaqueValue::Nil) = proc.arena.inner.get_unchecked(arg) {
+            Ok(proc.make_t(ctx))
         } else {
-            Ok(interp.nil_node)
+             Ok(proc.make_nil())
         }
     } else {
-        Ok(interp.t_node)
+        Ok(proc.make_t(ctx))
     }
 }
 
@@ -563,54 +601,57 @@ fn prim_not(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
 // ============================================================================
 
 /// Get the current output stream from *STANDARD-OUTPUT*
-fn get_current_output_stream(interp: &Interpreter) -> crate::streams::StreamId {
+fn get_current_output_stream(proc: &crate::process::Process, ctx: &crate::context::GlobalContext) -> crate::streams::StreamId {
     use crate::symbol::PackageId;
     
     // Look up *STANDARD-OUTPUT* symbol in COMMON-LISP package
-    if let Some(pkg) = interp.symbols.get_package(PackageId(1)) {
+    if let Some(pkg) = ctx.symbols.get_package(PackageId(1)) {
         if let Some(sym) = pkg.find_symbol("*STANDARD-OUTPUT*") {
-            if let Some(node) = interp.symbols.symbol_value(sym) {
-                if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(node) {
-                    return crate::streams::StreamId(*id);
+            // Check process dictionary for binding
+            if let Some(bind) = proc.dictionary.get(&sym) {
+                if let Some(val) = bind.value {
+                    if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(val) {
+                        return crate::streams::StreamId(*id);
+                    }
                 }
             }
         }
     }
-    // Fallback to the fixed stdout
-    interp.standard_output
+    // Fallback to the fixed stdout (1)
+    crate::streams::StreamId(1)
 }
 
-fn prim_print(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_print(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     use crate::printer::print_to_string;
     
     if let Some(&arg) = args.first() {
-        let s = print_to_string(&interp.arena, &interp.symbols, arg);
-        let out_id = get_current_output_stream(interp);
-        let _ = interp.streams.write_string(out_id, &s);
-        let _ = interp.streams.write_newline(out_id);
+        let s = print_to_string(&proc.arena.inner, &ctx.symbols, arg);
+        let out_id = get_current_output_stream(proc, ctx);
+        let _ = proc.streams.write_string(out_id, &s);
+        let _ = proc.streams.write_newline(out_id);
         Ok(arg)
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_princ(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_princ(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     use crate::printer::princ_to_string;
     
     if let Some(&arg) = args.first() {
-        let s = princ_to_string(&interp.arena, &interp.symbols, arg);
-        let out_id = get_current_output_stream(interp);
-        let _ = interp.streams.write_string(out_id, &s);
+        let s = princ_to_string(&proc.arena.inner, &ctx.symbols, arg);
+        let out_id = get_current_output_stream(proc, ctx);
+        let _ = proc.streams.write_string(out_id, &s);
         Ok(arg)
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_terpri(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
-    let out_id = get_current_output_stream(interp);
-    let _ = interp.streams.write_newline(out_id);
-    Ok(interp.nil_node)
+fn prim_terpri(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> EvalResult {
+    let out_id = get_current_output_stream(proc, ctx);
+    let _ = proc.streams.write_newline(out_id);
+    Ok(proc.make_nil())
 }
 
 /// (format destination control-string &rest args)
@@ -625,11 +666,11 @@ fn prim_terpri(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
 /// ~% - Newline
 /// ~& - Fresh line (newline if not at column 0)
 /// ~~ - Literal tilde
-fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_format(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     use crate::printer::{print_to_string, princ_to_string};
     
     if args.len() < 2 {
-        return interp.signal_error("FORMAT requires at least 2 arguments (destination control-string)");
+        return err_helper("FORMAT requires at least 2 arguments (destination control-string)");
     }
     
     let dest = args[0];
@@ -637,9 +678,9 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     let format_args = &args[2..];
     
     // Get the control string
-    let control_string = match interp.arena.get_unchecked(control_string_node) {
+    let control_string = match proc.arena.inner.get_unchecked(control_string_node) {
         Node::Leaf(OpaqueValue::String(s)) => s.clone(),
-        _ => return interp.signal_error("FORMAT: control-string must be a string"),
+        _ => return err_helper("FORMAT: control-string must be a string"),
     };
     
     // Process the format string
@@ -652,7 +693,7 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
         if chars[i] == '~' {
             i += 1;
             if i >= chars.len() {
-                return interp.signal_error("FORMAT: unexpected end of control string after ~");
+                return err_helper("FORMAT: unexpected end of control string after ~");
             }
             
             // Parse optional parameters (mincol, colinc, minpad, padchar)
@@ -668,7 +709,7 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
             }
             
             if i >= chars.len() {
-                return interp.signal_error("FORMAT: unexpected end of control string");
+                return err_helper("FORMAT: unexpected end of control string");
             }
             
             let directive = chars[i].to_ascii_uppercase();
@@ -677,110 +718,110 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
                 'A' => {
                     // Aesthetic output (princ)
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~A");
+                        return err_helper("FORMAT: not enough arguments for ~A");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
                     
-                    if colon && matches!(interp.arena.get_unchecked(arg), Node::Leaf(OpaqueValue::Nil)) {
+                    if colon && matches!(proc.arena.inner.get_unchecked(arg), Node::Leaf(OpaqueValue::Nil)) {
                         result.push_str("()");
                     } else {
-                        result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg));
+                        result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg));
                     }
                 }
                 'S' => {
                     // Standard output (prin1)
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~S");
+                        return err_helper("FORMAT: not enough arguments for ~S");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    result.push_str(&print_to_string(&interp.arena, &interp.symbols, arg));
+                    result.push_str(&print_to_string(&proc.arena.inner, &ctx.symbols, arg));
                 }
                 'D' => {
                     // Decimal integer
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~D");
+                        return err_helper("FORMAT: not enough arguments for ~D");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             if at_sign && *n >= 0 {
                                 result.push('+');
                             }
                             result.push_str(&n.to_string());
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 'B' => {
                     // Binary integer
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~B");
+                        return err_helper("FORMAT: not enough arguments for ~B");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             result.push_str(&format!("{:b}", n));
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 'O' => {
                     // Octal integer
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~O");
+                        return err_helper("FORMAT: not enough arguments for ~O");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             result.push_str(&format!("{:o}", n));
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 'X' => {
                     // Hexadecimal integer
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~X");
+                        return err_helper("FORMAT: not enough arguments for ~X");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             result.push_str(&format!("{:x}", n));
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 'F' => {
                     // Floating point
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~F");
+                        return err_helper("FORMAT: not enough arguments for ~F");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Float(f)) => {
                             result.push_str(&format!("{}", f));
                         }
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             result.push_str(&format!("{}.0", n));
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 'C' => {
                     // Character
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~C");
+                        return err_helper("FORMAT: not enough arguments for ~C");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             if let Some(c) = char::from_u32(*n as u32) {
                                 result.push(c);
@@ -791,7 +832,7 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
                                 result.push(c);
                             }
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 '%' => {
@@ -811,15 +852,15 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
                 'R' => {
                     // Radix (basic support: just decimal for now)
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~R");
+                        return err_helper("FORMAT: not enough arguments for ~R");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    match interp.arena.get_unchecked(arg) {
+                    match proc.arena.inner.get_unchecked(arg) {
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             result.push_str(&n.to_string());
                         }
-                        _ => result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg)),
+                        _ => result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg)),
                     }
                 }
                 '*' => {
@@ -842,11 +883,11 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
                 '?' => {
                     // Recursive format (not fully implemented - treat as ~A)
                     if arg_index >= format_args.len() {
-                        return interp.signal_error("FORMAT: not enough arguments for ~?");
+                        return err_helper("FORMAT: not enough arguments for ~?");
                     }
                     let arg = format_args[arg_index];
                     arg_index += 1;
-                    result.push_str(&princ_to_string(&interp.arena, &interp.symbols, arg));
+                    result.push_str(&princ_to_string(&proc.arena.inner, &ctx.symbols, arg));
                 }
                 _ => {
                     // Unknown directive - just output it
@@ -861,13 +902,13 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     }
     
     // Handle destination
-    let is_nil = matches!(interp.arena.get_unchecked(dest), Node::Leaf(OpaqueValue::Nil));
-    let is_t = if let Node::Leaf(OpaqueValue::Symbol(id)) = interp.arena.get_unchecked(dest) {
-        SymbolId(*id) == interp.t_sym
+    let is_nil = matches!(proc.arena.inner.get_unchecked(dest), Node::Leaf(OpaqueValue::Nil));
+    let is_t = if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(dest) {
+        SymbolId(*id) == ctx.t_sym
     } else {
         false
     };
-    let stream_id = if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(dest) {
+    let stream_id = if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(dest) {
         Some(crate::streams::StreamId(*id))
     } else {
         None
@@ -875,21 +916,21 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     
     if is_nil {
         // Return the formatted string
-        Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::String(result))))
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(result))))
     } else if is_t {
         // Output to standard output
-        let out_id = interp.standard_output;
-        let _ = interp.streams.write_string(out_id, &result);
-        Ok(interp.nil_node)
+        let out_id = get_current_output_stream(proc, ctx);
+        let _ = proc.streams.write_string(out_id, &result);
+        Ok(proc.make_nil())
     } else if let Some(id) = stream_id {
         // Output to specified stream
-        let _ = interp.streams.write_string(id, &result);
-        Ok(interp.nil_node)
+        let _ = proc.streams.write_string(id, &result);
+        Ok(proc.make_nil())
     } else {
         // For unknown destinations, output to stdout
-        let out_id = interp.standard_output;
-        let _ = interp.streams.write_string(out_id, &result);
-        Ok(interp.nil_node)
+        let out_id = get_current_output_stream(proc, ctx);
+        let _ = proc.streams.write_string(out_id, &result);
+        Ok(proc.make_nil())
     }
 }
 
@@ -898,131 +939,131 @@ fn prim_format(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
 // ============================================================================
 
 /// (make-string-output-stream) -> stream
-fn prim_make_string_output_stream(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
+fn prim_make_string_output_stream(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> EvalResult {
     use crate::streams::Stream;
     
     let stream = Stream::StringOutputStream { buffer: String::new() };
-    let id = interp.streams.alloc(stream);
-    Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))))
+    let id = proc.streams.alloc(stream);
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))))
 }
 
 /// (get-output-stream-string stream) -> string
-fn prim_get_output_stream_string(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_get_output_stream_string(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(arg) {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(arg) {
             let stream_id = crate::streams::StreamId(*id);
-            if let Some(s) = interp.streams.get_output_stream_string(stream_id) {
-                return Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::String(s))));
+            if let Some(s) = proc.streams.get_output_stream_string(stream_id) {
+                return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(s))));
             } else {
-                return interp.signal_error("GET-OUTPUT-STREAM-STRING: not a string output stream");
+                return err_helper("GET-OUTPUT-STREAM-STRING: not a string output stream");
             }
         }
     }
-    interp.signal_error("GET-OUTPUT-STREAM-STRING requires a stream argument")
+    err_helper("GET-OUTPUT-STREAM-STRING requires a stream argument")
 }
 
 /// (make-string-input-stream string) -> stream
-fn prim_make_string_input_stream(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_make_string_input_stream(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     use crate::streams::Stream;
     
     if let Some(&arg) = args.first() {
-        if let Node::Leaf(OpaqueValue::String(s)) = interp.arena.get_unchecked(arg) {
+        if let Node::Leaf(OpaqueValue::String(s)) = proc.arena.inner.get_unchecked(arg) {
             let stream = Stream::StringInputStream { 
                 buffer: s.clone(), 
                 position: 0 
             };
-            let id = interp.streams.alloc(stream);
-            return Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))));
+            let id = proc.streams.alloc(stream);
+            return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))));
         }
     }
-    interp.signal_error("MAKE-STRING-INPUT-STREAM requires a string argument")
+    err_helper("MAKE-STRING-INPUT-STREAM requires a string argument")
 }
 
 /// (close stream) -> t
-fn prim_close(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_close(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(arg) {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(arg) {
             let stream_id = crate::streams::StreamId(*id);
-            if interp.streams.close(stream_id) {
-                return Ok(interp.t_node);
+            if proc.streams.close(stream_id) {
+                return Ok(proc.make_t(ctx));
             }
         }
     }
-    Ok(interp.nil_node)
+    Ok(proc.make_nil())
 }
 
 /// (write-string string &optional stream) -> string
-fn prim_write_string(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_write_string(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return interp.signal_error("WRITE-STRING requires at least 1 argument");
+        return err_helper("WRITE-STRING requires at least 1 argument");
     }
     
     let string_arg = args[0];
     let stream_id = if args.len() > 1 {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(args[1]) {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(args[1]) {
             crate::streams::StreamId(*id)
         } else {
-            interp.standard_output
+            proc.streams.stdout_id()
         }
     } else {
-        interp.standard_output
+        proc.streams.stdout_id()
     };
     
-    if let Node::Leaf(OpaqueValue::String(s)) = interp.arena.get_unchecked(string_arg) {
+    if let Node::Leaf(OpaqueValue::String(s)) = proc.arena.inner.get_unchecked(string_arg) {
         let s_clone = s.clone();
-        let _ = interp.streams.write_string(stream_id, &s_clone);
+        let _ = proc.streams.write_string(stream_id, &s_clone);
         Ok(string_arg)
     } else {
         use crate::printer::princ_to_string;
-        let s = princ_to_string(&interp.arena, &interp.symbols, string_arg);
-        let _ = interp.streams.write_string(stream_id, &s);
+        let s = princ_to_string(&proc.arena.inner, &ctx.symbols, string_arg);
+        let _ = proc.streams.write_string(stream_id, &s);
         Ok(string_arg)
     }
 }
 
 /// (write-char char &optional stream) -> char
-fn prim_write_char(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_write_char(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return interp.signal_error("WRITE-CHAR requires at least 1 argument");
+        return err_helper("WRITE-CHAR requires at least 1 argument");
     }
     
     let char_arg = args[0];
     let stream_id = if args.len() > 1 {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(args[1]) {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(args[1]) {
             crate::streams::StreamId(*id)
         } else {
-            interp.standard_output
+            proc.streams.stdout_id()
         }
     } else {
-        interp.standard_output
+        proc.streams.stdout_id()
     };
     
-    let c = match interp.arena.get_unchecked(char_arg) {
+    let c = match proc.arena.inner.get_unchecked(char_arg) {
         Node::Leaf(OpaqueValue::Integer(n)) => char::from_u32(*n as u32).unwrap_or('?'),
         Node::Leaf(OpaqueValue::String(s)) => s.chars().next().unwrap_or('?'),
         _ => '?',
     };
     
-    let _ = interp.streams.write_char(stream_id, c);
+    let _ = proc.streams.write_char(stream_id, c);
     Ok(char_arg)
 }
 
 /// (fresh-line &optional stream) -> generalized-boolean
-fn prim_fresh_line(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_fresh_line(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     let stream_id = if !args.is_empty() {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = interp.arena.get_unchecked(args[0]) {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(args[0]) {
             crate::streams::StreamId(*id)
         } else {
-            interp.standard_output
+            proc.streams.stdout_id()
         }
     } else {
-        interp.standard_output
+        proc.streams.stdout_id()
     };
     
-    match interp.streams.fresh_line(stream_id) {
-        Ok(true) => Ok(interp.t_node),
-        Ok(false) => Ok(interp.nil_node),
-        Err(_) => Ok(interp.nil_node),
+    match proc.streams.fresh_line(stream_id) {
+        Ok(true) => Ok(proc.make_t(ctx)),
+        Ok(false) => Ok(proc.make_nil()),
+        Err(_) => Ok(proc.make_nil()),
     }
 }
 
@@ -1030,80 +1071,81 @@ fn prim_fresh_line(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
 // CLOS Primitives
 // ============================================================================
 
-fn prim_find_class(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_find_class(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        if let Some(sym) = interp.node_to_symbol(arg) {
-            if let Some(id) = interp.mop.find_class(sym) {
-                return Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Class(id.0))));
+        if let Some(sym) = node_to_symbol(proc, arg) {
+            if let Some(id) = proc.mop.find_class(sym) {
+                return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Class(id.0))));
             }
         }
     }
-    Ok(interp.nil_node)
+    Ok(proc.make_nil())
 }
 
-fn prim_make_instance(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_make_instance(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     use crate::clos::ClassId;
     if let Some(&class_arg) = args.first() {
-        let class_id = match interp.arena.get_unchecked(class_arg) {
+        let class_id = match proc.arena.inner.get_unchecked(class_arg) {
             Node::Leaf(OpaqueValue::Class(id)) => Some(ClassId(*id)),
             _ => {
                 // Try symbol
-                if let Some(sym) = interp.node_to_symbol(class_arg) {
-                    interp.mop.find_class(sym)
+                if let Some(sym) = node_to_symbol(proc, class_arg) {
+                    proc.mop.find_class(sym)
                 } else { None }
             }
         };
         
         if let Some(id) = class_id {
             // Create instance
-            if let Some(inst_idx) = interp.mop.make_instance(id, interp.nil_node) {
+            let nil_val = proc.make_nil();
+            if let Some(inst_idx) = proc.mop.make_instance(id, nil_val) {
                 // Handle Initargs? (TODO: process rest of args)
                 // For now, simple creation
-                return Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32))));
+                return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32))));
             }
         }
     }
-    Ok(interp.nil_node)
+    Ok(proc.make_nil())
 }
 
-fn prim_class_of(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_class_of(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     use crate::clos::ClassId;
     if let Some(&arg) = args.first() {
-        let class_id = match interp.arena.get_unchecked(arg) {
+        let class_id = match proc.arena.inner.get_unchecked(arg) {
             Node::Leaf(OpaqueValue::Integer(_)) => ClassId(0), // T/Integer map not full yet
             Node::Leaf(OpaqueValue::Instance(idx)) => {
-                interp.mop.get_instance(*idx as usize).map(|i| i.class).unwrap_or(interp.mop.t_class)
+                proc.mop.get_instance(*idx as usize).map(|i| i.class).unwrap_or(proc.mop.t_class)
             }
-            Node::Leaf(OpaqueValue::Class(_)) => interp.mop.standard_class,
-            _ => interp.mop.t_class,
+            Node::Leaf(OpaqueValue::Class(_)) => proc.mop.standard_class,
+            _ => proc.mop.t_class,
         };
         // Return class object
-        Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::Class(class_id.0))))
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Class(class_id.0))))
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_slot_value(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_slot_value(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() >= 2 {
         let instance = args[0];
         let slot_name = args[1];
         
         // Extract instance index
-        let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) = interp.arena.get_unchecked(instance) {
+        let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) = proc.arena.inner.get_unchecked(instance) {
             Some(*idx as usize)
         } else { None };
         
         // Extract slot name symbol
-        let slot_sym = interp.node_to_symbol(slot_name);
+        let slot_sym = node_to_symbol(proc, slot_name);
         
         if let (Some(idx), Some(sym)) = (inst_idx, slot_sym) {
             // Find slot index in class
-            if let Some(inst) = interp.mop.get_instance(idx) {
-                if let Some(class) = interp.mop.get_class(inst.class) {
+            if let Some(inst) = proc.mop.get_instance(idx) {
+                if let Some(class) = proc.mop.get_class(inst.class) {
                     // Find slot definition
                     if let Some(pos) = class.slots.iter().position(|s| s.name == sym) {
-                         return Ok(interp.mop.slot_value(idx, pos).unwrap_or(interp.nil_node));
+                         return Ok(proc.mop.slot_value(idx, pos).unwrap_or(proc.make_nil()));
                     }
                 }
             }
@@ -1112,27 +1154,27 @@ fn prim_slot_value(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     Err(crate::eval::ControlSignal::Error("Invalid slot access".to_string()))
 }
 
-fn prim_set_slot_value(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_set_slot_value(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() >= 3 {
         let instance = args[0];
         let slot_name = args[1];
         let new_val = args[2];
         
         // Extract instance index
-        let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) = interp.arena.get_unchecked(instance) {
+        let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) = proc.arena.inner.get_unchecked(instance) {
             Some(*idx as usize)
         } else { None };
         
         // Extract slot name symbol
-        let slot_sym = interp.node_to_symbol(slot_name);
+        let slot_sym = node_to_symbol(proc, slot_name);
         
         if let (Some(idx), Some(sym)) = (inst_idx, slot_sym) {
             // Find slot index in class
-            if let Some(inst) = interp.mop.get_instance(idx) {
-                if let Some(class) = interp.mop.get_class(inst.class) {
+            if let Some(inst) = proc.mop.get_instance(idx) {
+                if let Some(class) = proc.mop.get_class(inst.class) {
                     // Find slot definition
                     if let Some(pos) = class.slots.iter().position(|s| s.name == sym) {
-                         interp.mop.set_slot_value(idx, pos, new_val);
+                         proc.mop.set_slot_value(idx, pos, new_val);
                          return Ok(new_val);
                     }
                 }
@@ -1142,7 +1184,7 @@ fn prim_set_slot_value(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult 
     Err(crate::eval::ControlSignal::Error("Invalid slot set".to_string()))
 }
 
-fn prim_error(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_error(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
         return Err(crate::eval::ControlSignal::Error("Error called with no arguments".to_string()));
     }
@@ -1150,30 +1192,30 @@ fn prim_error(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     // (error "format" args...)
     // For now, simpler: (error "message")
     let fmt_node = args[0];
-    let fmt = if let Node::Leaf(OpaqueValue::String(h)) = interp.arena.get_unchecked(fmt_node) {
+    let fmt = if let Node::Leaf(OpaqueValue::String(h)) = proc.arena.inner.get_unchecked(fmt_node) {
         h.clone()
     } else {
         // Coerce to string
-        crate::printer::princ_to_string(&interp.arena, &interp.symbols, fmt_node)
+        crate::printer::princ_to_string(&proc.arena.inner, &ctx.symbols, fmt_node)
     };
     
     // Call signal_error
-    interp.signal_error(&fmt)
+    err_helper(&fmt)
 }
 
-fn prim_gc(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
-    let freed = interp.collect_garbage();
+fn prim_gc(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> EvalResult {
+    let freed = proc.collect_garbage();
     // Return freed count as integer
     let val = OpaqueValue::Integer(freed as i64);
-    Ok(interp.arena.alloc(Node::Leaf(val)))
+    Ok(proc.arena.inner.alloc(Node::Leaf(val)))
 }
 
-fn prim_room(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
-    let stats = interp.arena.stats();
-    let array_count = interp.arrays.active_count();
-    let array_elements = interp.arrays.total_elements();
-    let closure_count = interp.closures.len();
-    let symbol_count = interp.symbols.symbol_count();
+fn prim_room(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> EvalResult {
+    let stats = proc.arena.inner.stats();
+    let array_count = proc.arrays.active_count();
+    let array_elements = proc.arrays.total_elements();
+    let closure_count = proc.closures.len();
+    let symbol_count = ctx.symbols.symbol_count();
     
     println!("=== ROOM ===");
     println!("Arena:");
@@ -1184,46 +1226,46 @@ fn prim_room(interp: &mut Interpreter, _args: &[NodeId]) -> EvalResult {
     println!("Closures:          {}", closure_count);
     println!("Symbols:           {}", symbol_count);
     println!("GC:");
-    println!("  Threshold:       {}", interp.gc_threshold);
+    println!("  Threshold:       {}", proc.arena.gc_threshold);
     println!("  Allocs since GC: {}", stats.allocs_since_gc);
     
-    Ok(interp.nil_node)
+    Ok(proc.make_nil())
 }
 
-fn prim_make_array(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_make_array(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     // (make-array size [initial-element])
     if args.is_empty() {
         return Err(crate::eval::ControlSignal::Error("make-array requires at least 1 argument".to_string()));
     }
     
-    let size_val = extract_number(&interp.arena, args[0]);
+    let size_val = extract_number(&proc.arena.inner, args[0]);
     let size = match size_val {
         NumVal::Int(n) if n >= 0 => n as usize,
         _ => return Err(crate::eval::ControlSignal::Error("Invalid array size".to_string())),
     };
     
-    let initial = if args.len() > 1 { args[1] } else { interp.nil_node };
+    let initial = if args.len() > 1 { args[1] } else { proc.make_nil() };
     
-    let vec_id = interp.arrays.alloc(size, initial);
+    let vec_id = proc.arrays.alloc(size, initial);
     
-    Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
 }
 
-fn prim_aref(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_aref(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     // (aref array index)
     if args.len() != 2 {
         return Err(crate::eval::ControlSignal::Error("aref requires 2 arguments".to_string()));
     }
     
     // Check if array
-    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = interp.arena.get_unchecked(args[0]) {
+    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = proc.arena.inner.get_unchecked(args[0]) {
         let vec_id = crate::arrays::VectorId(*idx);
         
         // Parse index
-        let idx_val = extract_number(&interp.arena, args[1]);
+        let idx_val = extract_number(&proc.arena.inner, args[1]);
         if let NumVal::Int(i) = idx_val {
             if i >= 0 {
-                if let Some(val) = interp.arrays.aref(vec_id, i as usize) {
+                if let Some(val) = proc.arrays.aref(vec_id, i as usize) {
                     return Ok(val);
                 }
                 return Err(crate::eval::ControlSignal::Error(format!("Array index out of bounds: {}", i)));
@@ -1235,20 +1277,20 @@ fn prim_aref(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     Err(crate::eval::ControlSignal::Error("Not an array".to_string()))
 }
 
-fn prim_set_aref(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_set_aref(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     // (set-aref array index value)
     if args.len() != 3 {
         return Err(crate::eval::ControlSignal::Error("set-aref requires 3 arguments".to_string()));
     }
     
-    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = interp.arena.get_unchecked(args[0]) {
+    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = proc.arena.inner.get_unchecked(args[0]) {
          let vec_id = crate::arrays::VectorId(*idx);
          
-         let idx_val = extract_number(&interp.arena, args[1]);
+         let idx_val = extract_number(&proc.arena.inner, args[1]);
          if let NumVal::Int(i) = idx_val {
              if i >= 0 {
                  let val = args[2];
-                 if interp.arrays.set_aref(vec_id, i as usize, val) {
+                 if proc.arrays.set_aref(vec_id, i as usize, val) {
                      return Ok(val);
                  }
                  return Err(crate::eval::ControlSignal::Error(format!("Array index out of bounds: {}", i)));
@@ -1260,7 +1302,7 @@ fn prim_set_aref(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
     Err(crate::eval::ControlSignal::Error("Not an array".to_string()))
 }
 
-fn prim_set_macro_character(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_set_macro_character(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     // (set-macro-character char function [non-terminating-p])
     // function: currently only accepts a SYMBOL naming a built-in macro.
     if args.len() < 2 || args.len() > 3 {
@@ -1268,7 +1310,7 @@ fn prim_set_macro_character(interp: &mut Interpreter, args: &[NodeId]) -> EvalRe
     }
     
     // 1. Character
-    let char_val = extract_number(&interp.arena, args[0]);
+    let char_val = extract_number(&proc.arena.inner, args[0]);
     let ch = match char_val {
         NumVal::Int(n) => std::char::from_u32(n as u32).ok_or(crate::eval::ControlSignal::Error("Invalid character code".to_string()))?,
         _ => return Err(crate::eval::ControlSignal::Error("Character argument must be an integer (code point)".to_string())),
@@ -1276,8 +1318,8 @@ fn prim_set_macro_character(interp: &mut Interpreter, args: &[NodeId]) -> EvalRe
     
     // 2. Function (Symbol)
     // We expect a symbol.
-    let func_name = if let Some(sym_id) = interp.node_to_symbol(args[1]) {
-        interp.symbols.get_symbol(sym_id).unwrap().name.clone()
+    let func_name = if let Some(sym_id) = node_to_symbol(proc, args[1]) {
+        ctx.symbols.get_symbol(sym_id).unwrap().name.clone()
     } else {
          return Err(crate::eval::ControlSignal::Error("Function argument must be a symbol naming a built-in macro".to_string()));
     };
@@ -1289,7 +1331,7 @@ fn prim_set_macro_character(interp: &mut Interpreter, args: &[NodeId]) -> EvalRe
     
     // 3. Non-terminating?
     let non_terminating = if args.len() > 2 {
-        args[2] != interp.nil_node
+        args[2] != proc.make_nil()
     } else {
         false
     };
@@ -1302,66 +1344,66 @@ fn prim_set_macro_character(interp: &mut Interpreter, args: &[NodeId]) -> EvalRe
         SyntaxType::TerminatingMacro
     };
     
-    interp.readtable.set_syntax_type(ch, syntax);
-    interp.readtable.set_macro_character(ch, Some(macro_fn));
+    proc.readtable.set_syntax_type(ch, syntax);
+    proc.readtable.set_macro_character(ch, Some(macro_fn));
     
-    Ok(interp.t_node)
+    Ok(proc.make_t(ctx))
 }
 
-fn prim_get_macro_character(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_get_macro_character(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return interp.signal_error("get-macro-character: too few arguments");
+        return err_helper("get-macro-character: too few arguments");
     }
     
-    let ch_code = if let Node::Leaf(OpaqueValue::Integer(n)) = interp.arena.get_unchecked(args[0]).clone() {
+    let ch_code = if let Node::Leaf(OpaqueValue::Integer(n)) = proc.arena.inner.get_unchecked(args[0]).clone() {
         n as u32
     } else {
-        return interp.signal_error("get-macro-character: char code must be an integer");
+        return err_helper("get-macro-character: char code must be an integer");
     };
     
     let ch = std::char::from_u32(ch_code).ok_or_else(|| ControlSignal::Error(format!("Invalid char code: {}", ch_code)))?;
     
-    if let Some(_func) = interp.readtable.get_macro_character(ch) {
+    if let Some(_func) = proc.readtable.get_macro_character(ch) {
         // We can't return the Rust function pointer directly as a Lisp object yet
         // For Phase 10, let's just return T if a macro is set, or NIL.
         // In next phases, we would return a special OpaqueValue for read-macros.
-        Ok(interp.t_node)
+        Ok(proc.make_t(ctx))
     } else {
-        Ok(interp.nil_node)
+        Ok(proc.make_nil())
     }
 }
 
-fn prim_set_syntax_from_char(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_set_syntax_from_char(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() < 2 {
-        return interp.signal_error("set-syntax-from-char: too few arguments");
+        return err_helper("set-syntax-from-char: too few arguments");
     }
     
-    let to_code = if let Node::Leaf(OpaqueValue::Integer(n)) = interp.arena.get_unchecked(args[0]).clone() {
+    let to_code = if let Node::Leaf(OpaqueValue::Integer(n)) = proc.arena.inner.get_unchecked(args[0]).clone() {
         n as u32
     } else {
-        return interp.signal_error("set-syntax-from-char: to-char code must be an integer");
+        return err_helper("set-syntax-from-char: to-char code must be an integer");
     };
     
-    let from_code = if let Node::Leaf(OpaqueValue::Integer(n)) = interp.arena.get_unchecked(args[1]).clone() {
+    let from_code = if let Node::Leaf(OpaqueValue::Integer(n)) = proc.arena.inner.get_unchecked(args[1]).clone() {
         n as u32
     } else {
-        return interp.signal_error("set-syntax-from-char: from-char code must be an integer");
+        return err_helper("set-syntax-from-char: from-char code must be an integer");
     };
     
     let to_ch = std::char::from_u32(to_code).ok_or_else(|| ControlSignal::Error(format!("Invalid to-char code: {}", to_code)))?;
     let from_ch = std::char::from_u32(from_code).ok_or_else(|| ControlSignal::Error(format!("Invalid from-char code: {}", from_code)))?;
     
-    let syntax = interp.readtable.get_syntax_type(from_ch);
-    let macro_fn = interp.readtable.get_macro_character(from_ch);
+    let syntax = proc.readtable.get_syntax_type(from_ch);
+    let macro_fn = proc.readtable.get_macro_character(from_ch);
     
-    interp.readtable.set_syntax_type(to_ch, syntax);
+    proc.readtable.set_syntax_type(to_ch, syntax);
     if let Some(f) = macro_fn {
-        interp.readtable.set_macro_character(to_ch, Some(f));
+        proc.readtable.set_macro_character(to_ch, Some(f));
     } else {
-        interp.readtable.set_macro_character(to_ch, None);
+        proc.readtable.set_macro_character(to_ch, None);
     }
     
-    Ok(interp.t_node)
+    Ok(proc.make_t(ctx))
 }
 
 fn get_reader_macro(name: &str) -> Option<crate::readtable::ReaderMacroFn> {
@@ -1526,101 +1568,88 @@ fn extract_number(arena: &Arena, node: NodeId) -> NumVal {
     }
 }
 
-fn prim_compile(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_compile(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let node = interp.arena.get_unchecked(arg).clone();
+        let node = proc.arena.inner.get_unchecked(arg).clone();
             
         let target_closure = match node {
             Node::Leaf(OpaqueValue::Symbol(id)) => {
                 let sym = SymbolId(id);
-                if let Some(func_node) = interp.symbols.symbol_function(sym) {
-                    if let Node::Leaf(OpaqueValue::Closure(idx)) = interp.arena.get_unchecked(func_node) {
+                if let Some(func_node) = proc.get_function(sym) {
+                    if let Node::Leaf(OpaqueValue::Closure(idx)) = proc.arena.inner.get_unchecked(func_node) {
                          Some(*idx)
                     } else {
-                        return interp.signal_error("COMPILE: Symbol function is not a closure (maybe already compiled or primitive?)");
+                        return err_helper("COMPILE: Symbol function is not a closure (maybe already compiled or primitive?)");
                     }
                 } else {
-                     return interp.signal_error("COMPILE: Symbol has no function definition");
+                     return err_helper("COMPILE: Symbol has no function definition");
                 }
             }
             Node::Leaf(OpaqueValue::Closure(idx)) => {
                 Some(idx)
             }
             _ => {
-                return interp.signal_error("COMPILE: Argument must be a symbol or closure");
+                return err_helper("COMPILE: Argument must be a symbol or closure");
             }
         };
         
         if let Some(idx) = target_closure {
              let (params, body) = {
                  // Clone to avoid borrow conflict
-                 let closure = &interp.closures[idx as usize];
+                 let closure = &proc.closures[idx as usize];
                  (closure.params.clone(), closure.body)
              };
              
-             match crate::compiler::compile_func(interp, &params, body) {
+             match crate::compiler::compile_func(proc, ctx, &params, body) {
                  Ok(compiled_node) => return Ok(compiled_node),
-                 Err(e) => return interp.signal_error(&format!("Compilation failed: {}", e)),
+                 Err(e) => return err_helper(&format!("Compilation failed: {}", e)),
              }
         }
     }
     
-    interp.signal_error("COMPILE: Invalid argument")
+    err_helper("COMPILE: Invalid argument")
 }
 
-
-
-fn prim_tree_string(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_tree_string(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let s = crate::printer::tree_format(&interp.arena, arg);
-        Ok(interp.arena.alloc(Node::Leaf(OpaqueValue::String(s))))
+        let s = crate::printer::tree_format(&proc.arena.inner, arg);
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(s))))
     } else {
-        Err(crate::eval::ControlSignal::Error("TREE-STRING requires 1 argument".to_string()))
+        Err(ControlSignal::Error("TREE-STRING requires 1 argument".to_string()))
     }
 }
 
 /// (funcall function arg1 arg2 ...)
-fn prim_funcall(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_funcall(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.is_empty() {
-        return Err(crate::eval::ControlSignal::Error("FUNCALL requires at least 1 argument".to_string()));
+        return Err(ControlSignal::Error("FUNCALL requires at least 1 argument".to_string()));
     }
+    
+    let mut interp = Interpreter::new(proc, ctx);
     
     let func = args[0];
     let func_args = if args.len() > 1 {
         interp.list(&args[1..])
     } else {
-        interp.nil_node
+        interp.process.make_nil()
     };
-    
-    // We need an environment for apply_function.
-    // Primitives usually run in the current environment context, which is passed in?
-    // Wait, prim functions signature is (interp, args). No env.
-    // But apply_function takes env.
-    // We can pass a new empty environment or try to get current?
-    // Interpreter struct has ctx (EvalContext) but not Environment.
-    // Closures capture environment.
-    // Evaluated arguments are already values, so environment shouldn't matter for application unless it's a macro or special form that needs it?
-    // But apply_function takes it.
-    // Let's pass a new empty environment for now.
     
     let env = crate::eval::Environment::new();
     interp.apply_function(func, func_args, &env)
 }
 
 /// (apply function arg1 ... argn-1 list)
-fn prim_apply(interp: &mut Interpreter, args: &[NodeId]) -> EvalResult {
+fn prim_apply(proc: &mut crate::process::Process, ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
     if args.len() < 2 {
-         return Err(crate::eval::ControlSignal::Error("APPLY requires at least 2 arguments".to_string()));
+         return Err(ControlSignal::Error("APPLY requires at least 2 arguments".to_string()));
     }
+    
+    let mut interp = Interpreter::new(proc, ctx);
     
     let func = args[0];
     let last_arg = args[args.len() - 1]; // The list argument
     
-    // Check if last_arg is a proper list?
-    // We don't strictly enforce proper list for Tree Calculus, just use it.
-    
     // Construct argument list. 
-    // args[1..args.len()-1] are single arguments. last_arg is a list.
     let mut final_args = last_arg;
     for &arg in args[1..args.len()-1].iter().rev() {
         final_args = interp.cons(arg, final_args);
@@ -1636,13 +1665,13 @@ mod tests {
     
     #[test]
     fn test_add() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(1);
-        let b = interp.make_integer(2);
-        let c = interp.make_integer(3);
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(1)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
+        let c = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(3)));
         
-        let result = prim_add(&mut interp, &[a, b, c]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let result = prim_add(&mut proc, &globals, &[a, b, c]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(6)) => {}
             _ => panic!("Expected 6"),
         }
@@ -1650,13 +1679,13 @@ mod tests {
     
     #[test]
     fn test_cons_car_cdr() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(1);
-        let b = interp.make_integer(2);
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(1)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
         
-        let cell = prim_cons(&mut interp, &[a, b]).unwrap();
-        let car = prim_car(&mut interp, &[cell]).unwrap();
-        let cdr = prim_cdr(&mut interp, &[cell]).unwrap();
+        let cell = prim_cons(&mut proc, &globals, &[a, b]).unwrap();
+        let car = prim_car(&mut proc, &globals, &[cell]).unwrap();
+        let cdr = prim_cdr(&mut proc, &globals, &[cell]).unwrap();
         
         assert_eq!(car, a);
         assert_eq!(cdr, b);
@@ -1664,14 +1693,14 @@ mod tests {
     
     #[test]
     fn test_length() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(1);
-        let b = interp.make_integer(2);
-        let c = interp.make_integer(3);
-        let list = interp.list(&[a, b, c]);
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(1)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
+        let c = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(3)));
+        let list = proc.make_list(&[a, b, c]);
         
-        let len = prim_length(&mut interp, &[list]).unwrap();
-        match interp.arena.get_unchecked(len) {
+        let len = prim_length(&mut proc, &globals, &[list]).unwrap();
+        match proc.arena.inner.get_unchecked(len) {
             Node::Leaf(OpaqueValue::Integer(3)) => {}
             _ => panic!("Expected length 3"),
         }
@@ -1681,9 +1710,9 @@ mod tests {
     
     #[test]
     fn test_add_empty() {
-        let mut interp = Interpreter::new();
-        let result = prim_add(&mut interp, &[]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let result = prim_add(&mut proc, &globals, &[]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(0)) => {}
             _ => panic!("Expected 0"),
         }
@@ -1691,10 +1720,10 @@ mod tests {
     
     #[test]
     fn test_add_single() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(42);
-        let result = prim_add(&mut interp, &[a]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(42)));
+        let result = prim_add(&mut proc, &globals, &[a]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(42)) => {}
             _ => panic!("Expected 42"),
         }
@@ -1702,10 +1731,10 @@ mod tests {
     
     #[test]
     fn test_add_many() {
-        let mut interp = Interpreter::new();
-        let nums: Vec<_> = (1..=10).map(|i| interp.make_integer(i)).collect();
-        let result = prim_add(&mut interp, &nums).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let nums: Vec<_> = (1..=10).map(|i| proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(i as i64)))).collect();
+        let result = prim_add(&mut proc, &globals, &nums).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(55)) => {} // 1+2+...+10 = 55
             _ => panic!("Expected 55"),
         }
@@ -1713,10 +1742,10 @@ mod tests {
     
     #[test]
     fn test_sub_unary() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(5);
-        let result = prim_sub(&mut interp, &[a]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(5)));
+        let result = prim_sub(&mut proc, &globals, &[a]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(-5)) => {}
             _ => panic!("Expected -5"),
         }
@@ -1724,12 +1753,12 @@ mod tests {
     
     #[test]
     fn test_sub_chain() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(100);
-        let b = interp.make_integer(30);
-        let c = interp.make_integer(20);
-        let result = prim_sub(&mut interp, &[a, b, c]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(100)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(30)));
+        let c = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(20)));
+        let result = prim_sub(&mut proc, &globals, &[a, b, c]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(50)) => {} // 100-30-20 = 50
             _ => panic!("Expected 50"),
         }
@@ -1737,9 +1766,9 @@ mod tests {
     
     #[test]
     fn test_mul_empty() {
-        let mut interp = Interpreter::new();
-        let result = prim_mul(&mut interp, &[]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let result = prim_mul(&mut proc, &globals, &[]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(1)) => {}
             _ => panic!("Expected 1"),
         }
@@ -1747,13 +1776,13 @@ mod tests {
     
     #[test]
     fn test_mul_chain() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(2);
-        let b = interp.make_integer(3);
-        let c = interp.make_integer(4);
-        let d = interp.make_integer(5);
-        let result = prim_mul(&mut interp, &[a, b, c, d]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(3)));
+        let c = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(4)));
+        let d = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(5)));
+        let result = prim_mul(&mut proc, &globals, &[a, b, c, d]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(120)) => {} // 2*3*4*5 = 120
             _ => panic!("Expected 120"),
         }
@@ -1761,11 +1790,11 @@ mod tests {
     
     #[test]
     fn test_div_exact() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(20);
-        let b = interp.make_integer(4);
-        let result = prim_div(&mut interp, &[a, b]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(20)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(4)));
+        let result = prim_div(&mut proc, &globals, &[a, b]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Float(f)) if (*f - 5.0).abs() < 0.001 => {}
             _ => panic!("Expected 5.0"),
         }
@@ -1773,11 +1802,11 @@ mod tests {
     
     #[test]
     fn test_div_fractional() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(5);
-        let b = interp.make_integer(19);
-        let result = prim_div(&mut interp, &[a, b]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(5)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(19)));
+        let result = prim_div(&mut proc, &globals, &[a, b]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Float(f)) if (*f - 0.2631578947368421).abs() < 0.0001 => {}
             other => panic!("Expected ~0.263, got {:?}", other),
         }
@@ -1785,11 +1814,11 @@ mod tests {
     
     #[test]
     fn test_mixed_float_int() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(10);
-        let b = interp.arena.alloc(Node::Leaf(OpaqueValue::Float(2.5)));
-        let result = prim_add(&mut interp, &[a, b]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(10)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(2.5)));
+        let result = prim_add(&mut proc, &globals, &[a, b]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Float(f)) if (*f - 12.5).abs() < 0.001 => {}
             _ => panic!("Expected 12.5"),
         }
@@ -1797,40 +1826,55 @@ mod tests {
     
     #[test]
     fn test_comparison_lt() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(1);
-        let b = interp.make_integer(2);
-        let c = interp.make_integer(3);
-        let result = prim_lt(&mut interp, &[a, b, c]).unwrap();
-        assert_eq!(result, interp.t_node);
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(1)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
+        let c = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(3)));
+        let result = prim_lt(&mut proc, &globals, &[a, b, c]).unwrap();
+        
+        // Check if result is T
+        match proc.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0 => {}
+            _ => panic!("Expected T"),
+        }
     }
     
     #[test]
     fn test_comparison_lt_false() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(1);
-        let b = interp.make_integer(3);
-        let c = interp.make_integer(2);
-        let result = prim_lt(&mut interp, &[a, b, c]).unwrap();
-        assert_eq!(result, interp.nil_node);
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(1)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(3)));
+        let c = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
+        let result = prim_lt(&mut proc, &globals, &[a, b, c]).unwrap();
+        
+        // Check if result is NIL
+        match proc.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Nil) => {}
+            _ => panic!("Expected NIL"),
+        }
     }
     
     #[test]
     fn test_num_eq() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(42);
-        let b = interp.make_integer(42);
-        let result = prim_num_eq(&mut interp, &[a, b]).unwrap();
-        assert_eq!(result, interp.t_node);
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(42)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(42)));
+        let result = prim_num_eq(&mut proc, &globals, &[a, b]).unwrap();
+        
+        // Check if result is T
+        match proc.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0 => {}
+            _ => panic!("Expected T"),
+        }
     }
     
     #[test]
     fn test_mod() {
-        let mut interp = Interpreter::new();
-        let a = interp.make_integer(17);
-        let b = interp.make_integer(5);
-        let result = prim_mod(&mut interp, &[a, b]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
+        let a = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(17)));
+        let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(5)));
+        let result = prim_mod(&mut proc, &globals, &[a, b]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::Integer(2)) => {} // 17 mod 5 = 2
             _ => panic!("Expected 2"),
         }
@@ -1838,18 +1882,86 @@ mod tests {
 
     #[test]
     fn test_overflow() {
-        let mut interp = Interpreter::new();
+        let mut globals = crate::context::GlobalContext::new(); let mut proc = crate::process::Process::new(crate::process::Pid(1), crate::types::NodeId(0), &mut globals);
         // i64::MAX is 9,223,372,036,854,775,807
-        let large = interp.make_integer(i64::MAX);
-        let two = interp.make_integer(2);
+        let large = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(i64::MAX)));
+        let two = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(2)));
         
-        let result = prim_add(&mut interp, &[large, two]).unwrap();
-        match interp.arena.get_unchecked(result) {
+        let result = prim_add(&mut proc, &globals, &[large, two]).unwrap();
+        match proc.arena.inner.get_unchecked(result) {
             Node::Leaf(OpaqueValue::BigInt(_)) => {
                 // Success: it promoted to BigInt
             }
-            _ => panic!("Expected overflow to BigInt, got {:?}", interp.arena.get_unchecked(result)),
+            _ => panic!("Expected overflow to BigInt, got {:?}", proc.arena.inner.get_unchecked(result)),
         }
     }
 }
 
+
+// ============================================================================
+// Concurrency Primitives
+// ============================================================================
+
+    pub fn prim_spawn(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> Result<NodeId, ControlSignal> {
+        // (spawn lambda-node)
+        // Check arg count
+        if args.len() != 1 {
+             return Err(ControlSignal::Error(format!("spawn: expected 1 argument, got {}", args.len())));
+        }
+        
+        let func = args[0];
+        
+        // Return SysCall ControlSignal
+        // The evaluator will catch this and suspend the process
+        Err(ControlSignal::SysCall(SysCall::Spawn(func)))
+    }
+    
+    pub fn prim_send(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> Result<NodeId, ControlSignal> {
+        // (send pid msg)
+        if args.len() != 2 {
+             return Err(ControlSignal::Error(format!("send: expected 2 arguments, got {}", args.len())));
+        }
+        
+        // Extract Pid from args[0]
+        let target_id = args[0];
+        let target_node = proc.arena.inner.get_unchecked(target_id);
+        
+        let target_pid = if let Node::Leaf(OpaqueValue::Integer(p)) = target_node {
+             crate::process::Pid(*p as u32)
+        } else {
+             return Err(ControlSignal::Error("send: target must be a PID (integer)".into()));
+        };
+        
+        let msg = args[1];
+        
+        Err(ControlSignal::SysCall(SysCall::Send { target: target_pid, message: msg }))
+    }
+    
+    pub fn prim_receive(_proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> Result<NodeId, ControlSignal> {
+        // (receive) -> msg
+        // TODO: Pattern matching support in args
+        
+        Err(ControlSignal::SysCall(SysCall::Receive { pattern: None }))
+    }
+    
+    pub fn prim_sleep(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> Result<NodeId, ControlSignal> {
+        // (sleep ms)
+        if args.len() != 1 {
+            return Err(ControlSignal::Error("sleep: expected 1 argument".into()));
+        }
+        
+        let node_id = args[0];
+        let node = proc.arena.inner.get_unchecked(node_id);
+        
+        let ms = if let Node::Leaf(OpaqueValue::Integer(m)) = node {
+             *m as u64
+        } else {
+             return Err(ControlSignal::Error("sleep: argument must be integer ms".into()));
+        };
+        
+        Err(ControlSignal::SysCall(SysCall::Sleep(ms)))
+    }
+    
+    pub fn prim_self(_proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> Result<NodeId, ControlSignal> {
+         Err(ControlSignal::SysCall(SysCall::SelfPid))
+    }

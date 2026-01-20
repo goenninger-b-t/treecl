@@ -1,10 +1,9 @@
 use std::ffi::c_void;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct NodeId(pub u32);
+pub use crate::symbol::SymbolId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SymbolId(pub u32);
+pub struct NodeId(pub u32);
 
 #[derive(Clone, Debug, PartialEq)] // Removed Copy because StringHandle/VectorHandle might imply ownership semantics later, but for now they are indices.
 pub enum OpaqueValue {
