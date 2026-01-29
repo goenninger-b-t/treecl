@@ -3056,9 +3056,18 @@ fn prim_compile(
 
         if let Some(idx) = target_closure {
             let (params, body) = {
-                // Clone to avoid borrow conflict
                 let closure = &proc.closures[idx as usize];
-                (closure.params.clone(), closure.body)
+                let mut params = Vec::new();
+                for &p in &closure.lambda_list.req {
+                    if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(p) {
+                        params.push(SymbolId(*id));
+                    } else {
+                        // If we can't compile destructuring, just pass empty or error later?
+                        // For now we assume symbols. If not, the compiler will mismatch count or logic.
+                        // But compile_func expects SymbolId.
+                    }
+                }
+                (params, closure.body)
             };
 
             match crate::compiler::compile_func(proc, ctx, &params, body) {

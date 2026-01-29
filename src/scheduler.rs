@@ -78,6 +78,9 @@ impl Scheduler {
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
+        if !self.stealers.is_empty() {
+            return;
+        }
         println!("INFO: Starting scheduler with {} threads", parallelism);
 
         // Create workers
@@ -217,8 +220,9 @@ pub fn run_worker(
                             local.push(pid);
                         }
                         ExecutionResult::Terminated => {
-                            proc.status = Status::Terminated;
-                            println!("Process {:?} terminated.", pid);
+                            if !matches!(proc.status, Status::Failed(_)) {
+                                proc.status = Status::Terminated;
+                            }
                         }
                         ExecutionResult::Blocked => {
                             proc.status = Status::Waiting(None);

@@ -320,6 +320,7 @@ fn main() -> io::Result<()> {
                                 process.current_env = Some(treecl::eval::Environment::new());
                                 process.reduction_count = 0;
                                 process.status = Status::Runnable;
+                                scheduler.schedule(repl_pid);
                             }
                             Err(e) => {
                                 eprintln!("Parse Error: {:?}", e);

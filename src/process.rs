@@ -209,7 +209,7 @@ impl Process {
             mop,
             eval_context,
             continuation_stack: Vec::new(),
-            current_env: None,
+            current_env: Some(crate::eval::Environment::new()),
             execution_mode: ExecutionMode::Eval,
             reduction_count: 0,
             pending_redex: None,

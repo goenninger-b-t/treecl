@@ -67,12 +67,32 @@ impl Default for Environment {
 /// A compiled closure (lambda + environment)
 #[derive(Debug, Clone)]
 pub struct Closure {
-    /// Parameter list (as SymbolIds)
-    pub params: Vec<SymbolId>,
+    /// Parsed lambda list info
+    pub lambda_list: ParsedLambdaList,
     /// Body expression (NodeId)
     pub body: NodeId,
     /// Captured environment
     pub env: Environment,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ParsedLambdaList {
+    /// Required parameters (Symbol or Destructuring Pattern)
+    pub req: Vec<NodeId>,
+    /// Optional parameters: (var-pattern, default, supplied-p)
+    pub opt: Vec<(NodeId, NodeId, Option<SymbolId>)>,
+    /// Rest parameter (Symbol for now? Or pattern?)
+    /// ANSI: "The \rest parameter must be a symbol" (for functions). For macros?
+    /// " destructuring-lambda-list = ... [&rest | &body] var" -> var is a symbol or a list (in some implementations)?
+    /// CLHS 3.4.4.1: "&rest var". "var" is a symbol.
+    /// So rest should remain SymbolId.
+    pub rest: Option<SymbolId>,
+    /// Keyword parameters
+    pub key: Vec<(SymbolId, NodeId, NodeId, Option<SymbolId>)>, // key-name, var-pattern, init, sup
+    /// Aux parameters
+    pub aux: Vec<(SymbolId, NodeId)>,
+    /// &allow-other-keys present
+    pub allow_other_keys: bool,
 }
 
 /// Control flow signals for non-local exits
@@ -147,6 +167,14 @@ pub enum Continuation {
     ReturnFrom { target: SymbolId },
 }
 
+enum LambdaListMode {
+    Req,
+    Opt,
+    Rest,
+    Key,
+    Aux,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum TagKey {
     Sym(SymbolId),
@@ -163,6 +191,190 @@ pub struct Interpreter<'a> {
 impl<'a> Interpreter<'a> {
     pub fn new(process: &'a mut Process, globals: &'a GlobalContext) -> Self {
         Self { process, globals }
+    }
+
+    pub fn bind_pattern(
+        &mut self,
+        env: &mut Environment,
+        pattern: NodeId,
+        value: NodeId,
+        allow_destructuring: bool,
+    ) -> Result<(), ControlSignal> {
+        if let Some(sym) = self.node_to_symbol(pattern) {
+            env.bind(sym, value);
+            Ok(())
+        } else if allow_destructuring {
+            // Destructuring bind
+            if let Node::Fork(p_head, p_tail) =
+                self.process.arena.inner.get_unchecked(pattern).clone()
+            {
+                if let Node::Fork(v_head, v_tail) =
+                    self.process.arena.inner.get_unchecked(value).clone()
+                {
+                    self.bind_pattern(env, p_head, v_head, true)?;
+                    self.bind_pattern(env, p_tail, v_tail, true)?;
+                    Ok(())
+                } else if self.is_nil(value) {
+                    // Bind against nil: nil for all vars
+                    let nil_node = self.process.make_nil();
+                    self.bind_pattern(env, p_head, nil_node, true)?;
+                    let nil_node = self.process.make_nil();
+                    self.bind_pattern(env, p_tail, nil_node, true)?;
+                    Ok(())
+                } else {
+                    Err(ControlSignal::Error(format!(
+                        "Destructuring mismatch: pattern {:?} value {:?}",
+                        pattern, value
+                    )))
+                }
+            } else {
+                if self.is_nil(pattern) {
+                    Ok(()) // Ignore nil pattern
+                } else {
+                    Err(ControlSignal::Error(format!(
+                        "Invalid destructuring pattern: {:?}",
+                        pattern
+                    )))
+                }
+            }
+        } else {
+            Err(ControlSignal::Error(format!(
+                "Function argument must be a symbol: {:?}",
+                pattern
+            )))
+        }
+    }
+
+    pub fn parse_lambda_list(&mut self, list_node: NodeId) -> Result<ParsedLambdaList, String> {
+        let list_vec = self.cons_to_vec(list_node);
+        let mut parsed = ParsedLambdaList::default();
+
+        let mut mode = LambdaListMode::Req;
+
+        for node in list_vec.iter() {
+            // Check if keyword
+            let sym = self.node_to_symbol(*node);
+
+            if let Some(s) = sym {
+                if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(s) {
+                    match name {
+                        "&OPTIONAL" => {
+                            mode = LambdaListMode::Opt;
+                            continue;
+                        }
+                        "&REST" => {
+                            mode = LambdaListMode::Rest;
+                            continue;
+                        }
+                        "&KEY" => {
+                            mode = LambdaListMode::Key;
+                            continue;
+                        }
+                        "&AUX" => {
+                            mode = LambdaListMode::Aux;
+                            continue;
+                        }
+                        "&ALLOW-OTHER-KEYS" => {
+                            if !matches!(mode, LambdaListMode::Key) {
+                                return Err("&ALLOW-OTHER-KEYS must follow &KEY".into());
+                            }
+                            parsed.allow_other_keys = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            match mode {
+                LambdaListMode::Req => {
+                    // Allow NodeId for destructuring support
+                    parsed.req.push(*node);
+                }
+                LambdaListMode::Opt => {
+                    if let Some(_s) = self.node_to_symbol(*node) {
+                        parsed.opt.push((*node, self.process.make_nil(), None));
+                    } else {
+                        let parts = self.cons_to_vec(*node);
+                        if parts.is_empty() {
+                            return Err("Empty optional spec".into());
+                        }
+                        let var = parts[0]; // NodeId (pattern)
+                        let init = if parts.len() > 1 {
+                            parts[1]
+                        } else {
+                            self.process.make_nil()
+                        };
+                        let sup = if parts.len() > 2 {
+                            self.node_to_symbol(parts[2])
+                        } else {
+                            None
+                        };
+                        parsed.opt.push((var, init, sup));
+                    }
+                }
+                LambdaListMode::Rest => {
+                    if parsed.rest.is_some() {
+                        return Err("Multiple &rest arguments".into());
+                    }
+                    let s = self
+                        .node_to_symbol(*node)
+                        .ok_or("&rest argument must be a symbol")?;
+                    parsed.rest = Some(s);
+                }
+                LambdaListMode::Key => {
+                    if let Some(s) = self.node_to_symbol(*node) {
+                        // Default logic: Key is valid keyword with same name as symbol
+                        parsed.key.push((s, *node, self.process.make_nil(), None));
+                    } else {
+                        let parts = self.cons_to_vec(*node);
+                        let spec = parts[0];
+
+                        let (key_sym, var_node) = if let Some(s) = self.node_to_symbol(spec) {
+                            (s, spec)
+                        } else {
+                            let spec_parts = self.cons_to_vec(spec);
+                            let k = self
+                                .node_to_symbol(spec_parts[0])
+                                .ok_or("Key spec key must be symbol")?;
+                            let v = spec_parts[1]; // NodeId
+                            (k, v)
+                        };
+
+                        let init = if parts.len() > 1 {
+                            parts[1]
+                        } else {
+                            self.process.make_nil()
+                        };
+                        let sup = if parts.len() > 2 {
+                            self.node_to_symbol(parts[2])
+                        } else {
+                            None
+                        };
+
+                        parsed.key.push((key_sym, var_node, init, sup));
+                    }
+                }
+                LambdaListMode::Aux => {
+                    if let Some(s) = self.node_to_symbol(*node) {
+                        parsed.aux.push((s, self.process.make_nil()));
+                    } else {
+                        let parts = self.cons_to_vec(*node);
+                        let var = self
+                            .node_to_symbol(parts[0])
+                            .ok_or("Aux var must be symbol")?;
+                        let init = if parts.len() > 1 {
+                            parts[1]
+                        } else {
+                            self.process.make_nil()
+                        };
+                        parsed.aux.push((var, init));
+                    }
+                }
+            }
+        }
+
+        Ok(parsed)
     }
 
     /// Fully evaluate a node (interleaving Tree Calculus and Primitives)
@@ -275,18 +487,43 @@ impl<'a> Interpreter<'a> {
         // But the user asked to refactor Eval.
         // Let's implement step and then make eval call step in a loop.
 
-        // Initialize TCO state
+        // Save State for re-entrancy
+        let saved_program = self.process.program;
+        let saved_mode = self.process.execution_mode.clone();
+        let saved_env = self.process.current_env.clone();
+        // Take the stack to avoid cloning.
+        let saved_stack = std::mem::take(&mut self.process.continuation_stack);
+
+        // Initialize TCO state for this execution
         self.process.program = expr;
         self.process.current_env = Some(env.clone());
-        self.process.continuation_stack.clear();
+        // Stack is already empty because we took it
         self.process.continuation_stack.push(Continuation::Done);
         self.process.execution_mode = crate::process::ExecutionMode::Eval;
 
+        let mut result = Ok(self.process.make_nil()); // Default
+
         loop {
-            if !self.step()? {
-                return Ok(self.process.program);
+            match self.step() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    result = Ok(self.process.program);
+                    break;
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
             }
         }
+
+        // Restore State
+        self.process.program = saved_program;
+        self.process.execution_mode = saved_mode;
+        self.process.current_env = saved_env;
+        self.process.continuation_stack = saved_stack;
+
+        return result;
     }
 
     /// Perform one step of TCO evaluation
@@ -415,17 +652,24 @@ impl<'a> Interpreter<'a> {
             }
         }
 
+        // Check for Macros
+        if let Some(sym_id) = self.node_to_symbol(op) {
+            if let Some(&macro_idx) = self.process.macros.get(&sym_id) {
+                if let Some(closure) = self.process.closures.get(macro_idx).cloned() {
+                    let expanded = self._apply_macro(&closure, args)?;
+                    self.process.program = expanded;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                    return Ok(true);
+                }
+            }
+        }
+
         // Function Application
         let arg_list = self.cons_to_vec(args);
 
         if arg_list.is_empty() {
             // Immediate Apply (no args)
-            self.process.continuation_stack.push(Continuation::Apply {
-                func: op,
-                saved_env: env,
-            });
-            self.process.execution_mode = crate::process::ExecutionMode::Return;
-            self.process.program = self.process.make_nil();
+            return self.step_apply(op, Vec::new(), env);
         } else {
             // Start evaluating first arg
             let first = arg_list[0];
@@ -473,23 +717,14 @@ impl<'a> Interpreter<'a> {
             .alloc(Node::Fork(progn_sym_node, body_forms));
 
         // Parse lambda list
-        let mut params = Vec::new();
-        let mut c = lambda_list_node;
-        loop {
-            let node = self.process.arena.get_unchecked(c).clone();
-            if let Node::Fork(head, tail) = node {
-                if let Some(s) = self.node_to_symbol(head) {
-                    params.push(s);
-                }
-                c = tail;
-            } else {
-                break;
-            }
-        }
+        let parsed_lambda_list = match self.parse_lambda_list(lambda_list_node) {
+            Ok(l) => l,
+            Err(e) => return Err(ControlSignal::Error(e)),
+        };
 
         // Create Closure
         let closure = crate::eval::Closure {
-            params,
+            lambda_list: parsed_lambda_list,
             body: body_node,
             env: crate::eval::Environment::new(),
         };
@@ -684,10 +919,18 @@ impl<'a> Interpreter<'a> {
             .alloc(Node::Fork(progn_sym_node, body_forms));
 
         // Parse lambda list
-        let mut params = Vec::new();
+        let parsed_lambda_list = match self.parse_lambda_list(lambda_list_node) {
+            Ok(l) => l,
+            Err(e) => return Err(ControlSignal::Error(e)),
+        };
+        // Removed explicit params loop
+        // let mut params = Vec::new(); // placeholder to keep rest of file valid if needed temporarily
+        /*
         let mut c = lambda_list_node;
         loop {
             let node = self.process.arena.get_unchecked(c).clone();
+        */
+        /*
             if let Node::Fork(head, tail) = node {
                 if let Some(s) = self.node_to_symbol(head) {
                     params.push(s);
@@ -697,10 +940,11 @@ impl<'a> Interpreter<'a> {
                 break;
             }
         }
+        */
 
         // Create Closure
         let closure = crate::eval::Closure {
-            params,
+            lambda_list: parsed_lambda_list,
             body: body_node,
             env: crate::eval::Environment::new(),
         };
@@ -770,6 +1014,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_let(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env);
         // (let bindings &rest body)
         // Expand to ((lambda (vars...) body...) vals...)
         let args_vec = self.cons_to_vec(args);
@@ -853,6 +1098,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_setq(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env);
         if let Node::Fork(var_node, rest) = self.process.arena.get_unchecked(args).clone() {
             if let Node::Fork(val_expr, next) = self.process.arena.get_unchecked(rest).clone() {
                 if let Some(sym) = self.node_to_symbol(var_node) {
@@ -873,6 +1119,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_if(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env);
         if let Node::Fork(test, rest) = self.process.arena.get_unchecked(args).clone() {
             let (then_branch, else_branch) = if let Node::Fork(th, rest2) =
                 self.process.arena.get_unchecked(rest).clone()
@@ -903,6 +1150,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_progn(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env);
         let forms = self.cons_to_vec(args);
         if forms.is_empty() {
             self.process.program = self.process.make_nil();
@@ -1145,14 +1393,19 @@ impl<'a> Interpreter<'a> {
             if let Some(f) = self.process.get_function(sym) {
                 f
             } else if self.globals.primitives.contains_key(&sym) {
-                // TODO: Return primitive handle node?
-                // Primitives are just symbols in func position for now?
-                // No, calling primitives uses op directly usually.
                 op
             } else {
+                let name = self
+                    .globals
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(sym)
+                    .unwrap_or("?")
+                    .to_string();
                 return Err(ControlSignal::Error(format!(
-                    "Undefined function: {:?}",
-                    sym
+                    "Undefined function: {} ({:?})",
+                    name, sym
                 )));
             }
         } else {
@@ -1181,7 +1434,6 @@ impl<'a> Interpreter<'a> {
                 }
             }
         }
-
         let closure = if is_lambda {
             // Parse Lambda List (Code copied/adapted from step_defun)
             // func_node is (lambda params body...)
@@ -1205,26 +1457,19 @@ impl<'a> Interpreter<'a> {
                 .inner
                 .alloc(Node::Fork(progn_sym_node, body_list));
 
-            // Parse args
-            let mut params = Vec::new();
-            let mut c = params_node;
-            loop {
-                let node = self.process.arena.get_unchecked(c).clone();
-                if let Node::Fork(head, tail) = node {
-                    if let Some(s) = self.node_to_symbol(head) {
-                        params.push(s);
-                    }
-                    c = tail;
-                } else {
-                    break;
-                }
-            }
+            // Parse lambda list
+            // We use the new parser.
+            // Note: Parser helper returns Result<ParsedLambdaList, String>
+            let parsed_lambda_list = match self.parse_lambda_list(params_node) {
+                Ok(l) => l,
+                Err(e) => return Err(ControlSignal::Error(e)),
+            };
 
             // Create Closure capturing CURRENT environment
             // lambda expression evaluation returns a closure that captures the lexical environment.
             // When appearing as operator in ((lambda ...)), it should behave the same.
             crate::eval::Closure {
-                params,
+                lambda_list: parsed_lambda_list,
                 body: body_node,
                 env: env.clone(), // Capture the application point env (lexical scope)
             }
@@ -1257,34 +1502,162 @@ impl<'a> Interpreter<'a> {
         };
 
         // Execute Closure (Shared logic)
-        {
-            // Check Arity
-            if args.len() != closure.params.len() {
-                return Err(ControlSignal::Error(format!(
-                    "Arity mismatch: expected {}, got {}",
-                    closure.params.len(),
-                    args.len()
-                )));
+        // Bind Arguments using ParsedLambdaList logic
+        // We need a helper method to perform binding because it's complex.
+        // But we can implement it here or as a method on Interpreter/ParsedLambdaList.
+        // Implementing as method on Interpreter is better to access Arena/Globals.
+
+        // REWRITE BINDING LOGIC using indices
+        let mut new_env: Environment = closure.env.clone();
+        let mut arg_idx = 0;
+
+        // 1. Required
+        for &param in &closure.lambda_list.req {
+            if arg_idx >= args.len() {
+                return Err(ControlSignal::Error("Too few arguments".into()));
             }
-            // ... (rest of logic handles closure application)
-
-            // Create New Environment (Lexical Scope)
-            // Closure captures definition environment in `closure.env`.
-            // We extend THAT environment, not current.
-            let mut new_env: Environment = closure.env.clone();
-
-            // Bind args
-            for (param, val) in closure.params.iter().zip(args.iter()) {
-                new_env.bind(*param, *val);
-            }
-
-            // Setup Process for Body Execution
-            self.process.program = closure.body;
-            self.process.current_env = Some(new_env);
-            self.process.execution_mode = crate::process::ExecutionMode::Eval;
-
-            return Ok(true);
+            self.bind_pattern(&mut new_env, param, args[arg_idx], false)?;
+            arg_idx += 1;
         }
+
+        // 2. Optional
+        for (var, init, sup) in &closure.lambda_list.opt {
+            if arg_idx < args.len() {
+                self.bind_pattern(&mut new_env, *var, args[arg_idx], false)?;
+                if let Some(s) = sup {
+                    let t_node = self.process.make_t(&self.globals);
+                    new_env.bind(*s, t_node);
+                }
+                arg_idx += 1;
+            } else {
+                let val = self.eval(*init, &new_env)?;
+                self.bind_pattern(&mut new_env, *var, val, false)?;
+                if let Some(s) = sup {
+                    new_env.bind(*s, self.process.make_nil());
+                }
+            }
+        }
+
+        // 3. Rest
+        let rest_args = if arg_idx < args.len() {
+            &args[arg_idx..]
+        } else {
+            &[]
+        };
+        if let Some(rest_sym) = closure.lambda_list.rest {
+            let val = self.process.make_list(rest_args);
+            new_env.bind(rest_sym, val);
+        }
+
+        // 4. Keys
+        if !closure.lambda_list.key.is_empty() {
+            // Check even number of rest args
+            if rest_args.len() % 2 != 0 {
+                // Unless &rest captured them? ANSI says error if odd keys.
+                // "Order of argument processing: 1. Req, 2. Opt, 3. Rest, 4. Key"
+                // "If &key is specified, there must be an even number of remaining arguments."
+                // But &allow-other-keys?
+                if !closure.lambda_list.allow_other_keys {
+                    // Check strictly?
+                    // Actually, if allow-other-keys is true, odd length is still weird?
+                    // No, key/value pairs must be pairs.
+                    return Err(ControlSignal::Error(
+                        "Odd number of keyword arguments".into(),
+                    ));
+                }
+            }
+
+            for (key_sym, var, init, sup) in &closure.lambda_list.key {
+                // Scan rest_args for key_sym
+                // key_sym is the VAR symbol?
+                // No, in parse_lambda_list we stored (key, var, init...).
+                // And we decided key is the symbol itself (simple) or derived.
+                // We need to match against the keywords passed in args.
+                // The args contain KEYWORD symbols (usually).
+                // We need to check if arg matches key_sym.
+
+                let mut found_val = None;
+
+                // Linear scan for now (last win? OR first win?)
+                // ANSI: "Leftmost occurrence of keyword"
+
+                let mut i = 0;
+                while i < rest_args.len() {
+                    let k = rest_args[i];
+                    let v = if i + 1 < rest_args.len() {
+                        rest_args[i + 1]
+                    } else {
+                        self.process.make_nil()
+                    };
+
+                    // Compare k with key_sym (keyword)
+                    // k is a NodeId. key_sym is SymbolId.
+                    // Get symbol from k.
+                    if let Some(ks) = self.node_to_symbol(k) {
+                        // Robust comparison: Pkg + Name?
+                        // Ideally exact symbol ID match if interned correctly.
+                        // But caller used :KEY, def used &key (x y).
+                        // x is symbol X. :X is keyword.
+                        // We need to compare name?
+
+                        // Check names
+                        let k_name = self
+                            .globals
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(ks)
+                            .unwrap_or("")
+                            .to_string();
+                        let target_name = self
+                            .globals
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(*key_sym)
+                            .unwrap_or("")
+                            .to_string();
+
+                        if k_name.eq_ignore_ascii_case(&target_name) {
+                            // Match! (Simple name match for now)
+                            found_val = Some(v);
+                            break;
+                        }
+                    }
+                    i += 2;
+                }
+
+                if let Some(val) = found_val {
+                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    if let Some(s) = sup {
+                        let t_node = self.process.make_t(&self.globals);
+                        new_env.bind(*s, t_node);
+                    }
+                } else {
+                    let val = self.eval(*init, &new_env)?;
+                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    if let Some(s) = sup {
+                        new_env.bind(*s, self.process.make_nil());
+                    }
+                }
+            }
+
+            // Check &allow-other-keys or validity of keys?
+            // If not allowed, check if all keys in args are valid?
+            // Skip for now for simplicity.
+        }
+
+        // 5. Aux
+        for (var, init) in &closure.lambda_list.aux {
+            let val = self.eval(*init, &new_env)?;
+            new_env.bind(*var, val);
+        }
+
+        // Apply Process
+        self.process.program = closure.body;
+        self.process.current_env = Some(new_env);
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        return Ok(true);
     }
 
     fn cons_to_vec(&self, list: NodeId) -> Vec<NodeId> {
@@ -1696,23 +2069,14 @@ impl<'a> Interpreter<'a> {
     fn eval_lambda(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         if let Node::Fork(params, body) = self.process.arena.get_unchecked(args).clone() {
             // Parse parameter list
-            let mut param_list = Vec::new();
-            let mut current = params;
-            loop {
-                match self.process.arena.get_unchecked(current).clone() {
-                    Node::Fork(param, rest) => {
-                        if let Some(sym) = self.node_to_symbol(param) {
-                            param_list.push(sym);
-                        }
-                        current = rest;
-                    }
-                    _ => break,
-                }
-            }
+            let parsed_lambda_list = match self.parse_lambda_list(params) {
+                Ok(l) => l,
+                Err(e) => return Err(ControlSignal::Error(e)),
+            };
 
             // Create closure
             let closure = Closure {
-                params: param_list,
+                lambda_list: parsed_lambda_list,
                 body,
                 env: env.clone(),
             };
@@ -1781,23 +2145,10 @@ impl<'a> Interpreter<'a> {
                 }
 
                 // Parse parameter list
-                let mut param_list = Vec::new();
-                let mut current = params;
-                loop {
-                    match self.process.arena.get_unchecked(current).clone() {
-                        Node::Fork(param, rest) => {
-                            if let Some(sym) = self.node_to_symbol(param) {
-                                param_list.push(sym);
-                            } else {
-                                return Err(ControlSignal::Error(
-                                    "DEFUN: parameter names must be symbols".to_string(),
-                                ));
-                            }
-                            current = rest;
-                        }
-                        _ => break,
-                    }
-                }
+                let parsed_lambda_list = match self.parse_lambda_list(params) {
+                    Ok(l) => l,
+                    Err(e) => return Err(ControlSignal::Error(e)),
+                };
 
                 // Validate body exists
                 if let Node::Leaf(OpaqueValue::Nil) = self.process.arena.get_unchecked(body) {
@@ -1808,15 +2159,31 @@ impl<'a> Interpreter<'a> {
 
                 // Parse declarations
                 let (_decls, body_start) = self.parse_body(body);
-                // Note: DEFUN body is an implicit block named 'name', but we haven't implemented block fully for defun
-                // except implicitly via body eval? No, DEFUN implies BLOCK.
-                // For now, just store the body (with decls stripped).
-                // Wait, if we strip decls here, the wrapper Closure should use 'body_start' as body.
+                // Note: DEFUN body is an implicit block named 'name'.
+
+                // Wrap body in BLOCK name
+                let block_sym = self.globals.special_forms.block;
+                let block_sym_node = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(crate::types::OpaqueValue::Symbol(block_sym.0)));
+                // We need (BLOCK name body...)
+                let block_args = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Fork(name_node, body_start));
+                let block_form = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Fork(block_sym_node, block_args));
 
                 // Create closure
                 let closure = Closure {
-                    params: param_list,
-                    body: body_start,
+                    lambda_list: parsed_lambda_list,
+                    body: block_form,
                     env: env.clone(),
                 };
 
@@ -2187,83 +2554,121 @@ impl<'a> Interpreter<'a> {
 
         // Evaluate and bind arguments
         let mut current_arg = args;
-        let mut param_iter = closure.params.iter();
+        // 1. Required
+        for &param in &closure.lambda_list.req {
+            if let Node::Fork(arg_expr, rest) =
+                self.process.arena.inner.get_unchecked(current_arg).clone()
+            {
+                let val = self.eval(arg_expr, env)?;
+                self.bind_pattern(&mut new_env, param, val, false)?;
+                current_arg = rest;
+            } else {
+                return Err(ControlSignal::Error(format!(
+                    "Too few arguments: expected at least {}",
+                    closure.lambda_list.req.len()
+                )));
+            }
+        }
 
-        while let Some(&param) = param_iter.next() {
-            // Check for keywords
-            if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(param) {
-                if name == "&REST" {
-                    if let Some(&rest_param) = param_iter.next() {
-                        // Bind remaining args (as a list) to rest_param
-                        // We need key here: For functions, args are GIVEN as a list of EVALUATED values.
-                        // But we are iterating `current_arg`.
-                        // Wait, `eval_application` evaluates args into a list structure (if I implemented it right).
-                        // Yes, `eval_application`:
-                        /*
-                        let mut evaluated_args = Vec::new();
-                        while let Node::Fork(arg, rest) = ... {
-                            evaluated_args.push(self.eval(arg, env)?);
-                        }
-                        return self.apply_function(op_val, args, env) <-- Wait.
-                        */
-                        // In eval.rs line 416: `self.apply_function(op_val, args, env)`
-                        // args passed to apply_function is the UNEVALUATED NodeId tree from the call site?
-                        // NO.
-                        // `eval_application` line 387 (for primitives) evaluates args.
-                        // But line 416 calls `apply_function` with `args` which is the original argument list!
-                        // AND `apply_function` calls `apply_closure`.
-                        //
-                        // ISSUE: `eval_application` (lines 411-417)
-                        // `let op_val = self.eval(op, env)?;`
-                        // `self.apply_function(op_val, args, env)`
-                        // `apply_function` (via `apply_closure`) seems to EVALUATE arguments inside `apply_closure` loop!
-                        // See line 1101: `let arg_val = self.eval(arg_expr, env)?;`
-                        // So it validates strict evaluation order.
+        // 2. Optional
+        for (var, init, sup) in &closure.lambda_list.opt {
+            if let Node::Fork(arg_expr, rest) =
+                self.process.arena.inner.get_unchecked(current_arg).clone()
+            {
+                let val = self.eval(arg_expr, env)?;
+                self.bind_pattern(&mut new_env, *var, val, false)?;
+                if let Some(s) = sup {
+                    let t_val = self.process.make_t(&self.globals);
+                    new_env.bind(*s, t_val);
+                }
+                current_arg = rest;
+            } else {
+                let val = self.eval(init.clone(), &new_env)?;
+                self.bind_pattern(&mut new_env, *var, val, false)?;
+                if let Some(s) = sup {
+                    new_env.bind(*s, self.process.make_nil());
+                }
+            }
+        }
 
-                        // BUT `&rest` needs the evaluated values of the rest.
-                        // If we are evaluating one by one, we need to collect the rest.
+        // 3. Collect Rest (Evaluated)
+        let mut rest_vals = Vec::new();
+        while let Node::Fork(arg_expr, rest) =
+            self.process.arena.inner.get_unchecked(current_arg).clone()
+        {
+            let val = self.eval(arg_expr, env)?;
+            rest_vals.push(val);
+            current_arg = rest;
+        }
 
-                        let mut rest_vals = Vec::new();
-                        // Collect remaining args
-                        loop {
-                            match self.process.arena.inner.get_unchecked(current_arg).clone() {
-                                Node::Fork(arg_expr, rest) => {
-                                    rest_vals.push(self.eval(arg_expr, env)?);
-                                    current_arg = rest;
-                                }
-                                _ => break,
+        // Bind Rest
+        if let Some(rest_sym) = closure.lambda_list.rest {
+            let rest_list = self.process.make_list(&rest_vals);
+            new_env.bind(rest_sym, rest_list);
+        }
+
+        // 4. Keys
+        if !closure.lambda_list.key.is_empty() {
+            if rest_vals.len() % 2 != 0 && !closure.lambda_list.allow_other_keys {
+                return Err(ControlSignal::Error(
+                    "Odd number of keyword arguments".into(),
+                ));
+            }
+
+            for (key_sym, var, init, sup) in &closure.lambda_list.key {
+                let mut found_val = None;
+                let mut i = 0;
+                while i < rest_vals.len() {
+                    let k = rest_vals[i];
+                    if let Some(ks) = self.node_to_symbol(k) {
+                        let k_name = self
+                            .globals
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(ks)
+                            .unwrap_or("")
+                            .to_string();
+                        let target_name = self
+                            .globals
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(*key_sym)
+                            .unwrap_or("")
+                            .to_string();
+                        if k_name.eq_ignore_ascii_case(&target_name) {
+                            if i + 1 < rest_vals.len() {
+                                found_val = Some(rest_vals[i + 1]);
+                            } else {
+                                found_val = Some(self.process.make_nil());
                             }
+                            break;
                         }
-                        let rest_list = self.list(&rest_vals);
-                        new_env.bind(rest_param, rest_list);
-                        break; // Done
                     }
-                    continue;
+                    i += 2;
                 }
-                if name == "&OPTIONAL" {
-                    continue; // Switch mode, but loop handles binding optionals naturally?
-                              // We need to know if we are in optional mode to allow missing args.
-                              // But here we just proceed. If arg is missing?
-                }
-            }
 
-            // Normal binding
-            match self.process.arena.inner.get_unchecked(current_arg).clone() {
-                Node::Fork(arg_expr, rest) => {
-                    let arg_val = self.eval(arg_expr, env)?;
-                    new_env.bind(param, arg_val);
-                    current_arg = rest;
-                }
-                _ => {
-                    // Argument missing.
-                    // If we saw &OPTIONAL, bind nil.
-                    // We need to valid state tracking.
-                    // For now, let's just bind nil if missing (loose).
-                    // Or strict check?
-                    // Let's bind nil.
-                    new_env.bind(param, self.process.make_nil());
+                if let Some(val) = found_val {
+                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    if let Some(s) = sup {
+                        let t_val = self.process.make_t(&self.globals);
+                        new_env.bind(*s, t_val);
+                    }
+                } else {
+                    let val = self.eval(*init, &new_env)?;
+                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    if let Some(s) = sup {
+                        new_env.bind(*s, self.process.make_nil());
+                    }
                 }
             }
+        }
+
+        // 5. Aux
+        for (var, init) in &closure.lambda_list.aux {
+            let val = self.eval(*init, &new_env)?;
+            new_env.bind(*var, val);
         }
 
         // Evaluate body
@@ -2276,34 +2681,42 @@ impl<'a> Interpreter<'a> {
         let mut new_env = Environment::with_parent(closure.env.clone());
 
         // Bind arguments UNEVALUATED
+        // Bind arguments UNEVALUATED using ParsedLambdaList
         let mut current_arg = args;
-        let mut param_iter = closure.params.iter();
 
-        while let Some(&param) = param_iter.next() {
-            if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(param) {
-                if name == "&REST" {
-                    if let Some(&rest_param) = param_iter.next() {
-                        // Bind remaining args (as a node) to rest_param
-                        new_env.bind(rest_param, current_arg);
-                        break;
-                    }
-                    continue;
-                }
-                if name == "&OPTIONAL" {
-                    continue;
-                }
-            }
-
+        // 1. Required
+        for &param in &closure.lambda_list.req {
             match self.process.arena.inner.get_unchecked(current_arg).clone() {
                 Node::Fork(arg_expr, rest) => {
-                    new_env.bind(param, arg_expr);
+                    self.bind_pattern(&mut new_env, param, arg_expr, true)?;
                     current_arg = rest;
                 }
                 _ => {
-                    // Missing arg (for optional)
-                    new_env.bind(param, self.process.make_nil());
+                    // Macro missing required arg?
+                    // Bind nil or error?
+                    let nil_node = self.process.make_nil();
+                    self.bind_pattern(&mut new_env, param, nil_node, true)?;
                 }
             }
+        }
+
+        // 2. Optional
+        for (param, _init, _sup) in &closure.lambda_list.opt {
+            match self.process.arena.inner.get_unchecked(current_arg).clone() {
+                Node::Fork(arg_expr, rest) => {
+                    self.bind_pattern(&mut new_env, *param, arg_expr, true)?;
+                    current_arg = rest;
+                }
+                _ => {
+                    let nil_node = self.process.make_nil();
+                    self.bind_pattern(&mut new_env, *param, nil_node, true)?;
+                }
+            }
+        }
+
+        // 3. Rest
+        if let Some(rest_sym) = closure.lambda_list.rest {
+            new_env.bind(rest_sym, current_arg);
         }
 
         // Evaluate body - this produces the expansion
@@ -2360,13 +2773,13 @@ impl<'a> Interpreter<'a> {
             if let Some(closure) = self.process.closures.get(idx as usize).cloned() {
                 // Manual binding
                 let mut method_env = Environment::with_parent(closure.env.clone());
-                if executed_args.len() != closure.params.len() {
+                if executed_args.len() != closure.lambda_list.req.len() {
                     return Err(ControlSignal::Error(
                         "Method argument count mismatch".to_string(),
                     ));
                 }
-                for (param, val) in closure.params.iter().zip(executed_args.iter()) {
-                    method_env.bind(*param, *val);
+                for (param, val) in closure.lambda_list.req.iter().zip(executed_args.iter()) {
+                    self.bind_pattern(&mut method_env, *param, *val, false)?;
                 }
                 return self.eval_progn(closure.body, &method_env);
             }
@@ -2403,23 +2816,14 @@ impl<'a> Interpreter<'a> {
                     self.process.arena.inner.get_unchecked(rest).clone()
                 {
                     // Parse parameter list
-                    let mut param_list = Vec::new();
-                    let mut current = params;
-                    loop {
-                        match self.process.arena.inner.get_unchecked(current).clone() {
-                            Node::Fork(param, rest) => {
-                                if let Some(sym) = self.node_to_symbol(param) {
-                                    param_list.push(sym);
-                                }
-                                current = rest;
-                            }
-                            _ => break,
-                        }
-                    }
+                    let parsed_lambda_list = match self.parse_lambda_list(params) {
+                        Ok(l) => l,
+                        Err(e) => return Err(ControlSignal::Error(e)),
+                    };
 
                     // Create closure
                     let closure = Closure {
-                        params: param_list,
+                        lambda_list: parsed_lambda_list,
                         body,
                         env: env.clone(),
                     };
@@ -2611,6 +3015,7 @@ impl<'a> Interpreter<'a> {
                 {
                     // Parse parameters and specializers
                     let mut params = Vec::new();
+                    let mut params_nodes = Vec::new(); // For Closure
                     let mut specializers = Vec::new();
 
                     let mut current = params_node;
@@ -2621,12 +3026,14 @@ impl<'a> Interpreter<'a> {
                         if let Some(sym) = self.node_to_symbol(param_spec) {
                             // Unspecialized (T)
                             params.push(sym);
+                            params_nodes.push(param_spec);
                             specializers.push(self.process.mop.t_class);
                         } else if let Node::Fork(pname, ptype_rest) =
                             self.process.arena.inner.get_unchecked(param_spec).clone()
                         {
                             if let Some(psym) = self.node_to_symbol(pname) {
                                 params.push(psym);
+                                params_nodes.push(pname);
                                 // Get class
                                 let class_id = if let Node::Fork(cname, _) =
                                     self.process.arena.inner.get_unchecked(ptype_rest).clone()
@@ -2658,8 +3065,10 @@ impl<'a> Interpreter<'a> {
                     // Create closure for body
                     // Need lambda-list for closure
                     // Closure { params: params, body: body, env: env }
+                    let mut lambda_list = ParsedLambdaList::default();
+                    lambda_list.req = params_nodes;
                     let closure = Closure {
-                        params: params,
+                        lambda_list,
                         body: body,
                         env: env.clone(),
                     };
