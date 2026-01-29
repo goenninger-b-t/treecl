@@ -151,7 +151,7 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(pid: Pid, program: NodeId, globals: &mut crate::context::GlobalContext) -> Self {
+    pub fn new(pid: Pid, program: NodeId, globals: &crate::context::GlobalContext) -> Self {
         let arena = ProcessArena::new();
 
         // Initialize streams (Stdio)
@@ -362,6 +362,11 @@ impl Process {
         self.arena
             .inner
             .alloc(Node::Leaf(OpaqueValue::Integer(val)))
+    }
+
+    /// Make a Pid node
+    pub fn make_pid(&mut self, pid: Pid) -> NodeId {
+        self.arena.inner.alloc(Node::Leaf(OpaqueValue::Pid(pid)))
     }
 
     /// Create a list from a slice of nodes

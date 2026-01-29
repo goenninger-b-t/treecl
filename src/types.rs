@@ -1,5 +1,11 @@
 use std::ffi::c_void;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Added Copy/Clone/Eq/Hash
+pub struct ForeignHandle(pub *mut c_void);
+
+unsafe impl Send for ForeignHandle {}
+unsafe impl Sync for ForeignHandle {}
+
 pub use crate::symbol::SymbolId;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -16,7 +22,7 @@ pub enum OpaqueValue {
     String(String),             // String content
     Closure(u32),               // Handle to Closure
     VectorHandle(u32),          // Index into Vector Storage
-    ForeignPtr(*mut c_void),    // FFI Handle
+    ForeignPtr(ForeignHandle),  // FFI Handle
     Generic(u32),               // Handle to Generic Function (CLOS)
     Instance(u32),              // Handle to Instance (CLOS)
     Class(u32),                 // Handle to Class (CLOS)

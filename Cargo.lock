@@ -448,6 +448,7 @@ name = "treecl"
 version = "0.1.0"
 dependencies = [
  "crossbeam",
+ "crossbeam-deque",
  "dashmap",
  "ghost-cell",
  "num-bigint",

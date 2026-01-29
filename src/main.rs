@@ -5,13 +5,13 @@
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::io;
+use std::sync::Arc;
 use treecl::context::GlobalContext;
 use treecl::eval::{Environment, Interpreter};
 use treecl::primitives::register_primitives;
 use treecl::printer::print_to_string;
 use treecl::process::Status;
 use treecl::scheduler::Scheduler;
-
 use treecl::symbol::PackageId;
 
 const INIT_LISP: &str = include_str!("init.lisp");
@@ -24,6 +24,8 @@ fn main() -> io::Result<()> {
     let mut globals = GlobalContext::new();
     // Register all built-in primitives
     register_primitives(&mut globals);
+    // Register MP primitives
+    treecl::mp::register_mp_primitives(&mut globals);
 
     // Intern REPL history variables
     let mut symbols_guard = globals.symbols.write().unwrap();
@@ -35,16 +37,17 @@ fn main() -> io::Result<()> {
     symbols_guard.export_symbol(star_3);
     drop(symbols_guard);
 
+    // Wrap globals in Arc for sharing
+    let globals = Arc::new(globals);
+
     let mut scheduler = Scheduler::new();
 
     // Create main process (REPL Worker)
-    // We keep it in the scheduler mostly, but need to borrow it for parsing?
-    // Actually, we can use a dedicated REPL process that stays in the registry.
-    // Or we can assume PID 1 is the REPL.
-    let repl_pid = scheduler.spawn(&mut globals);
+    let repl_pid = scheduler.spawn(&globals, treecl::types::NodeId(0)); // spawn takes &GlobalContext, func
 
     // Bootstrap Standard Library
-    if let Some(mut process) = scheduler.registry.remove(&repl_pid) {
+    if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+        let mut process = proc_ref.lock().unwrap();
         process.status = Status::Runnable;
 
         let mut interpreter = Interpreter::new(&mut process, &globals);
@@ -80,8 +83,6 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             }
         }
-
-        scheduler.registry.insert(repl_pid, process);
     }
 
     // Check CLI args
@@ -91,17 +92,19 @@ fn main() -> io::Result<()> {
         let filename = &args[1];
         let file_content = std::fs::read_to_string(filename)?;
 
-        // Borrow REPL Process from Scheduler to Parse/Eval
         let mut expressions = Vec::new();
 
         // 1. Parse all expressions
-        if let Some(mut process) = scheduler.registry.remove(&repl_pid) {
+        if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+            let mut process_guard = proc_ref.lock().unwrap();
+            let process = &mut *process_guard;
             process.status = Status::Runnable;
 
+            let mut symbols_guard = globals.symbols.write().unwrap();
             let mut reader = treecl::reader::Reader::new(
                 &file_content,
                 &mut process.arena.inner,
-                globals.symbols.get_mut().unwrap(),
+                &mut *symbols_guard,
                 &process.readtable,
                 Some(&mut process.arrays),
             );
@@ -116,27 +119,65 @@ fn main() -> io::Result<()> {
                     }
                 }
             }
-
-            // Return process to registry
-            scheduler.registry.insert(repl_pid, process);
         }
 
         // 2. Execute all expressions
         for expr in expressions {
-            if let Some(mut process) = scheduler.registry.remove(&repl_pid) {
+            if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+                let mut process = proc_ref.lock().unwrap();
                 process.status = Status::Runnable;
 
                 let mut interpreter = Interpreter::new(&mut process, &globals);
                 let env = Environment::new();
 
-                if let Err(e) = interpreter.eval(expr, &env) {
-                    eprintln!("Execution Error: {:?}", e);
-                    scheduler.registry.insert(repl_pid, process);
-                    std::process::exit(1);
+                match interpreter.eval(expr, &env) {
+                    Ok(_) => {} // Ignore result for file exec
+                    Err(treecl::eval::ControlSignal::SysCall(syscall)) => {
+                        match syscall {
+                            treecl::syscall::SysCall::Spawn(fn_node) => {
+                                // We need to release lock? interpreter is done.
+                                let pid = scheduler.spawn(&globals, fn_node);
+                                let pid_node = process.make_pid(pid);
+                                println!(
+                                    "{}",
+                                    treecl::printer::print_to_string(
+                                        &process.arena.inner,
+                                        &*globals.symbols.read().unwrap(),
+                                        pid_node
+                                    )
+                                );
+                            }
+                            treecl::syscall::SysCall::Sleep(ms) => {
+                                std::thread::sleep(std::time::Duration::from_millis(ms));
+                            }
+                            treecl::syscall::SysCall::Receive { .. } => {
+                                if let Some(msg) = process.mailbox.pop_front() {
+                                    println!(
+                                        "{}",
+                                        treecl::printer::print_to_string(
+                                            &process.arena.inner,
+                                            &*globals.symbols.read().unwrap(),
+                                            msg.payload
+                                        )
+                                    );
+                                } else {
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    eprintln!("REPL: No message.");
+                                }
+                            }
+                            treecl::syscall::SysCall::Send { .. } => {
+                                // Ignore
+                            }
+                            _ => {
+                                eprintln!("Unhandled SysCall in File Exec: {:?}", syscall);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Execution Error: {:?}", e);
+                        std::process::exit(1);
+                    }
                 }
-
-                // Return process
-                scheduler.registry.insert(repl_pid, process);
             } else {
                 eprintln!("Process lost!");
                 std::process::exit(1);
@@ -144,6 +185,9 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
+
+    // Start Scheduler Threads
+    scheduler.start(globals.clone());
 
     println!("REPL Process: {:?}", repl_pid);
 
@@ -155,17 +199,11 @@ fn main() -> io::Result<()> {
     let mut code_buffer = String::new();
 
     // REPL History values (NodeIds)
-    // We init them to None and lazy-load NIL from process
     let mut hist_1: Option<treecl::types::NodeId> = None;
     let mut hist_2: Option<treecl::types::NodeId> = None;
-    let mut hist_3: Option<treecl::types::NodeId> = None;
 
     loop {
-        // Run background tasks (Scheduler tick)
-        // We run a few ticks to let background processes progress
-        for _ in 0..10 {
-            scheduler.run_tick(&mut globals);
-        }
+        // No manual ticking needed. Scheduler threads are running.
 
         let prompt = if code_buffer.is_empty() {
             "CL-USER> "
@@ -197,9 +235,9 @@ fn main() -> io::Result<()> {
                         continue;
                     }
 
-                    // Borrow REPL Process from Scheduler to Parse/Eval
-                    if let Some(mut process) = scheduler.registry.remove(&repl_pid) {
-                        // Ensure process is awake?
+                    if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+                        let mut process_guard = proc_ref.lock().unwrap();
+                        let process = &mut *process_guard;
                         process.status = Status::Runnable;
 
                         // Init history bindings if first run
@@ -213,19 +251,22 @@ fn main() -> io::Result<()> {
                         }
 
                         // Read
-                        let read_result = treecl::reader::Reader::new(
-                            &trimmed,
-                            &mut process.arena.inner,
-                            globals.symbols.get_mut().unwrap(),
-                            &process.readtable,
-                            Some(&mut process.arrays),
-                        )
-                        .read();
+                        let read_result = {
+                            let mut symbols_guard = globals.symbols.write().unwrap();
+                            treecl::reader::Reader::new(
+                                &trimmed,
+                                &mut process.arena.inner,
+                                &mut *symbols_guard,
+                                &process.readtable,
+                                Some(&mut process.arrays),
+                            )
+                            .read()
+                        };
 
                         match read_result {
                             Ok(expr) => {
                                 // Evaluate
-                                let mut interpreter = Interpreter::new(&mut process, &globals);
+                                let mut interpreter = Interpreter::new(process, &globals);
                                 let env = Environment::new();
 
                                 match interpreter.eval(expr, &env) {
@@ -239,13 +280,65 @@ fn main() -> io::Result<()> {
                                         println!("{}", output);
 
                                         // Update History (*, **, ***)
-                                        hist_3 = hist_2;
-                                        hist_2 = hist_1;
-                                        hist_1 = Some(val);
+                                        let old_star =
+                                            process.get_value(star_1).unwrap_or(hist_1.unwrap());
+                                        let old_star_2 =
+                                            process.get_value(star_2).unwrap_or(hist_2.unwrap());
 
-                                        process.set_value(star_1, hist_1.unwrap());
-                                        process.set_value(star_2, hist_2.unwrap());
-                                        process.set_value(star_3, hist_3.unwrap());
+                                        process.set_value(star_3, old_star_2);
+                                        process.set_value(star_2, old_star);
+                                        process.set_value(star_1, val);
+
+                                        hist_1 = Some(val);
+                                        hist_2 = Some(old_star);
+                                    }
+                                    Err(treecl::eval::ControlSignal::SysCall(syscall)) => {
+                                        match syscall {
+                                            treecl::syscall::SysCall::Spawn(fn_node) => {
+                                                let pid = scheduler.spawn(&globals, fn_node);
+                                                let pid_node = process.make_pid(pid);
+                                                println!(
+                                                    "{}",
+                                                    treecl::printer::print_to_string(
+                                                        &process.arena.inner,
+                                                        &*globals.symbols.read().unwrap(),
+                                                        pid_node
+                                                    )
+                                                );
+                                            }
+                                            treecl::syscall::SysCall::Sleep(ms) => {
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(ms),
+                                                );
+                                                println!("nil");
+                                            }
+                                            treecl::syscall::SysCall::Receive { .. } => {
+                                                if let Some(msg) = process.mailbox.pop_front() {
+                                                    println!(
+                                                        "{}",
+                                                        treecl::printer::print_to_string(
+                                                            &process.arena.inner,
+                                                            &*globals.symbols.read().unwrap(),
+                                                            msg.payload
+                                                        )
+                                                    );
+                                                } else {
+                                                    std::thread::sleep(
+                                                        std::time::Duration::from_millis(50),
+                                                    );
+                                                    eprintln!("REPL: No message.");
+                                                }
+                                            }
+                                            treecl::syscall::SysCall::Send { .. } => {
+                                                println!("nil");
+                                            }
+                                            _ => {
+                                                eprintln!(
+                                                    "Unhandled SysCall in REPL: {:?}",
+                                                    syscall
+                                                );
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         println!("Error: {:?}", e);
@@ -256,9 +349,8 @@ fn main() -> io::Result<()> {
                                 println!("Read error: {}", e);
                             }
                         }
-                        scheduler.registry.insert(repl_pid, process);
                     } else {
-                        println!("REPL Process died!");
+                        println!("REPL Process died/lost!");
                         break;
                     }
                     code_buffer.clear();

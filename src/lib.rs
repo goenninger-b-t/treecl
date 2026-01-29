@@ -24,6 +24,7 @@ pub mod types;
 // pub mod parser;
 pub mod compiler;
 pub mod context;
+pub mod mp;
 pub mod process;
 pub mod scheduler;
 pub mod syscall;
