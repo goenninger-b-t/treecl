@@ -46,6 +46,12 @@ pub struct Message {
     pub payload: NodeId, // Root of the message tree in Receiver's arena (copied on send)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionMode {
+    Eval,   // Evaluate `program` in `current_env`
+    Return, // `program` is a result, continue mechanism
+}
+
 /// Symbol Bindings (Process-Local)
 #[derive(Debug, Clone, Default)]
 pub struct SymbolBindings {
@@ -116,6 +122,9 @@ pub struct Process {
     /// Macros (SymbolId -> Closure Index)
     pub macros: HashMap<SymbolId, usize>,
 
+    /// Global Functions (SymbolId -> Closure Index)
+    pub functions: HashMap<SymbolId, usize>,
+
     /// Condition System State
     pub conditions: crate::conditions::ConditionSystem,
 
@@ -142,6 +151,16 @@ pub struct Process {
 
     /// Evaluation Context (Stack depth, limits)
     pub eval_context: EvalContext,
+
+    /// TCO Stack for Interpreter
+    pub continuation_stack: Vec<crate::eval::Continuation>,
+
+    /// Current Environment for TCO
+    // Using Option so we can take/replace without dummy
+    pub current_env: Option<crate::eval::Environment>,
+
+    /// TCO Execution Mode
+    pub execution_mode: ExecutionMode,
 
     /// MetaObject Protocol (CLOS)
     pub mop: crate::clos::MetaObjectProtocol,
@@ -180,6 +199,7 @@ impl Process {
             streams,
             closures,
             macros: HashMap::new(), // Initialize macros
+            functions: HashMap::new(),
             conditions,
             arrays,
             readtable,
@@ -188,6 +208,9 @@ impl Process {
             monitors: HashMap::new(), // Initialize monitors
             mop,
             eval_context,
+            continuation_stack: Vec::new(),
+            current_env: None,
+            execution_mode: ExecutionMode::Eval,
             reduction_count: 0,
             pending_redex: None,
             pending_syscall: None,
@@ -323,16 +346,16 @@ impl Process {
     }
 
     pub fn set_value(&mut self, sym: SymbolId, val: NodeId) {
-        eprintln!(
-            "DEBUG: Setting value for {:?} -> {:?}",
-            sym,
-            self.arena.inner.get_unchecked(val)
-        );
         self.dictionary.entry(sym).or_default().value = Some(val);
     }
 
-    pub fn get_function(&self, sym: SymbolId) -> Option<NodeId> {
-        self.dictionary.get(&sym).and_then(|b| b.function)
+    pub fn get_function(&mut self, sym: crate::symbol::SymbolId) -> Option<NodeId> {
+        if let Some(&idx) = self.functions.get(&sym) {
+            let val = crate::types::OpaqueValue::Closure(idx as u32);
+            Some(self.arena.inner.alloc(crate::arena::Node::Leaf(val)))
+        } else {
+            None
+        }
     }
 
     pub fn set_function(&mut self, sym: SymbolId, func: NodeId) {
@@ -388,56 +411,43 @@ impl Process {
             return ExecutionResult::Blocked;
         }
 
-        // Resume from SysCall if needed?
-        // No, the scheduler should have cleared pending_syscall before calling us if it was handled.
+        let mut steps = 0;
 
-        let mut ctx = EvalContext {
-            steps: 0,
-            max_steps: budget,
-        };
+        // We use the Interpreter to drive the TCO state machine
+        let mut interpreter = crate::eval::Interpreter::new(self, globals);
 
-        // 1. Run Tree Calculus Reduction
-        // Pass context to track steps
-        self.program = crate::search::reduce(&mut self.arena.inner, self.program, &mut ctx);
-        self.reduction_count += ctx.steps;
+        while steps < budget {
+            // Check for pending syscalls (shouldn't happen if we check inside step, but mostly for safety)
+            if let Some(syscall) = interpreter.process.pending_syscall.take() {
+                return ExecutionResult::SysCall(syscall);
+            }
 
-        // 2. Check for SysCall Interruption
-        // If primitive triggered SysCall, search::reduce returns the root (unmodified or partially reduced).
-        // But we set `pending_syscall` in `try_reduce_primitive`.
-        if let Some(syscall) = self.pending_syscall.take() {
-            return ExecutionResult::SysCall(syscall);
-        }
+            match interpreter.step() {
+                Ok(continue_exec) => {
+                    steps += 1;
+                    interpreter.process.reduction_count += 1;
 
-        // 3. Check for Primitives (Stuck state)
-        // If we stopped before budget, we might be stuck on a primitive
-        if ctx.steps < budget {
-            // Check if head is primitive
-            {
-                let mut interpreter = crate::eval::Interpreter::new(self, globals);
-                // Try one primitive reduction
-                let new_root = interpreter.try_reduce_primitive(
-                    interpreter.process.program,
-                    &crate::eval::Environment::new(),
-                );
-
-                // Check if THAT triggered syscall
-                if let Some(syscall) = interpreter.process.pending_syscall.take() {
-                    return ExecutionResult::SysCall(syscall);
+                    if !continue_exec {
+                        // Execution Finished
+                        return ExecutionResult::Terminated;
+                    }
                 }
-
-                interpreter.process.program = new_root;
+                Err(crate::eval::ControlSignal::Error(msg)) => {
+                    interpreter.process.status = Status::Failed(msg);
+                    return ExecutionResult::Terminated;
+                }
+                Err(crate::eval::ControlSignal::SysCall(sys)) => {
+                    return ExecutionResult::SysCall(sys);
+                }
+                Err(e) => {
+                    // Unhandled signal (Go, ReturnFrom, Throw) at top level
+                    let msg = format!("Unhandled signal: {:?}", e);
+                    interpreter.process.status = Status::Failed(msg);
+                    return ExecutionResult::Terminated;
+                }
             }
         }
 
-        if ctx.steps >= budget {
-            ExecutionResult::Yielded
-        } else if self.status == Status::Runnable {
-            // Terminated (Normal Form)
-            self.status = Status::Terminated;
-            ExecutionResult::Terminated
-        } else {
-            // Status changed (e.g. Failed, Blocked, SysCall pending)
-            ExecutionResult::Terminated
-        }
+        ExecutionResult::Yielded
     }
 }

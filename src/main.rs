@@ -35,6 +35,12 @@ fn main() -> io::Result<()> {
     symbols_guard.export_symbol(star_2);
     let star_3 = symbols_guard.intern_in("***", PackageId(1));
     symbols_guard.export_symbol(star_3);
+    let slash_1 = symbols_guard.intern_in("/", PackageId(1));
+    symbols_guard.export_symbol(slash_1);
+    let slash_2 = symbols_guard.intern_in("//", PackageId(1));
+    symbols_guard.export_symbol(slash_2);
+    let slash_3 = symbols_guard.intern_in("///", PackageId(1));
+    symbols_guard.export_symbol(slash_3);
     drop(symbols_guard);
 
     // Wrap globals in Arc for sharing
@@ -191,10 +197,51 @@ fn main() -> io::Result<()> {
 
     println!("REPL Process: {:?}", repl_pid);
 
-    let mut rl = DefaultEditor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    if rl.load_history("history.txt").is_err() {
-        println!("No previous history.");
-    }
+    // Channels for REPL I/O
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<String>();
+    let (prompt_tx, prompt_rx) = std::sync::mpsc::channel::<String>();
+
+    // Input Thread
+    std::thread::spawn(move || {
+        let mut rl = DefaultEditor::new().expect("Failed to init readline");
+        if rl.load_history("history.txt").is_err() {
+            println!("No previous history.");
+        }
+
+        loop {
+            // Wait for prompt request
+            let prompt = match prompt_rx.recv() {
+                Ok(p) => p,
+                Err(_) => break, // Main thread likely died
+            };
+
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    let _ = rl.add_history_entry(line.as_str());
+                    if input_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(ReadlineError::Interrupted) => {
+                    println!("CTRL-C");
+                    if input_tx.send("".to_string()).is_err() {
+                        break;
+                    }
+                }
+                Err(ReadlineError::Eof) => {
+                    println!("CTRL-D");
+                    let _ = input_tx.send("(exit)".to_string());
+                    break;
+                }
+                Err(err) => {
+                    println!("Error: {:?}", err);
+                    let _ = input_tx.send("(exit)".to_string());
+                    break;
+                }
+            }
+        }
+        let _ = rl.save_history("history.txt");
+    });
 
     let mut code_buffer = String::new();
 
@@ -202,42 +249,44 @@ fn main() -> io::Result<()> {
     let mut hist_1: Option<treecl::types::NodeId> = None;
     let mut hist_2: Option<treecl::types::NodeId> = None;
 
+    // Initial prompt
+    let _ = prompt_tx.send("CL-USER> ".to_string());
+    let mut waiting_for_input = true;
+
     loop {
-        // No manual ticking needed. Scheduler threads are running.
+        // Non-blocking Input Check
+        if let Ok(line) = input_rx.try_recv() {
+            let trimmed_line = line.trim();
 
-        let prompt = if code_buffer.is_empty() {
-            "CL-USER> "
-        } else {
-            ".....> "
-        };
+            if code_buffer.is_empty() && (trimmed_line == "(quit)" || trimmed_line == "(exit)") {
+                println!("Goodbye!");
+                break; // Exit Main Loop
+            }
 
-        let readline = rl.readline(prompt);
-        match readline {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
+            if !line.trim().is_empty() {
+                code_buffer.push_str(&line);
+                code_buffer.push('\n');
+            }
 
-                let trimmed_line = line.trim();
-                if code_buffer.is_empty() && (trimmed_line == "(quit)" || trimmed_line == "(exit)")
-                {
-                    println!("Goodbye!");
-                    break;
-                }
-
-                if !line.trim().is_empty() {
-                    code_buffer.push_str(&line);
-                    code_buffer.push('\n');
-                }
-
-                if is_balanced(&code_buffer) {
-                    let trimmed = code_buffer.trim().to_string();
-                    if trimmed.is_empty() {
-                        code_buffer.clear();
-                        continue;
-                    }
-
+            if is_balanced(&code_buffer) {
+                let trimmed = code_buffer.trim().to_string();
+                if trimmed.is_empty() {
+                    code_buffer.clear();
+                    // Request next prompt
+                    let _ = prompt_tx.send("CL-USER> ".to_string());
+                } else {
+                    // Evaluate!
                     if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
                         let mut process_guard = proc_ref.lock().unwrap();
                         let process = &mut *process_guard;
+
+                        if process.status != Status::Terminated
+                            && process.status != Status::Runnable
+                        {
+                            // If running, we might clash.
+                            // But usually REPL waits.
+                        }
+
                         process.status = Status::Runnable;
 
                         // Init history bindings if first run
@@ -248,130 +297,88 @@ fn main() -> io::Result<()> {
                             process.set_value(star_1, nil);
                             process.set_value(star_2, nil);
                             process.set_value(star_3, nil);
+                            process.set_value(slash_1, nil);
+                            process.set_value(slash_2, nil);
+                            process.set_value(slash_3, nil);
                         }
 
-                        // Read
-                        let read_result = {
-                            let mut symbols_guard = globals.symbols.write().unwrap();
-                            treecl::reader::Reader::new(
-                                &trimmed,
-                                &mut process.arena.inner,
-                                &mut *symbols_guard,
-                                &process.readtable,
-                                Some(&mut process.arrays),
-                            )
-                            .read()
-                        };
+                        let input_source = code_buffer.clone();
+                        code_buffer.clear(); // Clear buffer for next command
 
-                        match read_result {
+                        waiting_for_input = false; // We are now executing
+
+                        match treecl::reader::read_from_string(
+                            &input_source,
+                            &mut process.arena.inner,
+                            &mut *globals.symbols.write().unwrap(),
+                        ) {
                             Ok(expr) => {
-                                // Evaluate
-                                let mut interpreter = Interpreter::new(process, &globals);
-                                let env = Environment::new();
-
-                                match interpreter.eval(expr, &env) {
-                                    Ok(val) => {
-                                        // Print result
-                                        let output = print_to_string(
-                                            &process.arena.inner,
-                                            &*globals.symbols.read().unwrap(),
-                                            val,
-                                        );
-                                        println!("{}", output);
-
-                                        // Update History (*, **, ***)
-                                        let old_star =
-                                            process.get_value(star_1).unwrap_or(hist_1.unwrap());
-                                        let old_star_2 =
-                                            process.get_value(star_2).unwrap_or(hist_2.unwrap());
-
-                                        process.set_value(star_3, old_star_2);
-                                        process.set_value(star_2, old_star);
-                                        process.set_value(star_1, val);
-
-                                        hist_1 = Some(val);
-                                        hist_2 = Some(old_star);
-                                    }
-                                    Err(treecl::eval::ControlSignal::SysCall(syscall)) => {
-                                        match syscall {
-                                            treecl::syscall::SysCall::Spawn(fn_node) => {
-                                                let pid = scheduler.spawn(&globals, fn_node);
-                                                let pid_node = process.make_pid(pid);
-                                                println!(
-                                                    "{}",
-                                                    treecl::printer::print_to_string(
-                                                        &process.arena.inner,
-                                                        &*globals.symbols.read().unwrap(),
-                                                        pid_node
-                                                    )
-                                                );
-                                            }
-                                            treecl::syscall::SysCall::Sleep(ms) => {
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(ms),
-                                                );
-                                                println!("nil");
-                                            }
-                                            treecl::syscall::SysCall::Receive { .. } => {
-                                                if let Some(msg) = process.mailbox.pop_front() {
-                                                    println!(
-                                                        "{}",
-                                                        treecl::printer::print_to_string(
-                                                            &process.arena.inner,
-                                                            &*globals.symbols.read().unwrap(),
-                                                            msg.payload
-                                                        )
-                                                    );
-                                                } else {
-                                                    std::thread::sleep(
-                                                        std::time::Duration::from_millis(50),
-                                                    );
-                                                    eprintln!("REPL: No message.");
-                                                }
-                                            }
-                                            treecl::syscall::SysCall::Send { .. } => {
-                                                println!("nil");
-                                            }
-                                            _ => {
-                                                eprintln!(
-                                                    "Unhandled SysCall in REPL: {:?}",
-                                                    syscall
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!("Error: {:?}", e);
-                                    }
-                                }
+                                // TCO Setup
+                                process.program = expr;
+                                process.execution_mode = treecl::process::ExecutionMode::Eval;
+                                process.continuation_stack.clear();
+                                process
+                                    .continuation_stack
+                                    .push(treecl::eval::Continuation::Done);
+                                process.current_env = Some(treecl::eval::Environment::new());
+                                process.reduction_count = 0;
+                                process.status = Status::Runnable;
                             }
                             Err(e) => {
-                                println!("Read error: {}", e);
+                                eprintln!("Parse Error: {:?}", e);
+                                let _ = prompt_tx.send("CL-USER> ".to_string());
+                                waiting_for_input = true;
                             }
                         }
-                    } else {
-                        println!("REPL Process died/lost!");
-                        break;
                     }
-                    code_buffer.clear();
                 }
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
-                break;
-            }
-            Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
-                break;
-            }
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break;
+            } else {
+                // Incomplete
+                let _ = prompt_tx.send(".....> ".to_string());
             }
         }
+
+        // Post-Input Logic (Polling Execution)
+        // Check REPL process status
+        if !waiting_for_input {
+            if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+                let mut finished = false;
+                let mut result_node = None;
+                {
+                    let mut proc = proc_ref.lock().unwrap();
+                    if proc.status == Status::Terminated {
+                        finished = true;
+                        result_node = Some(proc.program);
+                    } else if let Status::Failed(msg) = &proc.status {
+                        eprintln!("Error: {}", msg);
+                        finished = true;
+                    }
+                }
+
+                if finished {
+                    if let Some(res) = result_node {
+                        let proc_guard = proc_ref.lock().unwrap();
+                        let s = print_to_string(
+                            &proc_guard.arena.inner,
+                            &*globals.symbols.read().unwrap(),
+                            res,
+                        );
+                        println!("{}", s);
+
+                        // Update History would go here
+                    }
+
+                    // Ready for next input
+                    let _ = prompt_tx.send("CL-USER> ".to_string());
+                    waiting_for_input = true;
+                }
+            }
+        }
+
+        // Sleep to prevent busy loop
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let _ = rl.save_history("history.txt");
     Ok(())
 }
 

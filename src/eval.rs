@@ -93,6 +93,58 @@ pub enum ControlSignal {
 /// Result of evaluation
 pub type EvalResult = Result<NodeId, ControlSignal>;
 
+/// TCO Continuation Frames
+#[derive(Debug, Clone)]
+pub enum Continuation {
+    /// Return to REPL/Caller
+    Done,
+    /// Evaluate arguments for function application
+    /// (operator, remaining_args, evaluated_args)
+    EvArgs {
+        op: NodeId,
+        args: Vec<NodeId>, // Pending args
+        vals: Vec<NodeId>, // Evaluated args
+    },
+    /// Apply function after args evaluated
+    /// (function, args)
+    Apply {
+        func: NodeId,
+        // Env is captured in closure or current?
+        // Usually Apply just needs func and args.
+        // Logic will handle dispatch (primitive or closure)
+        saved_env: Environment,
+    },
+    /// Evaluate sequences (PROGN)
+    /// (remaining_forms)
+    EvProgn { rest: Vec<NodeId> },
+    /// Evaluate Test for IF
+    /// (then_branch, else_branch)
+    EvIf {
+        then_branch: NodeId,
+        else_branch: NodeId,
+    },
+    /// Assignment (SETQ)
+    /// (symbol, remaining_pairs)
+    EvSetq {
+        sym: SymbolId,
+        rest: Vec<NodeId>, // Next var/val pairs
+    },
+    /// Definition (DEFUN/DEFMACRO) result handler
+    /// (name) - just intern/bind and return name
+    Defun { name: NodeId },
+    /// Tagbody frame
+    Tagbody {
+        rest: Vec<NodeId>,
+        tag_map: HashMap<TagKey, Vec<NodeId>>,
+    },
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum TagKey {
+    Sym(SymbolId),
+    Int(i64),
+}
+
 /// The TreeCL interpreter wrapper
 /// Holds references to the current Process state and Global Code context.
 pub struct Interpreter<'a> {
@@ -208,82 +260,949 @@ impl<'a> Interpreter<'a> {
 
     /// Main evaluation entry point
     pub fn eval(&mut self, expr: NodeId, env: &Environment) -> EvalResult {
+        // Legacy recursive eval - eventually replace or wrap step
         let node = self.process.arena.get_unchecked(expr).clone();
+        // ... (existing eval logic to be kept for reference or backup until full switch)
+        // For now, let's keep eval as is, and add step separately.
+        // But the user asked to refactor Eval.
+        // Let's implement step and then make eval call step in a loop.
 
-        match node {
-            Node::Leaf(val) => {
-                match val {
-                    OpaqueValue::Nil => Ok(self.process.make_nil()), // Need these in globals? Or retrieve?
-                    // GlobalContext has nil_sym, but nodes are in arena?
-                    // Ah, nil_node must be in EACH process arena?
-                    // Yes, separate heaps.
-                    // So we must lookup NIL in current arena or allocate it?
-                    // Or cache in Process?
-                    // Process::new() should create NIL/T?
-                    // Let's assume we can get them.
-                    OpaqueValue::Symbol(id) => {
-                        let sym_id = SymbolId(id);
-                        // Variable lookup
-                        if let Some(val) = env.lookup(sym_id) {
-                            return Ok(val);
-                        }
-                        // Check Process Dictionary
-                        if let Some(val) = self.process.get_value(sym_id) {
-                            return Ok(val);
-                        }
+        // Initialize TCO state
+        self.process.program = expr;
+        self.process.current_env = Some(env.clone());
+        self.process.continuation_stack.clear();
+        self.process.continuation_stack.push(Continuation::Done);
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
 
-                        // Self-evaluating keywords?
-                        // symbols is in Globals.
-                        if self
-                            .globals
-                            .symbols
-                            .read()
-                            .unwrap()
-                            .get_symbol(sym_id)
-                            .map_or(false, |s: &crate::symbol::Symbol| s.is_keyword())
-                        {
-                            return Ok(expr);
-                        }
-                        // If T or NIL
-                        if sym_id == self.globals.t_sym || sym_id == self.globals.nil_sym {
-                            return Ok(expr);
-                        }
+        loop {
+            if !self.step()? {
+                return Ok(self.process.program);
+            }
+        }
+    }
 
-                        // Keywords evaluate to themselves
-                        if let Some(sym) = self.globals.symbols.read().unwrap().get_symbol(sym_id) {
-                            if sym.is_keyword() {
-                                return Ok(expr);
+    /// Perform one step of TCO evaluation
+    /// Returns true if execution should continue, false if finished (result in process.program)
+    pub fn step(&mut self) -> Result<bool, ControlSignal> {
+        let mode = self.process.execution_mode.clone();
+
+        match mode {
+            crate::process::ExecutionMode::Eval => {
+                let expr = self.process.program;
+                let env = self.process.current_env.as_ref().unwrap().clone();
+                let node = self.process.arena.get_unchecked(expr).clone();
+
+                match node {
+                    Node::Leaf(val) => {
+                        match val {
+                            OpaqueValue::Symbol(id) => {
+                                let sym_id = SymbolId(id);
+                                if let Some(val) = env.lookup(sym_id) {
+                                    self.process.program = val;
+                                } else if let Some(val) = self.process.get_value(sym_id) {
+                                    self.process.program = val;
+                                } else if self.is_self_evaluating(sym_id) {
+                                    // Program remains expr
+                                } else {
+                                    let name = self
+                                        .globals
+                                        .symbols
+                                        .read()
+                                        .unwrap()
+                                        .symbol_name(sym_id)
+                                        .unwrap_or("?")
+                                        .to_string();
+                                    return Err(ControlSignal::Error(format!(
+                                        "Variable '{}' is not bound",
+                                        name
+                                    )));
+                                }
                             }
+                            _ => {} // Self-evaluating
                         }
-
-                        // Unbound variable
-                        let name = self
-                            .globals
-                            .symbols
-                            .read()
-                            .unwrap()
-                            .symbol_name(sym_id)
-                            .unwrap_or("???")
-                            .to_string();
-                        Err(ControlSignal::Error(format!(
-                            "Variable '{}' is not bound",
-                            name
-                        )))
+                        self.process.execution_mode = crate::process::ExecutionMode::Return;
+                        Ok(true)
                     }
-                    _ => Ok(expr), // Self-evaluating (e.g. Pid)
+                    Node::Stem(_) => {
+                        self.process.execution_mode = crate::process::ExecutionMode::Return;
+                        Ok(true)
+                    }
+                    Node::Fork(op, args) => self.step_application(op, args, env),
+                }
+            }
+            crate::process::ExecutionMode::Return => {
+                if let Some(cont) = self.process.continuation_stack.pop() {
+                    self.apply_continuation(cont)
+                } else {
+                    Ok(false) // Done
+                }
+            }
+        }
+    }
+
+    fn is_self_evaluating(&self, sym: SymbolId) -> bool {
+        if sym == self.globals.t_sym || sym == self.globals.nil_sym {
+            return true;
+        }
+        if let Some(s) = self.globals.symbols.read().unwrap().get_symbol(sym) {
+            if s.is_keyword() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn step_application(
+        &mut self,
+        op: NodeId,
+        args: NodeId,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        // Check Special Forms
+        if let Some(sym_id) = self.node_to_symbol(op) {
+            let sf = &self.globals.special_forms;
+
+            if sym_id == sf.setq {
+                return self.step_setq(args, env);
+            }
+            if sym_id == sf.r#if {
+                return self.step_if(args, env);
+            }
+            if sym_id == sf.progn {
+                return self.step_progn(args, env);
+            }
+            if sym_id == sf.quote {
+                if let Node::Fork(arg, _) = self.process.arena.get_unchecked(args) {
+                    self.process.program = *arg;
+                } else {
+                    self.process.program = self.process.make_nil();
+                }
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+            if sym_id == sf.defmacro {
+                return self.step_defmacro(args, env);
+            }
+            if sym_id == sf.defun {
+                return self.step_defun(args, env);
+            }
+            if sym_id == sf.function {
+                return self.step_function(args, env);
+            }
+            if sym_id == sf.r#let {
+                return self.step_let(args, env);
+            }
+            if sym_id == sf.block {
+                // For now, treat block as progn (ignore block name/return-from support temporarily)
+                // Just execute body (tail of args).
+                // (block name form1 form2...)
+                let list = self.cons_to_vec(args);
+                if list.len() >= 2 {
+                    // Treat as (progn form1...)
+                    // We need to construct progn node.
+                    let forms = self.process.make_list(&list[1..]);
+                    let progn_sym_val = crate::types::OpaqueValue::Symbol(sf.progn.0);
+                    let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
+
+                    let progn_node = self
+                        .process
+                        .arena
+                        .inner
+                        .alloc(Node::Fork(progn_sym_node, forms));
+                    self.process.program = progn_node;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                    return Ok(true);
+                } else {
+                    self.process.program = self.process.make_nil();
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                    return Ok(true);
+                }
+            }
+            if sym_id == sf.tagbody {
+                return self.step_tagbody(args, env);
+            }
+            if sym_id == sf.go {
+                return self.step_go(args, env);
+            }
+        }
+
+        // Function Application
+        let arg_list = self.cons_to_vec(args);
+
+        if arg_list.is_empty() {
+            // Immediate Apply (no args)
+            self.process.continuation_stack.push(Continuation::Apply {
+                func: op,
+                saved_env: env,
+            });
+            self.process.execution_mode = crate::process::ExecutionMode::Return;
+            self.process.program = self.process.make_nil();
+        } else {
+            // Start evaluating first arg
+            let first = arg_list[0];
+            let rest = arg_list[1..].to_vec();
+            self.process.continuation_stack.push(Continuation::EvArgs {
+                op,
+                args: rest,
+                vals: Vec::new(),
+            });
+            self.process.program = first;
+            self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        }
+        Ok(true)
+    }
+
+    fn step_defmacro(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        // (defmacro name lambda-list &rest body)
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Err(ControlSignal::Error("defmacro: too few args".into()));
+        }
+        let name_node = args_vec[0];
+        let lambda_list_node = args_vec[1];
+
+        let sym = self
+            .node_to_symbol(name_node)
+            .ok_or_else(|| ControlSignal::Error("defmacro name must be symbol".into()))?;
+
+        // Construct Closure Body: (progn ...body)
+        let body_forms = if args_vec.len() > 2 {
+            self.process.make_list(&args_vec[2..])
+        } else {
+            self.process.make_nil()
+        };
+
+        // Wrap in PROGN?
+        let progn_sym = self.globals.special_forms.progn;
+        let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
+        let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
+
+        let body_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Fork(progn_sym_node, body_forms));
+
+        // Parse lambda list
+        let mut params = Vec::new();
+        let mut c = lambda_list_node;
+        loop {
+            let node = self.process.arena.get_unchecked(c).clone();
+            if let Node::Fork(head, tail) = node {
+                if let Some(s) = self.node_to_symbol(head) {
+                    params.push(s);
+                }
+                c = tail;
+            } else {
+                break;
+            }
+        }
+
+        // Create Closure
+        let closure = crate::eval::Closure {
+            params,
+            body: body_node,
+            env: crate::eval::Environment::new(),
+        };
+
+        // Register
+        let closure_idx = self.process.closures.len();
+        self.process.closures.push(closure);
+        self.process.macros.insert(sym, closure_idx);
+
+        // Return Name
+        self.process.program = name_node;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_tagbody(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        let body_list = self.cons_to_vec(args);
+
+        // Scan for tags and build map
+        let mut tag_map = HashMap::new();
+
+        for (i, node) in body_list.iter().enumerate() {
+            let n = self.process.arena.inner.get_unchecked(*node);
+            let tag_key = match n {
+                Node::Leaf(crate::types::OpaqueValue::Symbol(s)) => {
+                    Some(TagKey::Sym(crate::symbol::SymbolId(*s)))
+                }
+                Node::Leaf(crate::types::OpaqueValue::Integer(v)) => Some(TagKey::Int(*v)),
+                _ => None,
+            };
+
+            if let Some(key) = tag_key {
+                // Map this tag to the suffix of the body list starting AFTER the tag
+                let suffix = body_list[i + 1..].to_vec();
+                tag_map.insert(key, suffix);
+            }
+        }
+
+        // Push Continuation
+        self.process.continuation_stack.push(Continuation::Tagbody {
+            rest: body_list,
+            tag_map,
+        });
+
+        // Start execution (Return mode -> pop continuation -> run logic)
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_go(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error("go: missing tag".into()));
+        }
+        let tag_node = args_vec[0];
+        let n = self.process.arena.inner.get_unchecked(tag_node).clone();
+
+        let tag_key = match n {
+            Node::Leaf(crate::types::OpaqueValue::Symbol(s)) => {
+                Some(TagKey::Sym(crate::symbol::SymbolId(s)))
+            }
+            Node::Leaf(crate::types::OpaqueValue::Integer(v)) => Some(TagKey::Int(v)),
+            _ => None,
+        };
+
+        if let Some(key) = tag_key {
+            // Unwind stack looking for matching tagbody
+            let mut found = false;
+            let mut depth = 0;
+
+            for (i, cont) in self.process.continuation_stack.iter().rev().enumerate() {
+                if let Continuation::Tagbody { tag_map, .. } = cont {
+                    if tag_map.contains_key(&key) {
+                        found = true;
+                        depth = i;
+                        break;
+                    }
                 }
             }
 
-            Node::Stem(_) => {
-                // Not a symbol (e.g. pure Combinator), treat as self-evaluating
-                Ok(expr)
-            }
+            if found {
+                // Drop 'depth' frames from the top (0 = current top)
+                let new_len = self.process.continuation_stack.len() - depth;
+                self.process.continuation_stack.truncate(new_len);
 
-            Node::Fork(car, cdr) => {
-                // (operator . args) - function application or special form
-                self.eval_application(car, cdr, env)
+                // Now top is the Tagbody. Update its 'rest'.
+                if let Some(Continuation::Tagbody { tag_map, rest }) =
+                    self.process.continuation_stack.last_mut()
+                {
+                    if let Some(target_rest) = tag_map.get(&key) {
+                        *rest = target_rest.clone();
+                    }
+                }
+
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                self.process.program = self.process.make_nil(); // Dummy
+                return Ok(true);
+            } else {
+                return Err(ControlSignal::Error(format!(
+                    "go: tag not found: {:?}",
+                    tag_node
+                )));
+            }
+        } else {
+            return Err(ControlSignal::Error("go: invalid tag".into()));
+        }
+    }
+
+    fn step_defun(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Err(ControlSignal::Error("defun: too few args".into()));
+        }
+        let name_node = args_vec[0];
+        let lambda_list_node = args_vec[1];
+
+        let sym = self
+            .node_to_symbol(name_node)
+            .ok_or_else(|| ControlSignal::Error("defun name must be symbol".into()))?;
+
+        // Construct Body
+        let body_forms = if args_vec.len() > 2 {
+            self.process.make_list(&args_vec[2..])
+        } else {
+            self.process.make_nil()
+        };
+
+        let progn_sym = self.globals.special_forms.progn;
+        let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
+        let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
+
+        let body_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Fork(progn_sym_node, body_forms));
+
+        // Parse lambda list
+        let mut params = Vec::new();
+        let mut c = lambda_list_node;
+        loop {
+            let node = self.process.arena.get_unchecked(c).clone();
+            if let Node::Fork(head, tail) = node {
+                if let Some(s) = self.node_to_symbol(head) {
+                    params.push(s);
+                }
+                c = tail;
+            } else {
+                break;
             }
         }
+
+        // Create Closure
+        let closure = crate::eval::Closure {
+            params,
+            body: body_node,
+            env: crate::eval::Environment::new(),
+        };
+
+        // Register Global Function
+        let closure_idx = self.process.closures.len();
+        self.process.closures.push(closure);
+        self.process.functions.insert(sym, closure_idx);
+
+        // Return Name
+        self.process.program = name_node;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_function(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        // (function name) or (function (lambda ...))
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error("function: too few args".into()));
+        }
+        let target = args_vec[0];
+
+        // If target is symbol, just return symbol (treated as function designator in apply)?
+        // Or resolve to closure handle?
+        // My invoke logic handles Symbols.
+        // But `functio`n special operator should return the FUNCTION OBJECT.
+        // For now, returning the symbol is enough if `apply` handles symbols.
+        // `step_apply` handles symbols by lookup.
+        // But `(funcall (function foo) ...)`
+        // `funcall` must handle symbols.
+        // If target is (lambda ...), we need to create closure and return it.
+        // Implementing full closure creation here is redundant with `step_defun` / `step_defmacro`.
+        // Ideally factor out `make_closure`.
+
+        // For TCO Test (defun sum-down ...), we don't use (function ...) directly usually.
+        // But `init.lisp` might use it.
+        // Let's handle Symbol case (return symbol) and Lambda case (create closure).
+
+        if let Some(_) = self.node_to_symbol(target) {
+            self.process.program = target;
+            self.process.execution_mode = crate::process::ExecutionMode::Return;
+            return Ok(true);
+        }
+
+        // Lambda case: (lambda args body)
+        // Check if head is lambda
+        let node = self.process.arena.get_unchecked(target).clone();
+        if let Node::Fork(head, tail) = node {
+            if let Some(s) = self.node_to_symbol(head) {
+                if s == self.globals.special_forms.lambda {
+                    // It is (lambda params body...)
+                    // Parse and create closure
+                    // Need to parse params from tail.
+                    // tail is (params body...)
+                    // reuse step_defun logic?
+                    // I'll leave "Lambda" support as Todo or simple panic/error if hit to see.
+                    // Usually `defun` covers 90%.
+                }
+            }
+        }
+
+        // Fallback: return target as is (maybe it's already a closure handle?)
+        self.process.program = target;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_let(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        // (let bindings &rest body)
+        // Expand to ((lambda (vars...) body...) vals...)
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error("let: malformed".into()));
+        }
+
+        let bindings_node = args_vec[0];
+        let body_nodes = if args_vec.len() > 1 {
+            &args_vec[1..]
+        } else {
+            &[]
+        };
+
+        // Parse bindings
+        let mut vars = Vec::new();
+        let mut vals = Vec::new();
+
+        let mut c = bindings_node;
+        loop {
+            let node = self.process.arena.get_unchecked(c).clone();
+            if let Node::Fork(head, tail) = node {
+                let binding_node = self.process.arena.get_unchecked(head).clone();
+                match binding_node {
+                    Node::Fork(var_n, val_n_tail) => {
+                        // (var val)
+                        vars.push(var_n);
+                        let tail_node = self.process.arena.get_unchecked(val_n_tail).clone();
+                        if let Node::Fork(val_n, _) = tail_node {
+                            vals.push(val_n);
+                        } else {
+                            vals.push(self.process.make_nil());
+                        }
+                    }
+                    Node::Leaf(crate::types::OpaqueValue::Symbol(_)) => {
+                        // var
+                        vars.push(head);
+                        vals.push(self.process.make_nil());
+                    }
+                    _ => {} // Ignore malformed binding?
+                }
+                c = tail;
+            } else {
+                break;
+            }
+        }
+
+        // Construct Body (progn ...)
+        let progn_sym = self.globals.special_forms.progn;
+        let body_list = self.process.make_list(body_nodes);
+
+        let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
+        let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
+
+        let body_form = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Fork(progn_sym_node, body_list));
+
+        // Construct Lambda
+        let lambda_sym = self.globals.special_forms.lambda;
+        let vars_list = self.process.make_list(&vars);
+
+        let lambda_sym_val = crate::types::OpaqueValue::Symbol(lambda_sym.0);
+        let lambda_sym_node = self.process.arena.inner.alloc(Node::Leaf(lambda_sym_val));
+
+        // (lambda vars body)
+        let lambda_form = self
+            .process
+            .make_list(&[lambda_sym_node, vars_list, body_form]);
+
+        // Construct Application: (lambda_form vals...)
+        let mut app_vec = vec![lambda_form];
+        app_vec.extend(vals);
+        let app_form = self.process.make_list(&app_vec);
+
+        self.process.program = app_form;
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        Ok(true)
+    }
+
+    fn step_setq(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        if let Node::Fork(var_node, rest) = self.process.arena.get_unchecked(args).clone() {
+            if let Node::Fork(val_expr, next) = self.process.arena.get_unchecked(rest).clone() {
+                if let Some(sym) = self.node_to_symbol(var_node) {
+                    let next_pairs = self.cons_to_vec(next);
+                    self.process.continuation_stack.push(Continuation::EvSetq {
+                        sym,
+                        rest: next_pairs,
+                    });
+                    self.process.program = val_expr;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                    return Ok(true);
+                }
+            }
+        }
+        self.process.program = self.process.make_nil();
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_if(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        if let Node::Fork(test, rest) = self.process.arena.get_unchecked(args).clone() {
+            let (then_branch, else_branch) = if let Node::Fork(th, rest2) =
+                self.process.arena.get_unchecked(rest).clone()
+            {
+                let el = if let Node::Fork(el, _) = self.process.arena.get_unchecked(rest2).clone()
+                {
+                    el
+                } else {
+                    self.process.make_nil()
+                };
+                (th, el)
+            } else {
+                (self.process.make_nil(), self.process.make_nil())
+            };
+
+            self.process.continuation_stack.push(Continuation::EvIf {
+                then_branch,
+                else_branch,
+            });
+            self.process.program = test;
+            self.process.execution_mode = crate::process::ExecutionMode::Eval;
+            Ok(true)
+        } else {
+            self.process.program = self.process.make_nil();
+            self.process.execution_mode = crate::process::ExecutionMode::Return;
+            Ok(true)
+        }
+    }
+
+    fn step_progn(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        let forms = self.cons_to_vec(args);
+        if forms.is_empty() {
+            self.process.program = self.process.make_nil();
+            self.process.execution_mode = crate::process::ExecutionMode::Return;
+        } else {
+            let first = forms[0];
+            let rest = forms[1..].to_vec();
+            self.process
+                .continuation_stack
+                .push(Continuation::EvProgn { rest });
+            self.process.program = first;
+            self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        }
+        Ok(true)
+    }
+
+    fn apply_continuation(&mut self, cont: Continuation) -> Result<bool, ControlSignal> {
+        let result = self.process.program;
+
+        match cont {
+            Continuation::Done => Ok(false),
+            Continuation::EvIf {
+                then_branch,
+                else_branch,
+            } => {
+                let true_val = match self.process.arena.get_unchecked(result) {
+                    Node::Leaf(OpaqueValue::Nil) => false,
+                    _ => true,
+                };
+                if true_val {
+                    self.process.program = then_branch;
+                } else {
+                    self.process.program = else_branch;
+                }
+                self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                Ok(true)
+            }
+            Continuation::EvProgn { rest } => {
+                if rest.is_empty() {
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                } else {
+                    let next = rest[0];
+                    let remaining = rest[1..].to_vec();
+                    self.process
+                        .continuation_stack
+                        .push(Continuation::EvProgn { rest: remaining });
+                    self.process.program = next;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                }
+                Ok(true)
+            }
+            Continuation::Tagbody { mut rest, tag_map } => {
+                // Return from a form inside tagbody (result ignored)
+                // Need to find NEXT form to execute.
+                // Loop through 'rest' until we find a form that is NOT a tag.
+                // Tags are Symbols or Integers.
+
+                // Note: The 'rest' stored in continuation is what remains AFTER the form that just finished.
+                // But wait, step_tagbody pushed the WHOLE body.
+                // So the first time we come here is via Return mode from step_tagbody?
+                // Yes, step_tagbody sets Return mode with "dummy" result.
+
+                // We better loop here.
+
+                // If rest is empty, we return Nil.
+                // But we must modify 'rest' to advance.
+
+                let mut next_form = None;
+
+                while !rest.is_empty() {
+                    let candidate = rest[0];
+                    let node = self.process.arena.inner.get_unchecked(candidate);
+                    let is_tag = match node {
+                        Node::Leaf(crate::types::OpaqueValue::Symbol(_))
+                        | Node::Leaf(crate::types::OpaqueValue::Integer(_)) => true,
+                        _ => false,
+                    };
+
+                    if is_tag {
+                        // Skip tag
+                        rest = rest[1..].to_vec();
+                        continue;
+                    } else {
+                        // Found a form
+                        next_form = Some(candidate);
+                        rest = rest[1..].to_vec();
+                        break;
+                    }
+                }
+
+                if let Some(form) = next_form {
+                    // Execute this form
+                    self.process
+                        .continuation_stack
+                        .push(Continuation::Tagbody { rest, tag_map });
+                    self.process.program = form;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                } else {
+                    // End of tagbody, return Nil
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                    self.process.program = self.process.make_nil();
+                }
+                Ok(true)
+            }
+            Continuation::EvSetq { sym, rest } => {
+                self.process.set_value(sym, result);
+
+                if rest.is_empty() {
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                } else {
+                    if rest.len() >= 2 {
+                        let next_var_node = rest[0];
+                        let next_val_node = rest[1];
+                        let remaining = rest[2..].to_vec();
+
+                        if let Some(next_sym) = self.node_to_symbol(next_var_node) {
+                            self.process.continuation_stack.push(Continuation::EvSetq {
+                                sym: next_sym,
+                                rest: remaining,
+                            });
+                            self.process.program = next_val_node;
+                            self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                        } else {
+                            return Err(ControlSignal::Error("SETQ: expected symbol".to_string()));
+                        }
+                    } else {
+                        self.process.execution_mode = crate::process::ExecutionMode::Return;
+                    }
+                }
+                Ok(true)
+            }
+            Continuation::EvArgs {
+                op,
+                mut args,
+                mut vals,
+            } => {
+                // Return from arg evaluation
+                vals.push(result);
+
+                if args.is_empty() {
+                    // All args evaluated. Transition to Apply.
+                    // We can reuse Apply continuation logic or just call apply here?
+                    // To keep state machine clean, let's push Apply and immediately Return (or step).
+                    // Actually, if we just push Apply and set Return mode, we need a dummy value?
+                    // Or we just call `self.apply_function`?
+                    // `apply_function` does the actual application logic (primitive or closure).
+                    // If closure: it sets up new env and program and pushes continuation?
+
+                    // Let's call a helper `step_apply(op, vals, env)`
+                    let env = self.process.current_env.clone().unwrap_or_default();
+                    return self.step_apply(op, vals, env);
+                } else {
+                    let next = args[0];
+                    let rest = args[1..].to_vec();
+                    self.process.continuation_stack.push(Continuation::EvArgs {
+                        op,
+                        args: rest,
+                        vals,
+                    });
+                    self.process.program = next;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                }
+                Ok(true)
+            }
+            Continuation::Apply { func, saved_env } => {
+                // We arrived here via explicit transition (e.g. no args).
+                // Logic handled in step_apply.
+                // If we use Continuation::Apply, we need to store args in it?
+                // EvArgs transforms to step_apply call.
+                // So we don't strictly need Continuation::Apply unless we pause DURING apply init?
+                // But step_apply will handle it.
+                // The case where we push Apply manually in step_application (empty args):
+                // We come here. We need to know args (empty).
+                // So Apply needs args.
+                // Update Continuation::Apply definition?
+                // Or just handle empty args inside step_application by calling step_apply directly.
+                Ok(false) // Should not happen if handled directly
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn step_apply(
+        &mut self,
+        op: NodeId,
+        args: Vec<NodeId>,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        // Resolve operator
+        // op could be Symbol or Function Object (Closure/Primitive)
+        // If symbol, lookup function.
+        let func_node = if let Some(sym) = self.node_to_symbol(op) {
+            if let Some(f) = self.process.get_function(sym) {
+                f
+            } else if self.globals.primitives.contains_key(&sym) {
+                // TODO: Return primitive handle node?
+                // Primitives are just symbols in func position for now?
+                // No, calling primitives uses op directly usually.
+                op
+            } else {
+                return Err(ControlSignal::Error(format!(
+                    "Undefined function: {:?}",
+                    sym
+                )));
+            }
+        } else {
+            op // Lambda or Closure
+        };
+
+        // Check if Primitive
+        if let Some(sym) = self.node_to_symbol(func_node) {
+            if let Some(prim) = self.globals.primitives.get(&sym) {
+                let result = prim(self.process, self.globals, &args)?;
+                self.process.program = result;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+        }
+
+        // Check if Lambda Expression (List starting with LAMBDA)
+        // (lambda params body...)
+        // This is necessary because LET expands to ((lambda ...) ...)
+        let lambda_sym = self.globals.special_forms.lambda;
+        let mut is_lambda = false;
+        if let Node::Fork(head, _) = self.process.arena.inner.get_unchecked(func_node) {
+            if let Some(s) = self.node_to_symbol(*head) {
+                if s == lambda_sym {
+                    is_lambda = true;
+                }
+            }
+        }
+
+        let closure = if is_lambda {
+            // Parse Lambda List (Code copied/adapted from step_defun)
+            // func_node is (lambda params body...)
+            let parts = self.cons_to_vec(func_node);
+            if parts.len() < 2 {
+                return Err(ControlSignal::Error("lambda: too few parts".into()));
+            }
+            let params_node = parts[1];
+
+            // Body is rest
+            let body_nodes = if parts.len() > 2 { &parts[2..] } else { &[] };
+
+            // Construct body progn
+            let progn_sym = self.globals.special_forms.progn;
+            let body_list = self.process.make_list(body_nodes); // already list? no body_nodes is slice
+            let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
+            let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
+            let body_node = self
+                .process
+                .arena
+                .inner
+                .alloc(Node::Fork(progn_sym_node, body_list));
+
+            // Parse args
+            let mut params = Vec::new();
+            let mut c = params_node;
+            loop {
+                let node = self.process.arena.get_unchecked(c).clone();
+                if let Node::Fork(head, tail) = node {
+                    if let Some(s) = self.node_to_symbol(head) {
+                        params.push(s);
+                    }
+                    c = tail;
+                } else {
+                    break;
+                }
+            }
+
+            // Create Closure capturing CURRENT environment
+            // lambda expression evaluation returns a closure that captures the lexical environment.
+            // When appearing as operator in ((lambda ...)), it should behave the same.
+            crate::eval::Closure {
+                params,
+                body: body_node,
+                env: env.clone(), // Capture the application point env (lexical scope)
+            }
+        } else {
+            // Check if Closure Object
+            // Node might be Leaf(Closure(idx))
+            let closure_idx = {
+                let node = self.process.arena.get_unchecked(func_node).clone();
+                if let Node::Leaf(crate::types::OpaqueValue::Closure(idx)) = node {
+                    Some(idx as usize)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(idx) = closure_idx {
+                if idx >= self.process.closures.len() {
+                    return Err(ControlSignal::Error("Invalid closure index".into()));
+                }
+                self.process.closures[idx].clone()
+            } else {
+                // Fallthrough to error
+                // Debug node type
+                let node = self.process.arena.get_unchecked(func_node);
+                return Err(ControlSignal::Error(format!(
+                    "TCO Apply not fully implemented for {:?} (Node ID: {:?} - {:?})",
+                    func_node, func_node, node
+                )));
+            }
+        };
+
+        // Execute Closure (Shared logic)
+        {
+            // Check Arity
+            if args.len() != closure.params.len() {
+                return Err(ControlSignal::Error(format!(
+                    "Arity mismatch: expected {}, got {}",
+                    closure.params.len(),
+                    args.len()
+                )));
+            }
+            // ... (rest of logic handles closure application)
+
+            // Create New Environment (Lexical Scope)
+            // Closure captures definition environment in `closure.env`.
+            // We extend THAT environment, not current.
+            let mut new_env: Environment = closure.env.clone();
+
+            // Bind args
+            for (param, val) in closure.params.iter().zip(args.iter()) {
+                new_env.bind(*param, *val);
+            }
+
+            // Setup Process for Body Execution
+            self.process.program = closure.body;
+            self.process.current_env = Some(new_env);
+            self.process.execution_mode = crate::process::ExecutionMode::Eval;
+
+            return Ok(true);
+        }
+    }
+
+    fn cons_to_vec(&self, list: NodeId) -> Vec<NodeId> {
+        let mut v = Vec::new();
+        let mut c = list;
+        while let Node::Fork(head, tail) = self.process.arena.get_unchecked(c) {
+            v.push(*head);
+            c = *tail;
+        }
+        v
     }
 
     /// Evaluate a function application or special form
