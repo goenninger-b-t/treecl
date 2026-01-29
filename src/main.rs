@@ -12,6 +12,8 @@ use treecl::printer::print_to_string;
 use treecl::process::Status;
 use treecl::scheduler::Scheduler;
 
+use treecl::symbol::PackageId;
+
 const INIT_LISP: &str = include_str!("init.lisp");
 
 fn main() -> io::Result<()> {
@@ -22,6 +24,16 @@ fn main() -> io::Result<()> {
     let mut globals = GlobalContext::new();
     // Register all built-in primitives
     register_primitives(&mut globals);
+
+    // Intern REPL history variables
+    let mut symbols_guard = globals.symbols.write().unwrap();
+    let star_1 = symbols_guard.intern_in("*", PackageId(1));
+    symbols_guard.export_symbol(star_1);
+    let star_2 = symbols_guard.intern_in("**", PackageId(1));
+    symbols_guard.export_symbol(star_2);
+    let star_3 = symbols_guard.intern_in("***", PackageId(1));
+    symbols_guard.export_symbol(star_3);
+    drop(symbols_guard);
 
     let mut scheduler = Scheduler::new();
 
@@ -142,6 +154,12 @@ fn main() -> io::Result<()> {
 
     let mut code_buffer = String::new();
 
+    // REPL History values (NodeIds)
+    // We init them to None and lazy-load NIL from process
+    let mut hist_1: Option<treecl::types::NodeId> = None;
+    let mut hist_2: Option<treecl::types::NodeId> = None;
+    let mut hist_3: Option<treecl::types::NodeId> = None;
+
     loop {
         // Run background tasks (Scheduler tick)
         // We run a few ticks to let background processes progress
@@ -184,6 +202,16 @@ fn main() -> io::Result<()> {
                         // Ensure process is awake?
                         process.status = Status::Runnable;
 
+                        // Init history bindings if first run
+                        if hist_1.is_none() {
+                            let nil = process.make_nil();
+                            hist_1 = Some(nil);
+                            hist_2 = Some(nil);
+                            process.set_value(star_1, nil);
+                            process.set_value(star_2, nil);
+                            process.set_value(star_3, nil);
+                        }
+
                         // Read
                         let read_result = treecl::reader::Reader::new(
                             &trimmed,
@@ -209,6 +237,15 @@ fn main() -> io::Result<()> {
                                             val,
                                         );
                                         println!("{}", output);
+
+                                        // Update History (*, **, ***)
+                                        hist_3 = hist_2;
+                                        hist_2 = hist_1;
+                                        hist_1 = Some(val);
+
+                                        process.set_value(star_1, hist_1.unwrap());
+                                        process.set_value(star_2, hist_2.unwrap());
+                                        process.set_value(star_3, hist_3.unwrap());
                                     }
                                     Err(e) => {
                                         println!("Error: {:?}", e);

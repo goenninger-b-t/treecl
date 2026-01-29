@@ -103,3 +103,4 @@ history.t*xt
 
 .vscode/
 
+tests/ansi-test
