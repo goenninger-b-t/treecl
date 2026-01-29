@@ -128,6 +128,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("TREE-STRING", cl, prim_tree_string);
     globals.register_primitive("FUNCALL", cl, prim_funcall);
     globals.register_primitive("APPLY", cl, prim_apply);
+    globals.register_primitive("APROPOS", cl, prim_apropos);
 
     // Streams
     globals.register_primitive(
@@ -3124,4 +3125,74 @@ pub fn prim_self(
         .arena
         .inner
         .alloc(Node::Leaf(OpaqueValue::Pid(proc.pid))))
+}
+
+fn prim_apropos(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("APROPOS: missing argument");
+    }
+
+    // 1. Parse search string
+    let search_str =
+        if let Node::Leaf(OpaqueValue::String(s)) = proc.arena.inner.get_unchecked(args[0]) {
+            s.clone()
+        } else if let Some(sym_id) = node_to_symbol(proc, args[0]) {
+            ctx.symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym_id)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            return err_helper("APROPOS: argument must be string or symbol");
+        };
+
+    let search_upper = search_str.to_uppercase();
+
+    // 2. Optional package filter? (Taking Simplified approach first: scan all)
+    // Common Lisp: (apropos string &optional package)
+
+    // 3. Scan symbols
+    let symbols_guard = ctx.symbols.read().unwrap();
+    let count = symbols_guard.symbol_count();
+
+    // We can't hold lock while printing if printing involves evaluation or re-locking?
+    // Printing to stream using `proc.streams` might be fine if it doesn't touch symbols?
+    // `princ_to_string` DOES touch symbols.
+
+    // So we collect matches first.
+    let mut matches = Vec::new();
+
+    // SymbolId is just an index (u32)
+    for i in 0..count {
+        let id = SymbolId(i as u32);
+        if let Some(name) = symbols_guard.symbol_name(id) {
+            if name.contains(&search_upper) {
+                matches.push(id);
+            }
+        }
+    }
+
+    // Drop lock
+    drop(symbols_guard);
+
+    // 4. Print matches
+    for sym_id in matches {
+        let name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(sym_id)
+            .unwrap_or("???")
+            .to_string();
+        let _ = proc
+            .streams
+            .write_string(crate::streams::StreamId(1), &format!("{}\n", name)); // 1 = Standard Output
+    }
+
+    Ok(proc.make_nil())
 }

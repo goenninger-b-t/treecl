@@ -2,7 +2,9 @@
 //
 // Uses Reader, Evaluator, and Printer for a complete read-eval-print loop.
 
-use std::io::{self, Write};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use std::io;
 use treecl::context::GlobalContext;
 use treecl::eval::{Environment, Interpreter};
 use treecl::primitives::register_primitives;
@@ -133,8 +135,10 @@ fn main() -> io::Result<()> {
 
     println!("REPL Process: {:?}", repl_pid);
 
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
+    let mut rl = DefaultEditor::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    if rl.load_history("history.txt").is_err() {
+        println!("No previous history.");
+    }
 
     let mut code_buffer = String::new();
 
@@ -145,89 +149,100 @@ fn main() -> io::Result<()> {
             scheduler.run_tick(&mut globals);
         }
 
-        if code_buffer.is_empty() {
-            print!("CL-USER> ");
+        let prompt = if code_buffer.is_empty() {
+            "CL-USER> "
         } else {
-            print!(".....> ");
-        }
-        stdout.flush()?;
+            ".....> "
+        };
 
-        // REPL Loop continues...
-        let mut input = String::new();
-        if stdin.read_line(&mut input)? == 0 {
-            break; // EOF
-        }
+        let readline = rl.readline(prompt);
+        match readline {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
 
-        let trimmed_line = input.trim();
-        if code_buffer.is_empty() && (trimmed_line == "(quit)" || trimmed_line == "(exit)") {
-            println!("Goodbye!");
-            break;
-        }
+                let trimmed_line = line.trim();
+                if code_buffer.is_empty() && (trimmed_line == "(quit)" || trimmed_line == "(exit)")
+                {
+                    println!("Goodbye!");
+                    break;
+                }
 
-        if !input.trim().is_empty() {
-            code_buffer.push_str(&input);
-        }
+                if !line.trim().is_empty() {
+                    code_buffer.push_str(&line);
+                    code_buffer.push('\n');
+                }
 
-        if is_balanced(&code_buffer) {
-            let trimmed = code_buffer.trim().to_string();
-            if trimmed.is_empty() {
-                code_buffer.clear();
-                continue;
-            }
+                if is_balanced(&code_buffer) {
+                    let trimmed = code_buffer.trim().to_string();
+                    if trimmed.is_empty() {
+                        code_buffer.clear();
+                        continue;
+                    }
 
-            // Borrow REPL Process from Scheduler to Parse/Eval
-            if let Some(mut process) = scheduler.registry.remove(&repl_pid) {
-                // Ensure process is awake?
-                process.status = Status::Runnable;
+                    // Borrow REPL Process from Scheduler to Parse/Eval
+                    if let Some(mut process) = scheduler.registry.remove(&repl_pid) {
+                        // Ensure process is awake?
+                        process.status = Status::Runnable;
 
-                // Read
-                let read_result = treecl::reader::Reader::new(
-                    &trimmed,
-                    &mut process.arena.inner,
-                    globals.symbols.get_mut().unwrap(),
-                    &process.readtable,
-                    Some(&mut process.arrays),
-                )
-                .read();
+                        // Read
+                        let read_result = treecl::reader::Reader::new(
+                            &trimmed,
+                            &mut process.arena.inner,
+                            globals.symbols.get_mut().unwrap(),
+                            &process.readtable,
+                            Some(&mut process.arrays),
+                        )
+                        .read();
 
-                match read_result {
-                    Ok(expr) => {
-                        // Evaluate
-                        let mut interpreter = Interpreter::new(&mut process, &globals);
-                        let env = Environment::new();
+                        match read_result {
+                            Ok(expr) => {
+                                // Evaluate
+                                let mut interpreter = Interpreter::new(&mut process, &globals);
+                                let env = Environment::new();
 
-                        match interpreter.eval(expr, &env) {
-                            Ok(val) => {
-                                // Print result
-                                let output = print_to_string(
-                                    &process.arena.inner,
-                                    &*globals.symbols.read().unwrap(),
-                                    val,
-                                );
-                                println!("{}", output);
+                                match interpreter.eval(expr, &env) {
+                                    Ok(val) => {
+                                        // Print result
+                                        let output = print_to_string(
+                                            &process.arena.inner,
+                                            &*globals.symbols.read().unwrap(),
+                                            val,
+                                        );
+                                        println!("{}", output);
+                                    }
+                                    Err(e) => {
+                                        println!("Error: {:?}", e);
+                                    }
+                                }
                             }
                             Err(e) => {
-                                println!("Error: {:?}", e);
+                                println!("Read error: {}", e);
                             }
                         }
+                        scheduler.registry.insert(repl_pid, process);
+                    } else {
+                        println!("REPL Process died!");
+                        break;
                     }
-                    Err(e) => {
-                        println!("Read error: {}", e);
-                    }
+                    code_buffer.clear();
                 }
-                scheduler.registry.insert(repl_pid, process);
-
-                // Process is already returned to registry (or lost) in all paths above.
-                // We rely on 'scheduler.registry.remove(&repl_pid)' at the start of the loop
-                // to fail if something went wrong.
-            } else {
-                println!("REPL Process died!");
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("CTRL-C");
                 break;
             }
-            code_buffer.clear();
+            Err(ReadlineError::Eof) => {
+                println!("CTRL-D");
+                break;
+            }
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            }
         }
     }
 
+    let _ = rl.save_history("history.txt");
     Ok(())
 }
 
