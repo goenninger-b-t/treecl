@@ -211,6 +211,11 @@ impl SymbolTable {
         self.symbols.len()
     }
 
+    /// Get the total number of packages
+    pub fn package_count(&self) -> usize {
+        self.packages.len()
+    }
+
     /// Get a mutable symbol by ID
     pub fn get_symbol_mut(&mut self, id: SymbolId) -> Option<&mut Symbol> {
         self.symbols.get_mut(id.0 as usize)

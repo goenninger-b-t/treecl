@@ -218,6 +218,9 @@ impl<'a> Printer<'a> {
             OpaqueValue::HashHandle(h) => {
                 self.output.push_str(&format!("#<hash-table:{}>", h));
             }
+            OpaqueValue::Package(id) => {
+                self.output.push_str(&format!("#<package:{}>", id));
+            }
         }
     }
 

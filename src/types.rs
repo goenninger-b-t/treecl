@@ -31,6 +31,7 @@ pub enum OpaqueValue {
     StreamHandle(u32),          // Handle to Stream
     Pid(crate::process::Pid),   // Process ID
     HashHandle(u32),            // Handle to Hash Table
+    Package(u32),               // Package ID
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)

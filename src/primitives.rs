@@ -174,11 +174,512 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("MERGE-PATHNAMES", cl, prim_merge_pathnames);
     globals.register_primitive("PATHNAME", cl, prim_pathname);
     globals.register_primitive("NAMESTRING", cl, prim_namestring);
+
+    // Symbols
+    globals.register_primitive("SYMBOL-NAME", cl, prim_symbol_name);
+    globals.register_primitive("SYMBOL-PACKAGE", cl, prim_symbol_package);
+    globals.register_primitive("SYMBOL-PLIST", cl, prim_symbol_plist);
+    globals.register_primitive("GET", cl, prim_get);
+    globals.register_primitive("PUT", cl, prim_put); // Internal use
+    globals.register_primitive("REMPROP", cl, prim_remprop);
+
+    globals.register_primitive("BOUNDP", cl, prim_boundp);
+    globals.register_primitive("MAKUNBOUND", cl, prim_makunbound);
+    globals.register_primitive("SET", cl, prim_set);
+
+    globals.register_primitive("SYMBOL-FUNCTION", cl, prim_symbol_function);
+    globals.register_primitive("FBOUNDP", cl, prim_fboundp);
+    globals.register_primitive("FMAKUNBOUND", cl, prim_fmakunbound);
+    globals.register_primitive("FIND-PACKAGE", cl, prim_find_package);
+    globals.register_primitive("KEYWORDP", cl, prim_keywordp);
+    globals.register_primitive("COPY-SYMBOL", cl, prim_copy_symbol);
+    globals.register_primitive("PACKAGE-NAME", cl, prim_package_name);
+    globals.register_primitive("LIST-ALL-PACKAGES", cl, prim_list_all_packages);
 }
 
 // ============================================================================
 // File System Primitives
 // ============================================================================
+
+fn prim_symbol_name(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym_id)
+                .unwrap_or("NIL")
+                .to_string();
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::String(name))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_symbol_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            let pkg_id = ctx.symbols.read().unwrap().symbol_package(sym_id);
+
+            if let Some(id) = pkg_id {
+                return Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Package(id.0))));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_symbol_plist(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            // Check process dictionary for plist
+            if let Some(binding) = proc.dictionary.get(&sym_id) {
+                if let Some(plist) = binding.plist {
+                    return Ok(plist);
+                }
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_get(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("GET: too few arguments");
+    }
+
+    let sym_node = args[0];
+    let indicator = args[1];
+    let default = if args.len() > 2 {
+        args[2]
+    } else {
+        proc.make_nil()
+    };
+
+    if let Some(sym_id) = node_to_symbol(proc, sym_node) {
+        if let Some(binding) = proc.dictionary.get(&sym_id) {
+            if let Some(plist_id) = binding.plist {
+                // Traverse plist
+                let mut current = plist_id;
+                loop {
+                    match proc.arena.inner.get_unchecked(current) {
+                        Node::Fork(ind_node, rest1) => {
+                            // Check indicator
+                            if crate::arena::deep_equal(&proc.arena.inner, indicator, *ind_node) {
+                                // Found! Get value
+                                match proc.arena.inner.get_unchecked(*rest1) {
+                                    Node::Fork(val_node, _) => return Ok(*val_node),
+                                    _ => return Ok(proc.make_nil()), // Malformed
+                                }
+                            }
+                            // Advance (skip value)
+                            match proc.arena.inner.get_unchecked(*rest1) {
+                                Node::Fork(_, rest2) => current = *rest2,
+                                _ => break,
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(default)
+}
+
+fn prim_put(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 3 {
+        return err_helper("PUT: too few arguments");
+    }
+
+    let sym_node = args[0];
+    let indicator = args[1];
+    let value = args[2];
+
+    if let Some(sym_id) = node_to_symbol(proc, sym_node) {
+        // Read-Modify-Write
+        let mut new_plist_nodes = Vec::new();
+        let mut found = false;
+
+        let binding = proc.dictionary.entry(sym_id).or_default();
+        if let Some(plist_id) = binding.plist {
+            let mut current = plist_id;
+            loop {
+                match proc.arena.inner.get_unchecked(current) {
+                    Node::Fork(ind_node, rest1) => {
+                        if !found
+                            && crate::arena::deep_equal(&proc.arena.inner, indicator, *ind_node)
+                        {
+                            found = true;
+                            // Replace value
+                            new_plist_nodes.push(*ind_node);
+                            new_plist_nodes.push(value);
+
+                            // Skip old value
+                            match proc.arena.inner.get_unchecked(*rest1) {
+                                Node::Fork(_, rest2) => current = *rest2,
+                                _ => break,
+                            }
+                        } else {
+                            // Copy pair
+                            new_plist_nodes.push(*ind_node);
+                            match proc.arena.inner.get_unchecked(*rest1) {
+                                Node::Fork(val_node, rest2) => {
+                                    new_plist_nodes.push(*val_node);
+                                    current = *rest2;
+                                }
+                                _ => break, // Malformed
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        if !found {
+            // Append new pair
+            new_plist_nodes.push(indicator);
+            new_plist_nodes.push(value);
+        }
+
+        let new_plist = proc.make_list(&new_plist_nodes);
+        proc.dictionary.entry(sym_id).or_default().plist = Some(new_plist);
+        return Ok(value);
+    }
+
+    Ok(proc.make_nil())
+}
+
+fn prim_remprop(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("REMPROP: too few arguments");
+    }
+
+    let sym_node = args[0];
+    let indicator = args[1];
+
+    if let Some(sym_id) = node_to_symbol(proc, sym_node) {
+        // We need to mutate the plist.
+        // Read-Modify-Write
+        let mut new_plist_nodes = Vec::new();
+        let mut found = false;
+
+        if let Some(binding) = proc.dictionary.get(&sym_id) {
+            if let Some(plist_id) = binding.plist {
+                let mut current = plist_id;
+                loop {
+                    match proc.arena.inner.get_unchecked(current) {
+                        Node::Fork(ind_node, rest1) => {
+                            if !found
+                                && crate::arena::deep_equal(&proc.arena.inner, indicator, *ind_node)
+                            {
+                                found = true;
+                                // Skip this pair
+                                match proc.arena.inner.get_unchecked(*rest1) {
+                                    Node::Fork(_, rest2) => current = *rest2,
+                                    _ => break,
+                                }
+                            } else {
+                                // Copy pair
+                                new_plist_nodes.push(*ind_node);
+                                match proc.arena.inner.get_unchecked(*rest1) {
+                                    Node::Fork(val_node, rest2) => {
+                                        new_plist_nodes.push(*val_node);
+                                        current = *rest2;
+                                    }
+                                    _ => break, // Malformed
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+
+        if found {
+            let new_plist = proc.make_list(&new_plist_nodes);
+            proc.dictionary.entry(sym_id).or_default().plist = Some(new_plist);
+            return Ok(proc.make_t(ctx));
+        }
+    }
+
+    Ok(proc.make_nil())
+}
+
+fn prim_boundp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            if let Some(binding) = proc.dictionary.get(&sym_id) {
+                if binding.value.is_some() {
+                    return Ok(proc.make_t(ctx));
+                }
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_makunbound(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            proc.unbind_value(sym_id);
+            return Ok(arg);
+        }
+    }
+    // Should error if not symbol?
+    Ok(proc.make_nil())
+}
+
+fn prim_set(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("SET: too few arguments");
+    }
+    let sym_node = args[0];
+    let val_node = args[1];
+
+    if let Some(sym_id) = node_to_symbol(proc, sym_node) {
+        proc.set_value(sym_id, val_node);
+        Ok(val_node)
+    } else {
+        err_helper("SET: first argument must be a symbol")
+    }
+}
+
+fn prim_symbol_function(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            if let Some(func) = proc.get_function(sym_id) {
+                return Ok(func);
+            } else if ctx.primitives.contains_key(&sym_id) {
+                // For now, return the symbol itself as a placeholder for primitive?
+                // Or error nicely.
+                // Ideally we return a wrapped primitive.
+                // Let's return the symbol, assuming caller knows?
+                // No, usually (funcall (symbol-function 'car) ...) works.
+                // Eval applies symbol by looking up.
+                // So returning symbol works for funcall.
+                return Ok(arg);
+            } else {
+                return err_helper(&format!("Undefined function: {:?}", sym_id));
+            }
+        }
+    }
+    err_helper("SYMBOL-FUNCTION: invalid argument")
+}
+
+fn prim_fboundp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            if proc.get_function(sym_id).is_some() || ctx.primitives.contains_key(&sym_id) {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_fmakunbound(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            if let Some(binding) = proc.dictionary.get_mut(&sym_id) {
+                binding.function = None;
+            }
+            return Ok(arg);
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_find_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        let name = match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::String(s)) => Some(s.clone()),
+            Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .map(|s| s.to_string()),
+            Node::Leaf(OpaqueValue::Package(id)) => {
+                return Ok(arg);
+            }
+            _ => None,
+        };
+
+        if let Some(n) = name {
+            if let Some(pkg_id) = ctx.symbols.read().unwrap().find_package(&n) {
+                return Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_keywordp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            if let Some(sym) = ctx.symbols.read().unwrap().get_symbol(sym_id) {
+                if sym.is_keyword() {
+                    return Ok(proc.make_t(ctx));
+                }
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_copy_symbol(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(sym_id) = node_to_symbol(proc, arg) {
+            let name = _ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym_id)
+                .unwrap_or("G")
+                .to_string();
+            let new_sym_id = _ctx.symbols.write().unwrap().make_symbol(&name);
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(new_sym_id.0))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_package_name(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        let pkg_id_opt = match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::Package(id)) => Some(crate::symbol::PackageId(*id)),
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                // Return home package name? Or if arg represents package name?
+                // Standard says: package designator.
+                // If symbol, use its name to find package? No, symbols name packages.
+                // Actually PACKAGE-NAME takes a package designator.
+                // A string or symbol designates the package named by it.
+                let name = ctx
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(SymbolId(*id))
+                    .unwrap_or("")
+                    .to_string();
+                ctx.symbols.read().unwrap().find_package(&name)
+            }
+            Node::Leaf(OpaqueValue::String(s)) => ctx.symbols.read().unwrap().find_package(s),
+            _ => None,
+        };
+
+        if let Some(pkg_id) = pkg_id_opt {
+            if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
+                return Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::String(pkg.name.clone()))));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_list_all_packages(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    _args: &[NodeId],
+) -> EvalResult {
+    let count = ctx.symbols.read().unwrap().package_count();
+    let mut list = proc.make_nil();
+
+    // Iterate backwards to preserve order in list construction if we pushed front,
+    // but here order doesn't strictly matter.
+    for i in (0..count).rev() {
+        let pkg_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Package(i as u32)));
+        list = proc.arena.inner.alloc(Node::Fork(pkg_node, list));
+    }
+
+    Ok(list)
+}
 
 fn prim_load(
     proc: &mut crate::process::Process,
@@ -203,6 +704,18 @@ fn prim_load(
 
         let path = std::path::Path::new(&filename);
         if !path.exists() {
+            // Try appending .lisp or .lsp if not found
+            let extensions = ["lisp", "lsp", "cl"];
+            for ext in extensions {
+                let path_ext = std::path::Path::new(&filename).with_extension(ext);
+                if path_ext.exists() {
+                    let new_arg = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(
+                        path_ext.to_string_lossy().to_string(),
+                    )));
+                    return prim_load(proc, ctx, &[new_arg]);
+                }
+            }
+
             return err_helper(&format!("LOAD: file not found: {}", filename));
         }
 
@@ -1014,11 +1527,31 @@ fn prim_eq(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    if args.len() >= 2 && args[0] == args[1] {
-        Ok(proc.make_t(ctx))
-    } else {
-        Ok(proc.make_nil())
+    if args.len() < 2 {
+        return Ok(proc.make_t(ctx));
     }
+
+    if args[0] == args[1] {
+        return Ok(proc.make_t(ctx));
+    }
+
+    // Check for same symbol with different NodeIds
+    match (
+        proc.arena.inner.get_unchecked(args[0]),
+        proc.arena.inner.get_unchecked(args[1]),
+    ) {
+        (Node::Leaf(OpaqueValue::Symbol(id1)), Node::Leaf(OpaqueValue::Symbol(id2))) => {
+            if id1 == id2 {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+        (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil)) => {
+            return Ok(proc.make_t(ctx));
+        }
+        _ => {}
+    }
+
+    Ok(proc.make_nil())
 }
 
 fn prim_eql(

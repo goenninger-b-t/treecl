@@ -38,16 +38,19 @@
       (if (consp place)
           (let ((op (car place))
                 (args (cdr place)))
+            (format t "DEBUG-SETF op: ~A (eq op 'get): ~A~%" op (eq op 'get))
             (if (eq op 'aref)
                 `(set-aref ,(car args) ,@(cdr args) ,value)
                 (if (eq op 'slot-value)
                     `(set-slot-value ,(car args) ,@(cdr args) ,value)
-                     (if (eq op 'car) 
-                         ;; Warning: Cons mutation not fully supported?
-                         `(error "SETF CAR not implemented")
-                         (if (eq op 'cdr)
-                             `(error "SETF CDR not implemented")
-                             `(error ,(format nil "Unknown SETF place: ~a" op)))))))
+                    (if (eq op 'get)
+                        `(put ,(car args) ,(car (cdr args)) ,value)
+                        (if (eq op 'car) 
+                             ;; Warning: Cons mutation not fully supported?
+                             `(error "SETF CAR not implemented")
+                             (if (eq op 'cdr)
+                                 `(error "SETF CDR not implemented")
+                                 `(error ,(format nil "Unknown SETF place: ~a" op))))))))
            `(error "Invalid SETF place"))))
 
 (defmacro push (obj place)
@@ -67,7 +70,7 @@
 
 (defmacro assert (test-form &optional places datum &rest args)
   `(unless ,test-form
-     (error "Assertion failed: ~a" ',test-form)))
+     (error (format nil "Assertion failed: ~a" ',test-form))))
 
 (defmacro dolist ((var list &optional result) &rest body)
   (let ((lg (gensym))
