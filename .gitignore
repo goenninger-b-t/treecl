@@ -85,6 +85,7 @@ error*.t*xt
 *.log
 *.out    
 *.err*
+history.t*xt
 
 # ---> C/C++
 
@@ -101,3 +102,4 @@ error*.t*xt
 # ---> VSCode
 
 .vscode/
+
