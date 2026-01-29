@@ -1,9 +1,0 @@
-(def debug_n n)
-(def debug_cons (cons 20 30))
-(def debug_tail (cons (cons 100 110) n))
-(def data (cons (cons 10 20) (cons (cons 20 30) (cons (cons 100 110) n))))
-
-debug_n
-debug_cons
-debug_tail
-data

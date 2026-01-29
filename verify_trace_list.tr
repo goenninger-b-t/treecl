@@ -1,2 +1,0 @@
-(def simple_list (cons 1 (cons 2 n)))
-(search-step simple_list n n 100)

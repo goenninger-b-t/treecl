@@ -1,7 +1,0 @@
-(def n1 (n (n n)))
-(def n2 (n n1))
-(def n3 (n n2))
-(def pair1 (cons n1 (cons n2 n)))
-(def pair2 (cons n2 (cons n3 n)))
-(def data (cons pair1 (cons pair2 n)))
-(search-step data n n 10000)

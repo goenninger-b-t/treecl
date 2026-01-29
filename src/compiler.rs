@@ -1,9 +1,8 @@
 use crate::arena::{Arena, Node};
-use crate::types::{NodeId, OpaqueValue};
-use crate::symbol::{SymbolId, SymbolTable};
 use crate::context::GlobalContext;
 use crate::process::Process;
-
+use crate::symbol::{SymbolId, SymbolTable};
+use crate::types::{NodeId, OpaqueValue};
 
 // Bracket Expression to handle intermediate compilation state
 #[derive(Debug, Clone)]
@@ -23,9 +22,11 @@ impl BExpr {
     }
 }
 
+use std::sync::RwLock;
+
 pub struct Compiler<'a> {
     arena: &'a mut Arena,
-    symbols: &'a SymbolTable,
+    symbols: &'a RwLock<SymbolTable>,
     primitives: &'a std::collections::HashMap<SymbolId, crate::context::PrimitiveFn>,
     nil_node: NodeId,
 }
@@ -73,7 +74,7 @@ impl<'a> Compiler<'a> {
         // In search.rs: △ (△ z w) y -> ((z y) (w y))
         let n = self.make_leaf();
         let n_node = BExpr::Const(n);
-        
+
         // (△ z)
         let nz = BExpr::App(Box::new(n_node.clone()), Box::new(z));
         // ((△ z) w)
@@ -96,7 +97,7 @@ impl<'a> Compiler<'a> {
                             return *l;
                         }
                     }
-                    
+
                     let al = self.abstract_var(name, *l);
                     let ar = self.abstract_var(name, *r);
                     self.bexpr_s(al, ar)
@@ -117,65 +118,71 @@ impl<'a> Compiler<'a> {
                         if params.contains(&sym_id) {
                             Ok(BExpr::Var(sym_id))
                         } else if self.primitives.contains_key(&sym_id) {
-                             // Global primitive function: compile as constant (symbol itself)
-                             Ok(BExpr::Const(expr))
+                            // Global primitive function: compile as constant (symbol itself)
+                            Ok(BExpr::Const(expr))
                         } else {
                             // Free variable: resolve to value using SYMBOL-VALUE
                             // This ensures we get dynamic lookup and errors for unbound variables.
-                            
+
                             // Find SYMBOL-VALUE symbol
                             // We assume it's in COMMON-LISP (Package 1)
                             // We construct an application: (SYMBOL-VALUE 'sym)
                             // 'sym is just the symbol leaf (OpaqueValue::Symbol already)
-                            
-                            // We need to look up SYMBOL-VALUE symbol ID. 
+
+                            // We need to look up SYMBOL-VALUE symbol ID.
                             // Since we don't have direct access to ctx.symbol_table by name easily without iter?
                             // Actually Compiler has &GlobalContext.
                             // But we need to be careful about borrowing.
                             // Compiler struct: pub symbols: &'a SymbolTable
-                            
+
                             // We can use a predetermined ID if we knew it, but it's dynamic.
                             // Safer to treat `SYMBOL-VALUE` as a known primitive wrapper if possible?
-                            // Or just emit a special Node? 
+                            // Or just emit a special Node?
                             // No, we emit BExpr::App.
-                            
+
                             // Let's create a temporary node for SYMBOL-VALUE?
                             // We can't easily look up mutable from here.
-                            
+
                             // Workaround: We emit a specific primitive call pattern?
                             // Or we modify BExpr to support "Global Lookup"?
-                            
+
                             // BExpr::Var is for lambda parameters (bound variables via De Bruijn or named params).
                             // BExpr::Const is for constants.
-                            
+
                             // If we return BExpr::Const(expr), it evaluates to the symbol.
-                            
+
                             // We want (SYMBOL-VALUE sym).
                             // Let's assume we can resolve "SYMBOL-VALUE" from symbols table.
                             // Be careful: symbols is `&SymbolTable`.
-                            
-                            if let Some(pkg) = self.symbols.get_package(crate::symbol::PackageId(1)) {
+
+                            if let Some(pkg) = self
+                                .symbols
+                                .read()
+                                .unwrap()
+                                .get_package(crate::symbol::PackageId(1))
+                            {
                                 if let Some(sv_sym) = pkg.find_symbol("SYMBOL-VALUE") {
                                     // Create nodes for (SYMBOL-VALUE 'sym)
                                     // We can't create new nodes in `self.arena` easily inside `match node` due to borrow?
                                     // self.arena is `&mut ProcessArena`.
                                     // But `node` is a clone of the value, so we are fine on borrow of `expr`.
-                                    // But `self.arena` is borrowed mutably? 
+                                    // But `self.arena` is borrowed mutably?
                                     // Wait, `compile_to_bexpr` takes `&mut self`.
-                                    
+
                                     // Make leaf for SYMBOL-VALUE
-                                    let sv_leaf = self.arena.alloc(Node::Leaf(OpaqueValue::Symbol(sv_sym.0)));
-                                    
+                                    let sv_leaf =
+                                        self.arena.alloc(Node::Leaf(OpaqueValue::Symbol(sv_sym.0)));
+
                                     // Make leaf for Quoted Argument?
                                     // SYMBOL-VALUE takes a symbol. In TC, (f a) applies f to a.
                                     // If a is a symbol node, it evaluates to itself initially?
                                     // Wait, if we just pass `expr` (the symbol node), `SYMBOL-VALUE` will receive `Symbol(id)`.
                                     // That is what we want.
-                                    
+
                                     // (SYMBOL-VALUE sym)
                                     let sv_node = BExpr::Const(sv_leaf);
                                     let arg_node = BExpr::Const(expr);
-                                    
+
                                     Ok(BExpr::App(Box::new(sv_node), Box::new(arg_node)))
                                 } else {
                                     // Fallback if SYMBOL-VALUE not found (shouldn't happen)
@@ -199,52 +206,68 @@ impl<'a> Compiler<'a> {
                         // We need to look up LAMBDA symbol from context?
                         // But Compiler has &SymbolTable.
                         // We can internment check "LAMBDA".
-                        if self.symbols.symbol_name(SymbolId(*s)).map(|n| n == "LAMBDA").unwrap_or(false) {
-                             // (LAMBDA (params) body)
-                             // Parse params
-                             if let Node::Fork(params_node, body_rest) = self.arena.get_unchecked(cdr).clone() {
-                                 let mut new_params = params.to_vec();
-                                 let mut current = params_node;
-                                 while let Node::Fork(p, rest) = self.arena.get_unchecked(current).clone() {
-                                     if let Node::Leaf(OpaqueValue::Symbol(pid)) = self.arena.get_unchecked(p) {
-                                         new_params.push(SymbolId(*pid));
-                                     }
-                                     current = rest;
-                                 }
-                                 
-                                 // Parse body (assume single expression for now, or implicit progn)
-                                 // If multiple body forms, we should wrap in PROGN?
-                                 // For now, take first form.
-                                 let body_node = if let Node::Fork(b, _) = self.arena.get_unchecked(body_rest).clone() {
-                                     b
-                                 } else {
-                                     self.nil_node
-                                 };
-                                 
-                                 // Recurse with new params
-                                 let mut body_bexpr = self.compile_to_bexpr(body_node, &new_params)?;
-                                 
-                                 // Abstract over new parameters matches
-                                 // We only abstract the variables introduced here
-                                 // The `params` argument to `compile_to_bexpr` tracks ALL visible variables.
-                                 // But abstract_var only abstracts the specific variable.
-                                 
-                                 // Wait, `new_params` contains outer + inner.
-                                 // We need to abstract inner params from the body result to create the lambda term.
-                                 // The result of `compile_to_bexpr` will have abstract placeholders for outer vars?
-                                 // No, `BExpr::Var` uses SymbolId.
-                                 // `abstract_var` converts `Var(id)` to S/K/I structure.
-                                 
-                                 // So we just need to abstract the *new* parameters in reverse order.
-                                 let _added_len = new_params.len() - params.len();
-                                 let inner_params = &new_params[params.len()..];
-                                 
-                                 for &param in inner_params.iter().rev() {
-                                     body_bexpr = self.abstract_var(param, body_bexpr);
-                                 }
-                                 
-                                 return Ok(body_bexpr);
-                             }
+                        if self
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(SymbolId(*s))
+                            .map(|n| n == "LAMBDA")
+                            .unwrap_or(false)
+                        {
+                            // (LAMBDA (params) body)
+                            // Parse params
+                            if let Node::Fork(params_node, body_rest) =
+                                self.arena.get_unchecked(cdr).clone()
+                            {
+                                let mut new_params = params.to_vec();
+                                let mut current = params_node;
+                                while let Node::Fork(p, rest) =
+                                    self.arena.get_unchecked(current).clone()
+                                {
+                                    if let Node::Leaf(OpaqueValue::Symbol(pid)) =
+                                        self.arena.get_unchecked(p)
+                                    {
+                                        new_params.push(SymbolId(*pid));
+                                    }
+                                    current = rest;
+                                }
+
+                                // Parse body (assume single expression for now, or implicit progn)
+                                // If multiple body forms, we should wrap in PROGN?
+                                // For now, take first form.
+                                let body_node = if let Node::Fork(b, _) =
+                                    self.arena.get_unchecked(body_rest).clone()
+                                {
+                                    b
+                                } else {
+                                    self.nil_node
+                                };
+
+                                // Recurse with new params
+                                let mut body_bexpr =
+                                    self.compile_to_bexpr(body_node, &new_params)?;
+
+                                // Abstract over new parameters matches
+                                // We only abstract the variables introduced here
+                                // The `params` argument to `compile_to_bexpr` tracks ALL visible variables.
+                                // But abstract_var only abstracts the specific variable.
+
+                                // Wait, `new_params` contains outer + inner.
+                                // We need to abstract inner params from the body result to create the lambda term.
+                                // The result of `compile_to_bexpr` will have abstract placeholders for outer vars?
+                                // No, `BExpr::Var` uses SymbolId.
+                                // `abstract_var` converts `Var(id)` to S/K/I structure.
+
+                                // So we just need to abstract the *new* parameters in reverse order.
+                                let _added_len = new_params.len() - params.len();
+                                let inner_params = &new_params[params.len()..];
+
+                                for &param in inner_params.iter().rev() {
+                                    body_bexpr = self.abstract_var(param, body_bexpr);
+                                }
+
+                                return Ok(body_bexpr);
+                            }
                         }
                     }
                 }
@@ -261,17 +284,20 @@ impl<'a> Compiler<'a> {
                     if items.is_empty() {
                         return Ok(BExpr::Const(self.nil_node));
                     }
-                    
+
                     // (f a b) -> ((f a) b)
                     let items_len = items.len();
                     if items_len > 0 {
                         let func_expr = items[0];
                         let mut curr_bexpr = self.compile_to_bexpr(func_expr, params)?;
-                        
+
                         // Handle 0-arity function calls (f) -> (f nil)
                         // In Tree Calculus, we must apply to something to trigger evaluation of the function
                         if items_len == 1 {
-                             curr_bexpr = BExpr::App(Box::new(curr_bexpr), Box::new(BExpr::Const(self.nil_node)));
+                            curr_bexpr = BExpr::App(
+                                Box::new(curr_bexpr),
+                                Box::new(BExpr::Const(self.nil_node)),
+                            );
                         } else {
                             for arg in &items[1..] {
                                 let arg_bexpr = self.compile_to_bexpr(*arg, params)?;
@@ -283,9 +309,9 @@ impl<'a> Compiler<'a> {
                         Ok(BExpr::Const(self.nil_node))
                     }
                 } else {
-                     // Dotted list -> Treat as data constant?
-                     // Or error? compile only supports standard code lists.
-                     Ok(BExpr::Const(expr))
+                    // Dotted list -> Treat as data constant?
+                    // Or error? compile only supports standard code lists.
+                    Ok(BExpr::Const(expr))
                 }
             }
         }
@@ -299,7 +325,10 @@ impl<'a> Compiler<'a> {
                 let rn = self.bexpr_to_node(*r)?;
                 Ok(self.make_app(ln, rn))
             }
-            BExpr::Var(sym) => Err(format!("Unbound variable remaining after compilation: {:?}", sym)),
+            BExpr::Var(sym) => Err(format!(
+                "Unbound variable remaining after compilation: {:?}",
+                sym
+            )),
         }
     }
     // Public API to compile an arbitrary expression (treating free variables as globals)
@@ -309,14 +338,19 @@ impl<'a> Compiler<'a> {
     }
 }
 
-pub fn compile_func(proc: &mut Process, ctx: &GlobalContext, params: &[SymbolId], body: NodeId) -> Result<NodeId, String> {
+pub fn compile_func(
+    proc: &mut Process,
+    ctx: &GlobalContext,
+    params: &[SymbolId],
+    body: NodeId,
+) -> Result<NodeId, String> {
     let mut compiler = Compiler::new(proc, ctx);
     let mut bexpr = compiler.compile_to_bexpr(body, params)?;
-    
+
     // Abstract variables in reverse order (inner to outer)
     for &param in params.iter().rev() {
         bexpr = compiler.abstract_var(param, bexpr);
     }
-    
+
     compiler.bexpr_to_node(bexpr)
 }

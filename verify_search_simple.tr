@@ -1,2 +1,0 @@
-(def task (cons (cons 1 (cons 2 n)) n))
-(search-step task n n 50)
