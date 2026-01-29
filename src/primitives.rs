@@ -75,6 +75,8 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("APPEND", cl, prim_append);
     globals.register_primitive("REVERSE", cl, prim_reverse);
     globals.register_primitive("NTH", cl, prim_nth);
+    globals.register_primitive("RPLACA", cl, prim_rplaca);
+    globals.register_primitive("RPLACD", cl, prim_rplacd);
 
     // Predicates
     globals.register_primitive("NULL", cl, prim_null);
@@ -188,6 +190,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("SET", cl, prim_set);
 
     globals.register_primitive("SYMBOL-FUNCTION", cl, prim_symbol_function);
+    globals.register_primitive("SET-SYMBOL-FUNCTION", cl, prim_set_symbol_function);
     globals.register_primitive("FBOUNDP", cl, prim_fboundp);
     globals.register_primitive("FMAKUNBOUND", cl, prim_fmakunbound);
     globals.register_primitive("FIND-PACKAGE", cl, prim_find_package);
@@ -195,6 +198,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("COPY-SYMBOL", cl, prim_copy_symbol);
     globals.register_primitive("PACKAGE-NAME", cl, prim_package_name);
     globals.register_primitive("LIST-ALL-PACKAGES", cl, prim_list_all_packages);
+    globals.register_primitive("MACROEXPAND-1", cl, prim_macroexpand_1);
 }
 
 // ============================================================================
@@ -679,6 +683,61 @@ fn prim_list_all_packages(
     }
 
     Ok(list)
+}
+
+fn prim_macroexpand_1(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&form) = args.first() {
+        // Reuse Interpreter logic?
+        // Accessing macros directly
+        if let Node::Fork(op, args_node) = proc.arena.inner.get_unchecked(form).clone() {
+            if let Some(sym_id) = node_to_symbol(proc, op) {
+                if let Some(&macro_idx) = proc.macros.get(&sym_id) {
+                    if let Some(closure) = proc.closures.get(macro_idx).cloned() {
+                        // We need to invoke the macro.
+                        // Since we are in a primitive, we don't have an Interpreter instance handy.
+                        // But _apply_macro is on Interpreter.
+                        // Re-instantiate a temporary Interpreter?
+                        // Interpreter::new(proc, ctx) takes mutable proc.
+                        // But we are in a primitive which has `&mut proc`.
+                        // So yes, we can create a temporary interpreter.
+                        let mut interpreter = Interpreter::new(proc, ctx);
+                        let expanded = interpreter._apply_macro(&closure, args_node)?;
+
+                        // Return (values expansion t) -> For now just list (expansion t)
+                        // Or just expansion if we don't have multiple values.
+                        // The user asked for VALUES support. If not present, we return list for now?
+                        // Or we assume single value return for MVP if acceptable.
+                        // Standard macroexpand-1 returns 2 values.
+                        // Let's return list (expansion t) to be safe for now or single value?
+                        // Actually, if I can't return values, (macroexpand-1) is hard to use correctly.
+                        // Let's return list (expansion t) and let Lisp wrapper handle it?
+                        // Or just return expansion.
+                        // Issue: If it's not a macro, we return the form.
+                        // If it IS a macro, we return expansion.
+                        // How to distinguish? "Expanded-p".
+                        // Let's implement values support later?
+                        // I'll return a LIST of two elements: (expansion expanded-p)
+                        // This is non-standard but functional for my lisp code.
+                        // Wait, I can fix `macroexpand` in lisp to handle this.
+
+                        let t_val = interpreter.process.make_t(ctx);
+                        let result_list = interpreter.process.make_list(&[expanded, t_val]);
+                        return Ok(result_list);
+                    }
+                }
+            }
+        }
+        // Not a macro form or not a cons
+        let nil_val = proc.make_nil();
+        let result_list = proc.make_list(&[form, nil_val]);
+        Ok(result_list)
+    } else {
+        err_helper("MACROEXPAND-1: missing argument")
+    }
 }
 
 fn prim_load(
@@ -3736,4 +3795,69 @@ fn prim_apropos(
     }
 
     Ok(proc.make_nil())
+}
+
+fn prim_rplaca(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("RPLACA: too few arguments");
+    }
+    let cons = args[0];
+    let new_car = args[1];
+
+    // Read current value to check if it's a Fork and get cdr
+    let current_node = proc.arena.inner.get_unchecked(cons).clone();
+
+    if let Node::Fork(_, cdr) = current_node {
+        let new_node = Node::Fork(new_car, cdr);
+        proc.arena.inner.overwrite(cons, new_node);
+        Ok(cons)
+    } else {
+        err_helper("RPLACA: argument is not a cons")
+    }
+}
+
+fn prim_rplacd(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("RPLACD: too few arguments");
+    }
+    let cons = args[0];
+    let new_cdr = args[1];
+
+    // Read current value to check if it's a Fork and get car
+    let current_node = proc.arena.inner.get_unchecked(cons).clone();
+
+    if let Node::Fork(car, _) = current_node {
+        let new_node = Node::Fork(car, new_cdr);
+        proc.arena.inner.overwrite(cons, new_node);
+        Ok(cons)
+    } else {
+        err_helper("RPLACD: argument is not a cons")
+    }
+}
+
+fn prim_set_symbol_function(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("SET-SYMBOL-FUNCTION: too few arguments");
+    }
+    let sym_node = args[0];
+    let func_node = args[1];
+
+    if let Some(sym_id) = node_to_symbol(proc, sym_node) {
+        proc.set_function(sym_id, func_node);
+        Ok(func_node)
+    } else {
+        err_helper("SET-SYMBOL-FUNCTION: first argument must be a symbol")
+    }
 }

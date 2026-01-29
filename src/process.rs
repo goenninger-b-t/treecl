@@ -266,6 +266,30 @@ impl Process {
             self.mark_node(root, &mut marked);
         }
 
+        // Mark Macros
+        for &closure_idx in self.macros.values() {
+            if let Some(closure) = self.closures.get(closure_idx) {
+                // Mark macro body
+                self.mark_node(closure.body, &mut marked);
+                // Mark macro environment
+                for root in closure.env.iter_roots() {
+                    self.mark_node(root, &mut marked);
+                }
+            }
+        }
+
+        // Mark Global Functions
+        // Note: Functions in 'functions' map are usually also in 'dictionary',
+        // but we mark them here for safety/completeness if not bound to symbol in dict.
+        for &closure_idx in self.functions.values() {
+            if let Some(closure) = self.closures.get(closure_idx) {
+                self.mark_node(closure.body, &mut marked);
+                for root in closure.env.iter_roots() {
+                    self.mark_node(root, &mut marked);
+                }
+            }
+        }
+
         // Closures are now traced via reachability in mark_node.
         // We do NOT scan all closures to allow collecting unreachable ones.
 

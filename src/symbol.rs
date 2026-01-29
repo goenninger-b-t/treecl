@@ -248,6 +248,12 @@ impl SymbolTable {
 
         // Create new symbol
         let sym_id = SymbolId(self.symbols.len() as u32);
+        if upper == "PROGN" {
+            println!(
+                "DEBUG: Creating NEW symbol PROGN. ID: {:?}. Package: {:?}",
+                sym_id, pkg_id
+            );
+        }
         let symbol = Symbol::new(upper.clone(), Some(pkg_id));
         self.symbols.push(symbol);
 
@@ -343,5 +349,26 @@ mod tests {
         let sym = table.make_symbol("G123");
         let s = table.get_symbol(sym).unwrap();
         assert!(s.package.is_none()); // Uninterned
+    }
+    #[test]
+    fn test_inheritance() {
+        let mut table = SymbolTable::new();
+        // Switch to CL (1)
+        table.set_current_package(PackageId(1));
+        let foo_cl = table.intern("FOO");
+        table.export_symbol(foo_cl);
+
+        // Switch to CL-USER (2)
+        // CL-USER uses CL.
+        table.set_current_package(PackageId(2));
+
+        // Should find inherited FOO
+        let foo_user = table.intern("FOO");
+
+        assert_eq!(foo_cl, foo_user, "FOO should be inherited from CL");
+
+        // Verify via intern_in
+        let foo_user_2 = table.intern_in("FOO", PackageId(2));
+        assert_eq!(foo_cl, foo_user_2, "FOO via intern_in should be inherited");
     }
 }

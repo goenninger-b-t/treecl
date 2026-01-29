@@ -124,6 +124,7 @@ pub enum Continuation {
         op: NodeId,
         args: Vec<NodeId>, // Pending args
         vals: Vec<NodeId>, // Evaluated args
+        env: Environment,  // Caller environment
     },
     /// Apply function after args evaluated
     /// (function, args)
@@ -142,6 +143,12 @@ pub enum Continuation {
     EvIf {
         then_branch: NodeId,
         else_branch: NodeId,
+        env: Environment,
+    },
+    EvMvb {
+        vars: NodeId,
+        body: NodeId,
+        env: Environment,
     },
     /// Assignment (SETQ)
     /// (symbol, remaining_pairs)
@@ -480,6 +487,18 @@ impl<'a> Interpreter<'a> {
 
     /// Main evaluation entry point
     pub fn eval(&mut self, expr: NodeId, env: &Environment) -> EvalResult {
+        // Check if expr is PROGN
+        if let Some(sym) = self.node_to_symbol(expr) {
+            if self
+                .globals
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .unwrap_or("")
+                == "PROGN"
+            {}
+        }
         // Legacy recursive eval - eventually replace or wrap step
         let node = self.process.arena.get_unchecked(expr).clone();
         // ... (existing eval logic to be kept for reference or backup until full switch)
@@ -543,12 +562,12 @@ impl<'a> Interpreter<'a> {
                         match val {
                             OpaqueValue::Symbol(id) => {
                                 let sym_id = SymbolId(id);
-                                if let Some(val) = env.lookup(sym_id) {
+                                if self.is_self_evaluating(sym_id) {
+                                    // Program remains expr
+                                } else if let Some(val) = env.lookup(sym_id) {
                                     self.process.program = val;
                                 } else if let Some(val) = self.process.get_value(sym_id) {
                                     self.process.program = val;
-                                } else if self.is_self_evaluating(sym_id) {
-                                    // Program remains expr
                                 } else {
                                     let name = self
                                         .globals
@@ -558,6 +577,32 @@ impl<'a> Interpreter<'a> {
                                         .symbol_name(sym_id)
                                         .unwrap_or("?")
                                         .to_string();
+
+                                    // DEBUG: Check P
+                                    if name == "P" {
+                                        println!(
+                                            "DEBUG: PAIRS lookup failure. SymId: {:?}.",
+                                            sym_id
+                                        );
+                                        println!("DEBUG: Env bindings keys:");
+                                        for key in env.bindings.keys() {
+                                            println!(
+                                                "  Key: {:?} Name: {:?}",
+                                                key,
+                                                self.globals
+                                                    .symbols
+                                                    .read()
+                                                    .unwrap()
+                                                    .symbol_name(*key)
+                                            );
+                                        }
+                                        if let Some(p) = &env.parent {
+                                            println!("DEBUG: Parent env present.");
+                                        } else {
+                                            println!("DEBUG: No parent env.");
+                                        }
+                                    }
+
                                     return Err(ControlSignal::Error(format!(
                                         "Variable '{}' is not bound",
                                         name
@@ -607,6 +652,24 @@ impl<'a> Interpreter<'a> {
         // Check Special Forms
         if let Some(sym_id) = self.node_to_symbol(op) {
             let sf = &self.globals.special_forms;
+            if sym_id == sf.progn {
+                println!("DEBUG: Matched PROGN in step_app for op={:?}", op);
+            } else {
+                if self
+                    .globals
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(sym_id)
+                    .unwrap_or("")
+                    == "PROGN"
+                {
+                    println!(
+                        "DEBUG: step_app MISSED PROGN. sym: {:?}, sf.progn: {:?}",
+                        sym_id, sf.progn
+                    );
+                }
+            }
 
             if sym_id == sf.setq {
                 return self.step_setq(args, env);
@@ -635,8 +698,23 @@ impl<'a> Interpreter<'a> {
             if sym_id == sf.function {
                 return self.step_function(args, env);
             }
+            if sym_id == sf.defvar {
+                let res = self.eval_defvar(args, &env)?;
+                self.process.program = res;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+            if sym_id == sf.defparameter {
+                let res = self.eval_defparameter(args, &env)?;
+                self.process.program = res;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
             if sym_id == sf.r#let {
                 return self.step_let(args, env);
+            }
+            if sym_id == sf.multiple_value_bind {
+                return self.step_multiple_value_bind(args, env);
             }
             if sym_id == sf.block {
                 return self.step_block(args, env);
@@ -649,6 +727,17 @@ impl<'a> Interpreter<'a> {
             }
             if sym_id == sf.go {
                 return self.step_go(args, env);
+            }
+            if sym_id == sf.quasiquote {
+                return self.step_quasiquote(args, env);
+            }
+            if sym_id == sf.unquote {
+                return Err(ControlSignal::Error("UNQUOTE outside of QUASIQUOTE".into()));
+            }
+            if sym_id == sf.unquote_splicing {
+                return Err(ControlSignal::Error(
+                    "UNQUOTE-SPLICING outside of QUASIQUOTE".into(),
+                ));
             }
         }
 
@@ -678,6 +767,7 @@ impl<'a> Interpreter<'a> {
                 op,
                 args: rest,
                 vals: Vec::new(),
+                env: env.clone(),
             });
             self.process.program = first;
             self.process.execution_mode = crate::process::ExecutionMode::Eval;
@@ -698,23 +788,13 @@ impl<'a> Interpreter<'a> {
             .node_to_symbol(name_node)
             .ok_or_else(|| ControlSignal::Error("defmacro name must be symbol".into()))?;
 
-        // Construct Closure Body: (progn ...body)
-        let body_forms = if args_vec.len() > 2 {
+        // Create Closure Body: just the list of forms (implicit progn)
+        // Do NOT wrap in PROGN symbol, as apply_closure uses eval_progn which expects a list of forms.
+        let body_node = if args_vec.len() > 2 {
             self.process.make_list(&args_vec[2..])
         } else {
             self.process.make_nil()
         };
-
-        // Wrap in PROGN?
-        let progn_sym = self.globals.special_forms.progn;
-        let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
-        let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
-
-        let body_node = self
-            .process
-            .arena
-            .inner
-            .alloc(Node::Fork(progn_sym_node, body_forms));
 
         // Parse lambda list
         let parsed_lambda_list = match self.parse_lambda_list(lambda_list_node) {
@@ -1119,6 +1199,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_if(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        let env_copy = env.clone();
         self.process.current_env = Some(env);
         if let Node::Fork(test, rest) = self.process.arena.get_unchecked(args).clone() {
             let (then_branch, else_branch) = if let Node::Fork(th, rest2) =
@@ -1138,6 +1219,7 @@ impl<'a> Interpreter<'a> {
             self.process.continuation_stack.push(Continuation::EvIf {
                 then_branch,
                 else_branch,
+                env: env_copy,
             });
             self.process.program = test;
             self.process.execution_mode = crate::process::ExecutionMode::Eval;
@@ -1147,6 +1229,37 @@ impl<'a> Interpreter<'a> {
             self.process.execution_mode = crate::process::ExecutionMode::Return;
             Ok(true)
         }
+    }
+
+    fn step_multiple_value_bind(
+        &mut self,
+        args: NodeId,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Err(ControlSignal::Error(
+                "multiple-value-bind: too few args".into(),
+            ));
+        }
+        let vars_node = args_vec[0];
+        let values_form = args_vec[1];
+        let body = if args_vec.len() > 2 {
+            self.process.make_list(&args_vec[2..])
+        } else {
+            self.process.make_nil()
+        };
+
+        self.process.continuation_stack.push(Continuation::EvMvb {
+            vars: vars_node,
+            body,
+            env: env.clone(),
+        });
+
+        self.process.program = values_form;
+        self.process.current_env = Some(env);
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        Ok(true)
     }
 
     fn step_progn(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
@@ -1175,7 +1288,11 @@ impl<'a> Interpreter<'a> {
             Continuation::EvIf {
                 then_branch,
                 else_branch,
+                env,
             } => {
+                // RESTORE ENVIRONMENT
+                self.process.current_env = Some(env);
+
                 let true_val = match self.process.arena.get_unchecked(result) {
                     Node::Leaf(OpaqueValue::Nil) => false,
                     _ => true,
@@ -1333,21 +1450,23 @@ impl<'a> Interpreter<'a> {
                 op,
                 mut args,
                 mut vals,
+                env,
             } => {
                 // Return from arg evaluation
                 vals.push(result);
 
                 if args.is_empty() {
                     // All args evaluated. Transition to Apply.
-                    // We can reuse Apply continuation logic or just call apply here?
-                    // To keep state machine clean, let's push Apply and immediately Return (or step).
-                    // Actually, if we just push Apply and set Return mode, we need a dummy value?
-                    // Or we just call `self.apply_function`?
-                    // `apply_function` does the actual application logic (primitive or closure).
-                    // If closure: it sets up new env and program and pushes continuation?
 
-                    // Let's call a helper `step_apply(op, vals, env)`
-                    let env = self.process.current_env.clone().unwrap_or_default();
+                    // Restore environment before Apply!
+                    // Although Apply captures its own env?
+                    // step_apply takes env.
+
+                    // Actually, if we restore self.process.current_env = Some(env),
+                    // Crucially, if we continue execution (e.g. if apply pushes more continuations),
+                    // we want the environment to be clean (unpolluted by args).
+                    self.process.current_env = Some(env.clone());
+
                     return self.step_apply(op, vals, env);
                 } else {
                     let next = args[0];
@@ -1356,7 +1475,12 @@ impl<'a> Interpreter<'a> {
                         op,
                         args: rest,
                         vals,
+                        env: env.clone(),
                     });
+
+                    // Restore environment for next arg evaluation!
+                    self.process.current_env = Some(env);
+
                     self.process.program = next;
                     self.process.execution_mode = crate::process::ExecutionMode::Eval;
                 }
@@ -2505,6 +2629,19 @@ impl<'a> Interpreter<'a> {
             }
 
             // Check primitives
+            if self
+                .globals
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .unwrap_or("")
+                == "PROGN"
+            {
+                println!("DEBUG: CAUGHT eval(PROGN)! sym={:?}", sym);
+                let bt = std::backtrace::Backtrace::capture();
+                println!("Backtrace:\n{:?}", bt);
+            }
             if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym) {
                 eprintln!("DEBUG: Checking primitive: {} ({:?})", name, sym);
             }
@@ -2676,9 +2813,9 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Apply a macro closure to arguments (no eval of args)
-    fn _apply_macro(&mut self, closure: &Closure, args: NodeId) -> EvalResult {
+    pub fn _apply_macro(&mut self, closure: &Closure, args: NodeId) -> EvalResult {
         // Create environment from closure's captured environment
-        let mut new_env = Environment::with_parent(closure.env.clone());
+        let mut new_env = crate::eval::Environment::with_parent(closure.env.clone());
 
         // Bind arguments UNEVALUATED
         // Bind arguments UNEVALUATED using ParsedLambdaList
@@ -2716,10 +2853,15 @@ impl<'a> Interpreter<'a> {
 
         // 3. Rest
         if let Some(rest_sym) = closure.lambda_list.rest {
+            println!("DEBUG: bind rest {:?} to {:?}", rest_sym, current_arg);
             new_env.bind(rest_sym, current_arg);
         }
 
         // Evaluate body - this produces the expansion
+        println!(
+            "DEBUG: apply_macro calling eval_progn. Env keys count: {}",
+            new_env.bindings.len()
+        );
         let expansion = self.eval_progn(closure.body, &new_env)?;
         Ok(expansion)
     }
@@ -3103,7 +3245,6 @@ impl<'a> Interpreter<'a> {
         Ok(self.process.make_nil())
     }
 
-    /// (defvar name [initial-value [doc]])
     fn eval_defvar(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         if let Node::Fork(name_node, rest) = self.process.arena.inner.get_unchecked(args).clone() {
             if let Some(name_sym) = self.node_to_symbol(name_node) {
@@ -3148,6 +3289,50 @@ impl<'a> Interpreter<'a> {
         ))
     }
 
+    fn step_quasiquote(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        let result = self.eval_quasiquote(args, &env)?;
+        self.process.program = result;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_multiple_value_bind_DUP(
+        &mut self,
+        args: NodeId,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        // (multiple-value-bind (vars...) values-form body...)
+        // 1. Eval values-form
+        // 2. Bind vars to values (lexical new env)
+        // 3. Eval body (tail)
+
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Err(ControlSignal::Error(
+                "multiple-value-bind: too few args".into(),
+            ));
+        }
+        let vars_node = args_vec[0];
+        let values_form = args_vec[1];
+        let body = if args_vec.len() > 2 {
+            self.process.make_list(&args_vec[2..])
+        } else {
+            self.process.make_nil()
+        };
+
+        // Push continuation to bind variables
+        self.process.continuation_stack.push(Continuation::EvMvb {
+            vars: vars_node,
+            body,
+            env: env.clone(),
+        });
+
+        self.process.program = values_form;
+        self.process.current_env = Some(env);
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        Ok(true)
+    }
+
     /// (quasiquote form) -> expand and evaluate
     fn eval_quasiquote(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         if let Node::Fork(form, _) = self.process.arena.inner.get_unchecked(args).clone() {
@@ -3166,6 +3351,10 @@ impl<'a> Interpreter<'a> {
             Node::Fork(car, cdr) => {
                 // Check if car is UNQUOTE or UNQUOTE-SPLICING
                 if let Some(sym) = self.node_to_symbol(car) {
+                    println!(
+                        "DEBUG: eval_qq inner sym={:?} unquote={:?}",
+                        sym, self.globals.special_forms.unquote
+                    );
                     if sym == self.globals.special_forms.unquote {
                         // (unquote x) -> eval x
                         // (unquote . (x . nil))
