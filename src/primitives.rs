@@ -265,9 +265,8 @@ fn prim_load(
             }
         }
 
-        let mut last_val = interpreter.process.make_nil();
         for expr in exprs {
-            last_val = interpreter.eval(expr, &env)?;
+            interpreter.eval(expr, &env)?;
         }
 
         // Restore bindings
@@ -393,7 +392,7 @@ fn prim_make_pathname(
 
 fn prim_merge_pathnames(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     // Return first arg if present
@@ -406,7 +405,7 @@ fn prim_merge_pathnames(
 
 fn prim_pathname(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
@@ -418,7 +417,7 @@ fn prim_pathname(
 
 fn prim_namestring(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
@@ -477,7 +476,7 @@ fn prim_compile_file_pathname(
 fn prim_string_equal(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
-    args: &[NodeId],
+    _args: &[NodeId],
 ) -> EvalResult {
     // Basic stub
     Ok(proc.make_t(ctx))
@@ -485,7 +484,7 @@ fn prim_string_equal(
 
 fn prim_assert(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     // Arg 0 is the value (evaluated)
