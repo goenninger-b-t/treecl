@@ -137,6 +137,14 @@ pub enum Continuation {
         rest: Vec<NodeId>,
         tag_map: HashMap<TagKey, Vec<NodeId>>,
     },
+    /// Block frame (named progn)
+    /// (name, remaining_forms)
+    Block { name: SymbolId, rest: Vec<NodeId> },
+    /// Catch return value for return-from
+    /// (target_block_name)
+    // Actually, step_return_from evaluates the value.
+    // Then the continuation receives the value and unwinds.
+    ReturnFrom { target: SymbolId },
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -289,6 +297,7 @@ impl<'a> Interpreter<'a> {
         match mode {
             crate::process::ExecutionMode::Eval => {
                 let expr = self.process.program;
+                self.process.pending_redex = Some(expr);
                 let env = self.process.current_env.as_ref().unwrap().clone();
                 let node = self.process.arena.get_unchecked(expr).clone();
 
@@ -393,30 +402,10 @@ impl<'a> Interpreter<'a> {
                 return self.step_let(args, env);
             }
             if sym_id == sf.block {
-                // For now, treat block as progn (ignore block name/return-from support temporarily)
-                // Just execute body (tail of args).
-                // (block name form1 form2...)
-                let list = self.cons_to_vec(args);
-                if list.len() >= 2 {
-                    // Treat as (progn form1...)
-                    // We need to construct progn node.
-                    let forms = self.process.make_list(&list[1..]);
-                    let progn_sym_val = crate::types::OpaqueValue::Symbol(sf.progn.0);
-                    let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
-
-                    let progn_node = self
-                        .process
-                        .arena
-                        .inner
-                        .alloc(Node::Fork(progn_sym_node, forms));
-                    self.process.program = progn_node;
-                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
-                    return Ok(true);
-                } else {
-                    self.process.program = self.process.make_nil();
-                    self.process.execution_mode = crate::process::ExecutionMode::Return;
-                    return Ok(true);
-                }
+                return self.step_block(args, env);
+            }
+            if sym_id == sf.return_from {
+                return self.step_return_from(args, env);
             }
             if sym_id == sf.tagbody {
                 return self.step_tagbody(args, env);
@@ -607,6 +596,62 @@ impl<'a> Interpreter<'a> {
         } else {
             return Err(ControlSignal::Error("go: invalid tag".into()));
         }
+    }
+
+    fn step_block(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error("block: missing name".into()));
+        }
+        let name_node = args_vec[0];
+        let name_sym = self
+            .node_to_symbol(name_node)
+            .ok_or_else(|| ControlSignal::Error("block: name must be a symbol".into()))?;
+
+        // Block body (implicit progn)
+        let body_forms = if args_vec.len() > 1 {
+            args_vec[1..].to_vec()
+        } else {
+            // Block with no body returns nil
+            Vec::new()
+        };
+
+        self.process.continuation_stack.push(Continuation::Block {
+            name: name_sym,
+            rest: body_forms,
+        });
+
+        // Start execution
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_return_from(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error("return-from: missing name".into()));
+        }
+        let name_node = args_vec[0];
+        let name_sym = self
+            .node_to_symbol(name_node)
+            .ok_or_else(|| ControlSignal::Error("return-from: name must be a symbol".into()))?;
+
+        // Optional result form (defaults to nil)
+        let result_form = if args_vec.len() > 1 {
+            args_vec[1]
+        } else {
+            self.process.make_nil()
+        };
+
+        // We need to evaluate the result form first.
+        // Then Unwind.
+        self.process
+            .continuation_stack
+            .push(Continuation::ReturnFrom { target: name_sym });
+
+        self.process.program = result_form;
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        Ok(true)
     }
 
     fn step_defun(&mut self, args: NodeId, _env: Environment) -> Result<bool, ControlSignal> {
@@ -908,6 +953,53 @@ impl<'a> Interpreter<'a> {
                     self.process.execution_mode = crate::process::ExecutionMode::Eval;
                 }
                 Ok(true)
+            }
+            Continuation::Block { name, rest } => {
+                if rest.is_empty() {
+                    // Block finished normally. Return result.
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                } else {
+                    let next = rest[0];
+                    let remaining = rest[1..].to_vec();
+                    self.process.continuation_stack.push(Continuation::Block {
+                        name,
+                        rest: remaining,
+                    });
+                    self.process.program = next;
+                    self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                }
+                Ok(true)
+            }
+            Continuation::ReturnFrom { target } => {
+                // Return value is in 'result'.
+                // Unwind to find Block { name == target }.
+
+                let mut found_depth = None;
+                for (i, cont) in self.process.continuation_stack.iter().rev().enumerate() {
+                    if let Continuation::Block { name, .. } = cont {
+                        if *name == target {
+                            found_depth = Some(i);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(depth) = found_depth {
+                    // Truncate stack.
+                    let new_len = self
+                        .process
+                        .continuation_stack
+                        .len()
+                        .saturating_sub(depth + 1);
+                    self.process.continuation_stack.truncate(new_len);
+
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                    Ok(true)
+                } else {
+                    Err(ControlSignal::Error(format!(
+                        "return-from: block not found"
+                    )))
+                }
             }
             Continuation::Tagbody { mut rest, tag_map } => {
                 // Return from a form inside tagbody (result ignored)

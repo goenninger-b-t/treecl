@@ -127,69 +127,66 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // 2. Execute all expressions
-        for expr in expressions {
-            if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
-                let mut process = proc_ref.lock().unwrap();
+        // 2. Execute all expressions via Scheduler
+        // Wrap in (PROGN ...) so they run sequentially in one process context
+        if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+            let mut process_guard = proc_ref.lock().unwrap();
+            let process = &mut *process_guard;
+
+            // Construct PROGN
+            if !expressions.is_empty() {
+                let progn_sym = globals.special_forms.progn;
+                let progn_val = treecl::types::OpaqueValue::Symbol(progn_sym.0);
+                let progn_node = process
+                    .arena
+                    .inner
+                    .alloc(treecl::arena::Node::Leaf(progn_val));
+
+                let body_list = process.make_list(&expressions);
+                let program = process
+                    .arena
+                    .inner
+                    .alloc(treecl::arena::Node::Fork(progn_node, body_list));
+
+                process.program = program;
+                process.execution_mode = treecl::process::ExecutionMode::Eval;
+                // Reset stack just in case
+                process.continuation_stack.clear();
+                process
+                    .continuation_stack
+                    .push(treecl::eval::Continuation::Done);
+                process.current_env = Some(treecl::eval::Environment::new());
                 process.status = Status::Runnable;
-
-                let mut interpreter = Interpreter::new(&mut process, &globals);
-                let env = Environment::new();
-
-                match interpreter.eval(expr, &env) {
-                    Ok(_) => {} // Ignore result for file exec
-                    Err(treecl::eval::ControlSignal::SysCall(syscall)) => {
-                        match syscall {
-                            treecl::syscall::SysCall::Spawn(fn_node) => {
-                                // We need to release lock? interpreter is done.
-                                let pid = scheduler.spawn(&globals, fn_node);
-                                let pid_node = process.make_pid(pid);
-                                println!(
-                                    "{}",
-                                    treecl::printer::print_to_string(
-                                        &process.arena.inner,
-                                        &*globals.symbols.read().unwrap(),
-                                        pid_node
-                                    )
-                                );
-                            }
-                            treecl::syscall::SysCall::Sleep(ms) => {
-                                std::thread::sleep(std::time::Duration::from_millis(ms));
-                            }
-                            treecl::syscall::SysCall::Receive { .. } => {
-                                if let Some(msg) = process.mailbox.pop_front() {
-                                    println!(
-                                        "{}",
-                                        treecl::printer::print_to_string(
-                                            &process.arena.inner,
-                                            &*globals.symbols.read().unwrap(),
-                                            msg.payload
-                                        )
-                                    );
-                                } else {
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                    eprintln!("REPL: No message.");
-                                }
-                            }
-                            treecl::syscall::SysCall::Send { .. } => {
-                                // Ignore
-                            }
-                            _ => {
-                                eprintln!("Unhandled SysCall in File Exec: {:?}", syscall);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Execution Error: {:?}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                eprintln!("Process lost!");
-                std::process::exit(1);
             }
         }
-        return Ok(());
+
+        // Start Scheduler (workers will pick up the process)
+        scheduler.start(globals.clone());
+
+        // Wait for completion
+        loop {
+            let mut finished = false;
+            let mut exit_code = 0;
+
+            if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
+                let proc = proc_ref.lock().unwrap();
+                if proc.status == Status::Terminated {
+                    finished = true;
+                    exit_code = 0;
+                } else if let Status::Failed(msg) = &proc.status {
+                    eprintln!("Execution Failed: {}", msg);
+                    finished = true;
+                    exit_code = 1;
+                }
+            }
+
+            if finished {
+                std::process::exit(exit_code);
+            }
+
+            // Sleep to avoid busy loop while waiting for workers
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     // Start Scheduler Threads

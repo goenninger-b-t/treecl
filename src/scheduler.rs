@@ -124,7 +124,7 @@ impl SchedulerHandle {
         }
     }
 
-    pub fn spawn_process(&self, globals: &mut crate::context::GlobalContext) -> Pid {
+    pub fn spawn_process(&self, globals: &crate::context::GlobalContext, func: NodeId) -> Pid {
         let mut pid_guard = self.next_pid.lock().unwrap();
         let pid = Pid {
             node: self.node_id,
@@ -134,7 +134,9 @@ impl SchedulerHandle {
         *pid_guard += 1;
         drop(pid_guard);
 
+        // Dummy program for now, caller (handle_syscall) will setup the call
         let process = Process::new(pid, NodeId(0), globals);
+
         self.registry.insert(pid, Arc::new(Mutex::new(process)));
         pid
     }
@@ -261,24 +263,72 @@ fn handle_syscall(
 
     match syscall {
         SysCall::Spawn(func) => {
-            // Create new PID
-            // We can use the handle to spawn logic
-            drop(proc); // Drop lock
+            // 1. Create Child Process
+            // Dummy node(0) passed, we set real program later
+            let child_pid = sched.spawn_process(globals, crate::types::NodeId(0));
 
-            // Create new process
-            // Wait, we need GlobalContext to create process (intern symbols?)
-            // Process::new takes &mut GlobalContext?
-            // Let's check Process::new signature.
-            // It takes `&mut GlobalContext`.
-            // This is bad for multithreading if we need &mut.
-            // But GlobalContext only mutates SymbolTable (RwLock) and MOP?
-            // If we change Process::new to take `&GlobalContext`, and use internal mutability, it works.
-            // We should fix this signature.
+            // 2. Setup Child and Resume Parent
+            if let Some(child_arc) = sched.registry.get(&child_pid) {
+                // Lock child to set up program
+                let mut child = child_arc.lock().unwrap();
 
-            // ASSUMING Process::new takes &GlobalContext or we can cast mut.
-            // For now, let's fake it or assume we fixed it.
-            // (See next edit for Process::new fix)
-            // let new_pid = sched.spawn_process(&mut *globals); // Error: cannot borrow as mut
+                // We need to copy `func` from Parent to Child.
+                // We need Parent Lock.
+                if let Some(parent_arc) = sched.registry.get(&pid) {
+                    let mut parent = parent_arc.lock().unwrap();
+
+                    // Deep copy function node
+                    let func_copy =
+                        crate::arena::deep_copy(&parent.arena.inner, func, &mut child.arena.inner);
+
+                    // Wrap in (FUNCALL func_copy)
+                    // Find FUNCALL symbol
+                    let funcall_sym = globals
+                        .symbols
+                        .write()
+                        .unwrap()
+                        .intern_in("FUNCALL", crate::symbol::PackageId(1));
+                    let funcall_val = OpaqueValue::Symbol(funcall_sym.0);
+                    let funcall_node = child
+                        .arena
+                        .inner
+                        .alloc(crate::arena::Node::Leaf(funcall_val));
+
+                    let nil = child.make_nil();
+                    let args_list = child
+                        .arena
+                        .inner
+                        .alloc(crate::arena::Node::Fork(func_copy, nil));
+                    let call_form = child
+                        .arena
+                        .inner
+                        .alloc(crate::arena::Node::Fork(funcall_node, args_list));
+
+                    child.program = call_form;
+                    // Status is already Runnable (from spawn_process default? No check Process::new)
+                    // Process::new sets Runnable.
+
+                    // Resume Parent with Child PID
+                    let pid_node = parent.make_pid(child_pid);
+
+                    if let Some(redex) = parent.pending_redex.take() {
+                        // Deep copy pid_node? No, pid_node is in parent arena (alloced by parent.make_pid)
+                        // Wait. `parent.make_pid` allocates in `parent.arena`.
+                        // `overwrite` takes NodeId (redex in parent) and Node (value).
+                        // `get_unchecked` returns &Node.
+                        let val = parent.arena.inner.get_unchecked(pid_node).clone();
+                        parent.arena.inner.overwrite(redex, val);
+                    }
+                    parent.status = Status::Runnable;
+
+                    // Schedule parent
+                    sched.global_queue.push(pid);
+                }
+                // Unlock parent
+
+                // Schedule child
+                sched.global_queue.push(child_pid);
+            }
         }
         SysCall::Send { target, message } => {
             // Drop lock because we need to lock target
