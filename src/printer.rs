@@ -3,8 +3,8 @@
 // Implements ANSI CL print functions.
 
 use crate::arena::{Arena, Node};
+use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
-use crate::symbol::{SymbolTable, SymbolId};
 
 /// Print options
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ impl PrintOptions {
     pub fn prin1() -> Self {
         Self::default()
     }
-    
+
     /// For princ (human-readable)
     pub fn princ() -> Self {
         Self {
@@ -67,66 +67,69 @@ impl<'a> Printer<'a> {
             current_depth: 0,
         }
     }
-    
+
     /// Print an expression to string
     pub fn print(&mut self, node: NodeId) -> &str {
         self.print_node(node);
         &self.output
     }
-    
+
     fn print_node(&mut self, node: NodeId) {
         if self.current_depth > self.options.max_depth {
             self.output.push_str("...");
             return;
         }
-        
+
         self.current_depth += 1;
-        
+
         // Check for symbolic combinators first
         if let Some(name) = self.detect_combinator(node) {
             self.output.push_str(name);
             self.current_depth -= 1;
             return;
         }
-        
+
         match self.arena.get_unchecked(node).clone() {
             Node::Leaf(val) => self.print_leaf(val),
             Node::Stem(inner) => self.print_stem(inner),
             Node::Fork(_car, _cdr) => self.print_list(node),
         }
-        
+
         self.current_depth -= 1;
     }
-    
+
     /// Detect if a node matches a known combinator pattern
     fn detect_combinator(&self, node: NodeId) -> Option<&'static str> {
         // Check for K = Fork(Nil, Nil)
         if self.is_k(node) {
-            return Some("K");
+            return Some(":K-COMBINATOR");
         }
-        
+
         // Check for I = Fork(K, K)
         if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
             if self.is_k(*left) && self.is_k(*right) {
-                return Some("I");
+                return Some(":I-COMBINATOR");
             }
         }
-        
+
         None
     }
-    
+
     /// Check if node is K = Fork(Nil, Nil)
     fn is_k(&self, node: NodeId) -> bool {
         if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
             matches!(
-                (self.arena.get_unchecked(*left), self.arena.get_unchecked(*right)),
+                (
+                    self.arena.get_unchecked(*left),
+                    self.arena.get_unchecked(*right)
+                ),
                 (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil))
             )
         } else {
             false
         }
     }
-    
+
     fn print_leaf(&mut self, val: OpaqueValue) {
         match val {
             OpaqueValue::Nil => self.output.push_str("NIL"),
@@ -186,7 +189,7 @@ impl<'a> Printer<'a> {
                         self.output.push(':');
                         self.output.push_str(&sym.name);
                     } else if self.options.package_prefix {
-                         if let Some(pkg_id) = sym.package {
+                        if let Some(pkg_id) = sym.package {
                             if let Some(pkg) = self.symbols.get_package(pkg_id) {
                                 if pkg.name != "CL-USER" && pkg.name != "COMMON-LISP" {
                                     self.output.push_str(&pkg.name);
@@ -196,7 +199,7 @@ impl<'a> Printer<'a> {
                         }
                         self.output.push_str(&sym.name);
                     } else {
-                         self.output.push_str(&sym.name);
+                        self.output.push_str(&sym.name);
                     }
                 } else {
                     self.output.push_str(&format!("#<symbol:{}>", id));
@@ -208,42 +211,52 @@ impl<'a> Printer<'a> {
             OpaqueValue::StreamHandle(id) => {
                 self.output.push_str(&format!("#<stream:{}>", id));
             }
+            OpaqueValue::Pid(pid) => {
+                self.output
+                    .push_str(&format!("#<{}.{}.{}>", pid.node, pid.id, pid.serial));
+            }
+            OpaqueValue::HashHandle(h) => {
+                self.output.push_str(&format!("#<hash-table:{}>", h));
+            }
+            OpaqueValue::Package(id) => {
+                self.output.push_str(&format!("#<package:{}>", id));
+            }
         }
     }
-    
+
     fn print_stem(&mut self, inner: NodeId) {
         // Handle legacy Stem(Leaf(Integer)) just in case or for internal use
         if let Node::Leaf(OpaqueValue::Integer(id)) = self.arena.get_unchecked(inner).clone() {
             self.output.push_str(&format!("#<stem-int:{}>", id));
             return;
         }
-        
+
         // Generic stem (K combinator)
         self.output.push_str("#<K ");
         self.print_node(inner);
         self.output.push('>');
     }
-    
+
     fn print_list(&mut self, node: NodeId) {
         self.output.push('(');
-        
+
         let mut current = node;
         let mut first = true;
         let mut count = 0;
-        
+
         loop {
             if count >= self.options.max_length {
                 self.output.push_str(" ...");
                 break;
             }
-            
+
             match self.arena.get_unchecked(current).clone() {
                 Node::Fork(car, cdr) => {
                     if !first {
                         self.output.push(' ');
                     }
                     first = false;
-                    
+
                     self.print_node(car);
                     current = cdr;
                     count += 1;
@@ -260,7 +273,7 @@ impl<'a> Printer<'a> {
                 }
             }
         }
-        
+
         self.output.push(')');
     }
 }
@@ -282,7 +295,7 @@ pub fn format(arena: &Arena, symbols: &SymbolTable, control: &str, args: &[NodeI
     let mut output = String::new();
     let mut chars = control.chars().peekable();
     let mut arg_idx = 0;
-    
+
     while let Some(c) = chars.next() {
         if c == '~' {
             match chars.next() {
@@ -334,7 +347,7 @@ pub fn format(arena: &Arena, symbols: &SymbolTable, control: &str, args: &[NodeI
             output.push(c);
         }
     }
-    
+
     output
 }
 
@@ -374,7 +387,9 @@ impl<'a> TreePrinter<'a> {
                     // Re-using Printer? We don't have easy access to symbols/options here.
                     // But we can just use a simple formatter.
                     match val {
-                        OpaqueValue::Symbol(id) => { self.output.push_str(&format!("sym:{}", id)); } // We don't have symbol table here easily?
+                        OpaqueValue::Symbol(id) => {
+                            self.output.push_str(&format!("sym:{}", id));
+                        } // We don't have symbol table here easily?
                         // Wait, tree_format signature is just (arena, node).
                         // If we want symbols, we need symbol table.
                         // Let's just print a generic placeholder or the raw value if simple.
@@ -412,78 +427,78 @@ mod tests {
     use super::*;
     use crate::arena::Arena;
     use crate::symbol::SymbolTable;
-    
+
     #[test]
     fn test_print_integer() {
         let mut arena = Arena::new();
         let symbols = SymbolTable::new();
         let node = arena.alloc(Node::Leaf(OpaqueValue::Integer(42)));
-        
+
         assert_eq!(print_to_string(&arena, &symbols, node), "42");
     }
-    
+
     #[test]
     fn test_print_float() {
         let mut arena = Arena::new();
         let symbols = SymbolTable::new();
         let node = arena.alloc(Node::Leaf(OpaqueValue::Float(3.14)));
-        
+
         let s = print_to_string(&arena, &symbols, node);
         assert!(s.starts_with("3.14"));
     }
-    
+
     #[test]
     fn test_print_nil() {
         let mut arena = Arena::new();
         let symbols = SymbolTable::new();
         let node = arena.alloc(Node::Leaf(OpaqueValue::Nil));
-        
+
         assert_eq!(print_to_string(&arena, &symbols, node), "NIL");
     }
-    
+
     #[test]
     fn test_print_list() {
         let mut arena = Arena::new();
         let symbols = SymbolTable::new();
-        
+
         let nil = arena.alloc(Node::Leaf(OpaqueValue::Nil));
         let a = arena.alloc(Node::Leaf(OpaqueValue::Integer(1)));
         let b = arena.alloc(Node::Leaf(OpaqueValue::Integer(2)));
         let c = arena.alloc(Node::Leaf(OpaqueValue::Integer(3)));
-        
+
         let list = arena.alloc(Node::Fork(c, nil));
         let list = arena.alloc(Node::Fork(b, list));
         let list = arena.alloc(Node::Fork(a, list));
-        
+
         assert_eq!(print_to_string(&arena, &symbols, list), "(1 2 3)");
     }
-    
+
     #[test]
     fn test_print_dotted_pair() {
         let mut arena = Arena::new();
         let symbols = SymbolTable::new();
-        
+
         let a = arena.alloc(Node::Leaf(OpaqueValue::Integer(1)));
         let b = arena.alloc(Node::Leaf(OpaqueValue::Integer(2)));
         let pair = arena.alloc(Node::Fork(a, b));
-        
+
         assert_eq!(print_to_string(&arena, &symbols, pair), "(1 . 2)");
     }
-    
+
     #[test]
     fn test_format_basic() {
         let arena = Arena::new();
         let symbols = SymbolTable::new();
-        
+
         let result = format(&arena, &symbols, "Hello~%World", &[]);
         assert_eq!(result, "Hello\nWorld");
     }
-    
+
     #[test]
     fn test_format_with_args() {
         let mut arena = Arena::new();
         let symbols = SymbolTable::new();
-        
+
         let num = arena.alloc(Node::Leaf(OpaqueValue::Integer(42)));
         let result = format(&arena, &symbols, "Value: ~D", &[num]);
         assert_eq!(result, "Value: 42");

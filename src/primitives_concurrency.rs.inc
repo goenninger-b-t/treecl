@@ -16,22 +16,21 @@ fn prim_send(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalCo
         return err_helper("SEND: Expected (pid message)");
     }
     // Extract PID
-    let pid_val = extract_number(&proc.arena.inner, args[0]);
-    let pid = match pid_val {
-        NumVal::Int(n) => crate::process::Pid(n as u32),
-        _ => return err_helper("SEND: Invalid PID"),
+    let pid = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Pid(pid)) => *pid,
+        _ => return err_helper("SEND: Target must be a PID"),
     };
     
     Err(ControlSignal::SysCall(SysCall::Send { target: pid, message: args[1] }))
 }
 
-fn prim_receive(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> EvalResult {
-    // TODO: Pattern matching support in args
-    Err(ControlSignal::SysCall(SysCall::Receive { pattern: None }))
+fn prim_receive(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {
+    let pattern = args.first().copied();
+    Err(ControlSignal::SysCall(SysCall::Receive { pattern }))
 }
 
 fn prim_self(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, _args: &[NodeId]) -> EvalResult {
-    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(proc.pid.0 as i64))))
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Pid(proc.pid))))
 }
 
 fn prim_sleep(proc: &mut crate::process::Process, _ctx: &crate::context::GlobalContext, args: &[NodeId]) -> EvalResult {

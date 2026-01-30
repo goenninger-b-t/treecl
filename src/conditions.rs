@@ -2,8 +2,8 @@
 //
 // Implements ANSI CL condition/handler/restart semantics.
 
-use crate::types::NodeId;
 use crate::symbol::SymbolId;
+use crate::types::NodeId;
 use std::collections::HashMap;
 
 /// A condition type (class-like, but simpler)
@@ -30,7 +30,7 @@ pub struct Handler {
 }
 
 /// A condition instance
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Condition {
     pub condition_type: ConditionType,
     pub slots: HashMap<SymbolId, NodeId>,
@@ -54,6 +54,8 @@ pub struct ConditionSystem {
     pub simple_warning_type: ConditionType,
     /// Type inheritance
     type_parents: HashMap<ConditionType, Vec<ConditionType>>,
+    /// Type names
+    type_names: HashMap<ConditionType, String>,
 }
 
 impl ConditionSystem {
@@ -69,50 +71,72 @@ impl ConditionSystem {
             simple_error_type: ConditionType(5),
             simple_warning_type: ConditionType(6),
             type_parents: HashMap::new(),
+            type_names: HashMap::new(),
         };
-        
+
+        // Register names
+        sys.type_names
+            .insert(ConditionType(0), "Condition".to_string());
+        sys.type_names
+            .insert(ConditionType(1), "Warning".to_string());
+        sys.type_names.insert(ConditionType(2), "Error".to_string());
+        sys.type_names
+            .insert(ConditionType(3), "Serious-Condition".to_string());
+        sys.type_names
+            .insert(ConditionType(4), "Simple-Condition".to_string());
+        sys.type_names
+            .insert(ConditionType(5), "Simple-Error".to_string());
+        sys.type_names
+            .insert(ConditionType(6), "Simple-Warning".to_string());
+
         // Set up type hierarchy
         // condition <- warning
-        sys.type_parents.insert(ConditionType(1), vec![ConditionType(0)]);
+        sys.type_parents
+            .insert(ConditionType(1), vec![ConditionType(0)]);
         // condition <- serious-condition <- error
-        sys.type_parents.insert(ConditionType(3), vec![ConditionType(0)]);
-        sys.type_parents.insert(ConditionType(2), vec![ConditionType(3)]);
+        sys.type_parents
+            .insert(ConditionType(3), vec![ConditionType(0)]);
+        sys.type_parents
+            .insert(ConditionType(2), vec![ConditionType(3)]);
         // simple-condition <- condition
-        sys.type_parents.insert(ConditionType(4), vec![ConditionType(0)]);
+        sys.type_parents
+            .insert(ConditionType(4), vec![ConditionType(0)]);
         // simple-error <- simple-condition, error
-        sys.type_parents.insert(ConditionType(5), vec![ConditionType(4), ConditionType(2)]);
+        sys.type_parents
+            .insert(ConditionType(5), vec![ConditionType(4), ConditionType(2)]);
         // simple-warning <- simple-condition, warning
-        sys.type_parents.insert(ConditionType(6), vec![ConditionType(4), ConditionType(1)]);
-        
+        sys.type_parents
+            .insert(ConditionType(6), vec![ConditionType(4), ConditionType(1)]);
+
         sys
     }
-    
+
     /// Push a new handler cluster
     pub fn push_handlers(&mut self, handlers: Vec<Handler>) {
         self.handler_stack.push(handlers);
     }
-    
+
     /// Pop a handler cluster
     pub fn pop_handlers(&mut self) {
         self.handler_stack.pop();
     }
-    
+
     /// Push a new restart cluster
     pub fn push_restarts(&mut self, restarts: Vec<Restart>) {
         self.restart_stack.push(restarts);
     }
-    
+
     /// Pop a restart cluster
     pub fn pop_restarts(&mut self) {
         self.restart_stack.pop();
     }
-    
+
     /// Check if condition type A is a subtype of B
     pub fn subtypep(&self, a: ConditionType, b: ConditionType) -> bool {
         if a == b {
             return true;
         }
-        
+
         if let Some(parents) = self.type_parents.get(&a) {
             for &parent in parents {
                 if self.subtypep(parent, b) {
@@ -120,7 +144,7 @@ impl ConditionSystem {
                 }
             }
         }
-        
+
         false
     }
 
@@ -131,11 +155,11 @@ impl ConditionSystem {
     pub fn restart_stack(&self) -> &Vec<Vec<Restart>> {
         &self.restart_stack
     }
-    
+
     /// Find applicable handlers for a condition
     pub fn find_handlers(&self, condition: &Condition) -> Vec<&Handler> {
         let mut result = Vec::new();
-        
+
         // Search from innermost to outermost
         for cluster in self.handler_stack.iter().rev() {
             for handler in cluster {
@@ -144,23 +168,23 @@ impl ConditionSystem {
                 }
             }
         }
-        
+
         result
     }
-    
+
     /// Find all active restarts
     pub fn find_restarts(&self) -> Vec<&Restart> {
         let mut result = Vec::new();
-        
+
         for cluster in self.restart_stack.iter().rev() {
             for restart in cluster {
                 result.push(restart);
             }
         }
-        
+
         result
     }
-    
+
     /// Find a restart by name
     pub fn find_restart(&self, name: SymbolId) -> Option<&Restart> {
         for cluster in self.restart_stack.iter().rev() {
@@ -172,7 +196,7 @@ impl ConditionSystem {
         }
         None
     }
-    
+
     /// Make a simple condition
     pub fn make_condition(&self, typ: ConditionType) -> Condition {
         Condition {
@@ -182,7 +206,7 @@ impl ConditionSystem {
             format_arguments: Vec::new(),
         }
     }
-    
+
     /// Make a simple error with format string
     pub fn make_simple_error(&self, format: &str, args: Vec<NodeId>) -> Condition {
         Condition {
@@ -192,7 +216,7 @@ impl ConditionSystem {
             format_arguments: args,
         }
     }
-    
+
     /// Make a simple warning with format string
     pub fn make_simple_warning(&self, format: &str, args: Vec<NodeId>) -> Condition {
         Condition {
@@ -201,6 +225,33 @@ impl ConditionSystem {
             format_control: Some(format.to_string()),
             format_arguments: args,
         }
+    }
+    /// Get GC roots (functions in handlers and restarts)
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        for cluster in &self.handler_stack {
+            for handler in cluster {
+                roots.push(handler.function);
+            }
+        }
+
+        for cluster in &self.restart_stack {
+            for restart in cluster {
+                roots.push(restart.function);
+                if let Some(node) = restart.interactive {
+                    roots.push(node);
+                }
+                if let Some(node) = restart.test {
+                    roots.push(node);
+                }
+            }
+        }
+        roots
+    }
+
+    /// Get name of condition type
+    pub fn get_type_name(&self, type_id: ConditionType) -> Option<&String> {
+        self.type_names.get(&type_id)
     }
 }
 
@@ -213,51 +264,49 @@ impl Default for ConditionSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_condition_type_hierarchy() {
         let sys = ConditionSystem::new();
-        
+
         // Error is a subtype of serious-condition
         assert!(sys.subtypep(sys.error_type, sys.serious_condition_type));
-        
+
         // Error is a subtype of condition
         assert!(sys.subtypep(sys.error_type, sys.condition_type));
-        
+
         // Warning is a subtype of condition
         assert!(sys.subtypep(sys.warning_type, sys.condition_type));
-        
+
         // Error is not a subtype of warning
         assert!(!sys.subtypep(sys.error_type, sys.warning_type));
     }
-    
+
     #[test]
     fn test_handler_binding() {
         let mut sys = ConditionSystem::new();
-        
-        sys.push_handlers(vec![
-            Handler {
-                condition_type: sys.error_type,
-                function: NodeId(1),
-            },
-        ]);
-        
+
+        sys.push_handlers(vec![Handler {
+            condition_type: sys.error_type,
+            function: NodeId(1),
+        }]);
+
         let error = sys.make_condition(sys.error_type);
         let handlers = sys.find_handlers(&error);
-        
+
         assert_eq!(handlers.len(), 1);
         assert_eq!(handlers[0].function, NodeId(1));
-        
+
         sys.pop_handlers();
         assert!(sys.find_handlers(&error).is_empty());
     }
-    
+
     #[test]
     fn test_restart_binding() {
         let mut sys = ConditionSystem::new();
-        
+
         let restart_name = SymbolId(42);
-        
+
         sys.push_restarts(vec![Restart {
             name: restart_name,
             report: Some("Continue anyway".to_string()),
@@ -265,32 +314,32 @@ mod tests {
             test: None,
             function: NodeId(10),
         }]);
-        
+
         let restart = sys.find_restart(restart_name);
         assert!(restart.is_some());
         assert_eq!(restart.unwrap().function, NodeId(10));
-        
+
         sys.pop_restarts();
         assert!(sys.find_restart(restart_name).is_none());
     }
-    
+
     #[test]
     fn test_nested_handlers() {
         let mut sys = ConditionSystem::new();
-        
+
         sys.push_handlers(vec![Handler {
             condition_type: sys.condition_type,
             function: NodeId(1),
         }]);
-        
+
         sys.push_handlers(vec![Handler {
             condition_type: sys.error_type,
             function: NodeId(2),
         }]);
-        
+
         let error = sys.make_condition(sys.error_type);
         let handlers = sys.find_handlers(&error);
-        
+
         // Should find both handlers (error is subtype of condition)
         // Inner handler should come first
         assert_eq!(handlers.len(), 2);

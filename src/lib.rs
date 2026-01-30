@@ -1,26 +1,30 @@
 // TreeCL: Embedded ANSI Common Lisp Runtime
 // This module provides a minimal lib.rs that only exports TreeCL modules.
 // Legacy triage-rs modules are disabled to avoid conflicts.
+extern crate num_bigint;
+extern crate num_traits;
 
-pub mod types;
 pub mod arena;
-pub mod search;
-pub mod symbol;
-pub mod eval;
-pub mod reader;
-pub mod printer;
-pub mod primitives;
+pub mod arrays;
 pub mod clos;
 pub mod conditions;
-pub mod arrays;
+pub mod eval;
+pub mod hashtables;
+pub mod primitives;
+pub mod printer;
+pub mod reader;
 pub mod readtable;
+pub mod search;
 pub mod streams;
+pub mod symbol;
+pub mod types;
 
 // Legacy modules disabled - they use incompatible Node structure
 // pub mod engine;
 // pub mod parser;
 pub mod compiler;
+pub mod context;
+pub mod mp;
 pub mod process;
 pub mod scheduler;
-pub mod context;
 pub mod syscall;

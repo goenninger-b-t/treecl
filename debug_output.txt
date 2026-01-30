@@ -1,0 +1,188 @@
+warning: unused import: `crate::symbol::PackageId`
+ --> src/mp.rs:5:5
+  |
+5 | use crate::symbol::PackageId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `node`
+   --> src/eval.rs:484:13
+    |
+484 |         let node = self.process.arena.get_unchecked(expr).clone();
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_node`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `result` is never read
+   --> src/eval.rs:504:26
+    |
+504 |         let mut result = Ok(self.process.make_nil()); // Default
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `tail`
+    --> src/eval.rs:1025:33
+     |
+1025 |         if let Node::Fork(head, tail) = node {
+     |                                 ^^^^ help: if this is intentional, prefix it with an underscore: `_tail`
+
+warning: variable does not need to be mutable
+    --> src/eval.rs:1363:17
+     |
+1363 |                 mut args,
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `func`
+    --> src/eval.rs:1394:35
+     |
+1394 |             Continuation::Apply { func, saved_env } => {
+     |                                   ^^^^ help: try ignoring the field: `func: _`
+
+warning: unused variable: `saved_env`
+    --> src/eval.rs:1394:41
+     |
+1394 |             Continuation::Apply { func, saved_env } => {
+     |                                         ^^^^^^^^^ help: try ignoring the field: `saved_env: _`
+
+warning: unused variable: `ctx`
+   --> src/primitives.rs:320:5
+    |
+320 |     ctx: &crate::context::GlobalContext,
+    |     ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: unused variable: `id`
+   --> src/primitives.rs:569:45
+    |
+569 |             Node::Leaf(OpaqueValue::Package(id)) => {
+    |                                             ^^ help: if this is intentional, prefix it with an underscore: `_id`
+
+warning: unused variable: `func`
+   --> src/scheduler.rs:130:74
+    |
+130 | ...e::context::GlobalContext, func: NodeId) -> Pid {
+    |                               ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `worker_idx`
+   --> src/scheduler.rs:167:5
+    |
+167 |     worker_idx: usize,
+    |     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_worker_idx`
+
+warning: unused variable: `pat`
+   --> src/scheduler.rs:370:44
+    |
+370 |                     if let Status::Waiting(pat) = target_proc.status {
+    |                                            ^^^ help: if this is intentional, prefix it with an underscore: `_pat`
+
+warning: method `resume_process` is never used
+   --> src/scheduler.rs:151:8
+    |
+119 | impl SchedulerHandle {
+    | -------------------- method in this implementation
+...
+151 |     fn resume_process(&self, pid: Pid, mut proc: Process, result: NodeId) {
+    |        ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `treecl` (lib) generated 13 warnings (run `cargo fix --lib -p treecl` to apply 11 suggestions)
+warning: variable does not need to be mutable
+   --> src/main.rs:346:25
+    |
+346 |                     let mut proc = proc_ref.lock().unwrap();
+    |                         ----^^^^
+    |                         |
+    |                         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `hist_2` is assigned to, but never used
+   --> src/main.rs:247:9
+    |
+247 |     let mut hist_2: Option<treecl::types::NodeId> = None;
+    |         ^^^^^^^^^^
+    |
+    = note: consider using `_hist_2` instead
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `hist_2` is never read
+   --> src/main.rs:293:29
+    |
+293 | ...                   hist_2 = Some(nil);
+    |                       ^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `treecl` (bin "treecl") generated 3 warnings (run `cargo fix --bin "treecl" -p treecl` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running `target/debug/treecl tests/setf_debug.lisp`
+TreeCL v0.2.0 - DEBUG BUILD - ANSI Common Lisp on Tree Calculus
+Type (quit) or Ctrl-D to exit
+
+DEBUG: Creating NEW symbol PROGN. ID: SymbolId(2). Package: PackageId(1)
+DEBUG: step_application op=NodeId(1) args=NodeId(29)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(31) args=NodeId(60)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(62) args=NodeId(149)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(151) args=NodeId(210)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(212) args=NodeId(239)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(241) args=NodeId(288)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(290) args=NodeId(307)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(309) args=NodeId(357)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(359) args=NodeId(431)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(433) args=NodeId(760)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(762) args=NodeId(993)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(995) args=NodeId(1182)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1184) args=NodeId(1215)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1217) args=NodeId(1274)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1276) args=NodeId(1312)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1314) args=NodeId(1350)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1352) args=NodeId(1395)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1397) args=NodeId(1541)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1543) args=NodeId(1685)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1687) args=NodeId(1704)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1706) args=NodeId(1765)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1767) args=NodeId(1799)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1801) args=NodeId(1851)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+INFO: Starting scheduler with 16 threads
+DEBUG: step_application op=NodeId(2028) args=NodeId(2035)
+DEBUG: node_to_symbol(op) = SymbolId(2). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(1976) args=NodeId(1980)
+DEBUG: node_to_symbol(op) = SymbolId(81). sf.progn=SymbolId(2)
+Test macro returning progn
+DEBUG: step_application op=NodeId(1982) args=NodeId(1998)
+DEBUG: node_to_symbol(op) = SymbolId(18). sf.progn=SymbolId(2)
+DEBUG: step_application op=NodeId(2000) args=NodeId(1975)
+DEBUG: node_to_symbol(op) = SymbolId(231). sf.progn=SymbolId(2)
+DEBUG: PROGN error in step(). SymId: SymbolId(2), sf.progn: SymbolId(2), name: PROGN
+Execution Failed: Variable 'PROGN' is not bound

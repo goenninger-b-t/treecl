@@ -382,6 +382,29 @@ impl MetaObjectProtocol {
         }
         std::cmp::Ordering::Equal
     }
+    /// Get GC roots
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        // Trace Classes (initforms in slot definitions)
+        for class in &self.classes {
+            for slot in &class.slots {
+                if let Some(initform) = slot.initform {
+                    roots.push(initform);
+                }
+            }
+        }
+        
+        // Trace Methods (bodies)
+        for method in &self.methods {
+            roots.push(method.body);
+        }
+        
+        // Trace Instances (slot values) - REMOVED
+        // Instances are not roots; they are reachable via handles in the graph.
+        // If we marked them here, they would never be collected.
+        
+        roots
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,0 @@
-(def test (n n))
-(first (cons test n))
-(+ 1 1)
-(def list (cons 1 (cons 2 n)))
-(first list)
-(first (rest list))
-(emptyList? list)
-:q
