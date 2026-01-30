@@ -442,6 +442,7 @@ fn main() -> io::Result<()> {
                         println!("\n*** Debugger Entered ***");
 
                         let proc = proc_ref.lock().unwrap();
+                        println!("Processing Error in Process {:?}", proc.pid);
                         let type_name = if proc
                             .conditions
                             .subtypep(cond.condition_type, proc.conditions.error_type)
