@@ -1168,7 +1168,23 @@ impl<'a> Interpreter<'a> {
         // But `init.lisp` might use it.
         // Let's handle Symbol case (return symbol) and Lambda case (create closure).
 
-        if let Some(_) = self.node_to_symbol(target) {
+        if let Some(sym) = self.node_to_symbol(target) {
+            // If it is a known function (lexical or global generic/closure), resolve it!
+            // First check lexical env (flet/labels)
+            if let Some(func_node) = _env.lookup_function(sym) {
+                self.process.program = func_node;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+            // Then check global functions (defun/defgeneric)
+            // Note: primitives are not stored in global functions map usually.
+            // If function is not found, return symbol (for primitives via try_reduce_primitive fallback)
+            if let Some(func_node) = self.process.get_function(sym) {
+                self.process.program = func_node;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+            // Fallback: Return Symbol (Designator)
             self.process.program = target;
             self.process.execution_mode = crate::process::ExecutionMode::Return;
             return Ok(true);
@@ -2284,6 +2300,11 @@ impl<'a> Interpreter<'a> {
         // Evaluate operator
         let op_val = self.eval(op, env)?;
 
+        eprintln!(
+            "DEBUG: eval_application op_val node={:?}",
+            self.process.arena.inner.get_unchecked(op_val)
+        );
+
         // Apply
         self.apply_function(op_val, args, env)
     }
@@ -2302,6 +2323,26 @@ impl<'a> Interpreter<'a> {
             .compute_applicable_methods(gid, &arg_classes);
 
         if methods.is_empty() {
+            eprintln!("DEBUG: apply_generic failed. GID={:?}", gid);
+            eprintln!("DEBUG: args: {:?}", args);
+            eprintln!("DEBUG: arg_classes: {:?}", arg_classes);
+            if let Some(gf) = self.process.mop.get_generic(gid) {
+                eprintln!(
+                    "DEBUG: GF Name: {:?}",
+                    self.process.mop.get_generic(gid).map(|g| g.name)
+                );
+                eprintln!("DEBUG: GF Methods: {:?}", gf.methods);
+                for &mid in &gf.methods {
+                    if let Some(m) = self.process.mop.get_method(mid) {
+                        eprintln!("DEBUG: Method {:?} specializers: {:?}", mid, m.specializers);
+                        // Check applicability manually to debug
+                        eprintln!(
+                            "DEBUG: Applicable? {}",
+                            self.process.mop.method_applicable(m, &arg_classes)
+                        );
+                    }
+                }
+            }
             return Err(ControlSignal::Error(format!(
                 "No applicable method for generic function {:?} with args {:?}",
                 gid, args
@@ -2324,6 +2365,10 @@ impl<'a> Interpreter<'a> {
 
         // Method body is expected to be a Closure NodeId
         let method_body_node = method.body;
+        eprintln!(
+            "DEBUG: applying method body node: {:?}",
+            self.process.arena.get_unchecked(method_body_node)
+        );
 
         // Check if method body is a closure
         let closure_idx = if let Node::Leaf(OpaqueValue::Closure(idx)) =
@@ -2363,7 +2408,13 @@ impl<'a> Interpreter<'a> {
                     self.process.mop.standard_object
                 }
             }
-            _ => self.process.mop.t_class, // Fallback for now (should handle primitive mapping)
+            Node::Leaf(OpaqueValue::Class(_)) => self.process.mop.standard_class,
+            Node::Leaf(OpaqueValue::Symbol(_)) => self.process.mop.symbol_class,
+            Node::Leaf(OpaqueValue::Integer(_)) => self.process.mop.integer_class,
+            _ => {
+                // eprintln!("DEBUG: get_arg_class fallback to T for {:?}", self.process.arena.get_unchecked(arg));
+                self.process.mop.t_class
+            }
         }
     }
 
@@ -2957,6 +3008,7 @@ impl<'a> Interpreter<'a> {
                 }
             }
             Node::Leaf(OpaqueValue::Generic(id)) => {
+                eprintln!("DEBUG: apply_function dispatching to Generic ID={}", id);
                 self.apply_generic(id, args, env)
                 // Ok(self.process.make_nil())
             }
@@ -2995,18 +3047,27 @@ impl<'a> Interpreter<'a> {
         let func_node = self.process.arena.get_unchecked(func).clone();
 
         match func_node {
-            Node::Leaf(OpaqueValue::Closure(idx)) => {
-                // Closure application
-                if let Some(closure) = self.process.closures.get(idx as usize).cloned() {
-                    self.apply_closure(&closure, args, env)
-                } else {
-                    Err(ControlSignal::Error(format!(
-                        "Invalid closure index: {}",
-                        idx
-                    )))
+            Node::Leaf(OpaqueValue::Closure(_)) | Node::Leaf(OpaqueValue::Generic(_)) => {
+                let mut arg_vec = Vec::new();
+                let mut curr = args;
+                while let Node::Fork(h, t) = self.process.arena.inner.get_unchecked(curr).clone() {
+                    arg_vec.push(h);
+                    curr = t;
+                }
+                self.step_apply(func, arg_vec, env.clone())?;
+
+                // Adapter loop
+                loop {
+                    match self.process.execution_mode {
+                        crate::process::ExecutionMode::Return => return Ok(self.process.program),
+                        crate::process::ExecutionMode::Eval => {
+                            if !self.step()? {
+                                // Paused
+                            }
+                        }
+                    }
                 }
             }
-            Node::Leaf(OpaqueValue::Generic(id)) => self.apply_generic(id, args, env),
             _ => {
                 // Fall back to tree calculus reduction (without evaluation of args)
                 use crate::search::reduce;
@@ -3358,70 +3419,42 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Apply a generic function
+    /// Apply a generic function
     fn apply_generic(&mut self, gf_id: u32, args: NodeId, env: &Environment) -> EvalResult {
-        use crate::clos::GenericId;
-
-        let gf_id = GenericId(gf_id);
-
-        // 1. Evaluate arguments to get classes
+        eprintln!("DEBUG: apply_generic called for ID={}", gf_id);
+        // 1. Evaluate arguments (Generic Function application expects evaluated args)
         let mut evaluated_args = Vec::new();
-        let mut executed_args = Vec::new(); // Values to pass to method
         let mut current = args;
         while let Node::Fork(arg, rest) = self.process.arena.inner.get_unchecked(current).clone() {
             let val = self.eval(arg, env)?;
-            executed_args.push(val);
-            evaluated_args.push(val); // In a real implementation, we might need these separate
+            evaluated_args.push(val);
             current = rest;
         }
 
-        // 2. Get classes of arguments
-        let mut arg_classes = Vec::new();
-        for &arg in &executed_args {
-            let class_id = self.class_of(arg);
-            arg_classes.push(class_id);
-        }
+        // 2. Delegate to apply_generic_function (TCO logic)
+        use crate::clos::GenericId;
+        self.apply_generic_function(GenericId(gf_id), evaluated_args, env)?;
 
-        // 3. Compute applicable methods
-        let applicable = self
-            .process
-            .mop
-            .compute_applicable_methods(gf_id, &arg_classes);
-
-        if applicable.is_empty() {
-            return Err(ControlSignal::Error(format!(
-                "No applicable method for generic function {:?} with args {:?}",
-                gf_id, arg_classes
-            )));
-        }
-
-        // 4. Call most specific method (primary only for now)
-        let method_id = applicable[0];
-        let method = self.process.mop.get_method(method_id).unwrap();
-        let method_body = method.body;
-
-        // Apply method closure
-        if let Node::Leaf(OpaqueValue::Closure(idx)) =
-            self.process.arena.inner.get_unchecked(method_body).clone()
-        {
-            if let Some(closure) = self.process.closures.get(idx as usize).cloned() {
-                // Manual binding
-                let mut method_env = Environment::with_parent(closure.env.clone());
-                if executed_args.len() != closure.lambda_list.req.len() {
-                    return Err(ControlSignal::Error(
-                        "Method argument count mismatch".to_string(),
-                    ));
+        // 3. Adapter: Run the interpreter loop until return (Simulate synchronous execution)
+        loop {
+            match self.process.execution_mode {
+                crate::process::ExecutionMode::Return => {
+                    eprintln!(
+                        "DEBUG: apply_generic returning program node: {:?}",
+                        self.process.arena.inner.get_unchecked(self.process.program)
+                    );
+                    return Ok(self.process.program);
                 }
-                for (param, val) in closure.lambda_list.req.iter().zip(executed_args.iter()) {
-                    self.bind_pattern(&mut method_env, *param, *val, false)?;
+                crate::process::ExecutionMode::Eval => {
+                    // Continue stepping
+                    if !self.step()? {
+                        // If step returns false (pause/interrupt), we might be in trouble here if we expect a result.
+                        // But for now assume it runs to completion.
+                        // Or wait?
+                    }
                 }
-                return self.eval_progn(closure.body, &method_env);
             }
         }
-
-        // Fallback
-        Err(ControlSignal::Error(
-            "Method body is not a valid closure".to_string(),
-        ))
     }
 
     /// Get class of value

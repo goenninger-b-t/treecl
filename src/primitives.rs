@@ -136,7 +136,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("FUNCALL", cl, prim_funcall);
     globals.register_primitive("EVAL", cl, prim_eval);
     globals.register_primitive("APPLY", cl, prim_apply);
-    globals.register_primitive("SYS-ALLOCATE-INSTANCE", cl, prim_allocate_instance);
+    globals.register_primitive("SYS-ALLOCATE-INSTANCE", cl, prim_sys_allocate_instance);
     globals.register_primitive("SYS-SHARED-INITIALIZE-PRIM", cl, prim_shared_initialize);
     globals.register_primitive("APROPOS", cl, prim_apropos);
 
@@ -2454,10 +2454,15 @@ fn prim_allocate_instance(
             // Create instance (all slots nil)
             let nil_val = proc.make_nil();
             if let Some(inst_idx) = proc.mop.make_instance(id, nil_val) {
-                return Ok(proc
+                let inst_node = proc
                     .arena
                     .inner
-                    .alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32))));
+                    .alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32)));
+                eprintln!(
+                    "DEBUG: prim_allocate_instance returning Instance idx={}",
+                    inst_idx
+                );
+                return Ok(inst_node);
             }
         }
     }
@@ -2472,6 +2477,10 @@ fn prim_shared_initialize(
     args: &[NodeId],
 ) -> EvalResult {
     // (shared-initialize instance slot-names &rest initargs)
+    eprintln!(
+        "DEBUG: prim_shared_initialize called with {} args",
+        args.len()
+    );
     if args.len() < 2 {
         return Err(crate::eval::ControlSignal::Error(
             "shared-initialize: too few args".into(),
@@ -2599,6 +2608,31 @@ fn prim_slot_value(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
+    eprintln!("DEBUG: prim_slot_value called with {} args", args.len());
+    if args.len() > 0 {
+        let node = proc.arena.inner.get_unchecked(args[0]);
+        eprintln!("DEBUG: prim_slot_value args[0] node={:?}", node);
+        match node {
+            Node::Fork(head, tail) => {
+                eprintln!(
+                    "DEBUG: prim_slot_value args[0] is List/Form. Head: {:?} Tail: {:?}",
+                    proc.arena.inner.get_unchecked(*head),
+                    proc.arena.inner.get_unchecked(*tail)
+                );
+                if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(*head) {
+                    let sym_name = ctx
+                        .symbols
+                        .read()
+                        .unwrap()
+                        .symbol_name(crate::symbol::SymbolId(*id))
+                        .unwrap_or("?")
+                        .to_string();
+                    eprintln!("DEBUG: Head is Symbol: {}", sym_name);
+                }
+            }
+            _ => {}
+        }
+    }
     let mut inst_idx = None;
     let mut slot_sym = None;
 
@@ -2945,6 +2979,50 @@ fn prim_ensure_generic_function(
     proc.set_function(name, gf_node);
 
     Ok(gf_node)
+}
+
+fn prim_sys_allocate_instance(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    eprintln!("DEBUG: prim_sys_allocate_instance called. Args: {:?}", args);
+    if args.is_empty() {
+        return Err(crate::eval::ControlSignal::Error(
+            "sys-allocate-instance requires class".to_string(),
+        ));
+    }
+
+    let class_node = proc.arena.inner.get_unchecked(args[0]);
+    let class_id = if let Node::Leaf(OpaqueValue::Class(id)) = class_node {
+        crate::clos::ClassId(*id)
+    } else if let Some(sym) = node_to_symbol(proc, args[0]) {
+        if let Some(id) = proc.mop.find_class(sym) {
+            id
+        } else {
+            return Err(crate::eval::ControlSignal::Error(format!(
+                "sys-allocate-instance: Unknown class symbol: {:?}",
+                class_node
+            )));
+        }
+    } else {
+        return Err(crate::eval::ControlSignal::Error(format!(
+            "sys-allocate-instance: Invalid argument (Expected Class or Symbol): {:?}",
+            class_node
+        )));
+    };
+
+    let nil = proc.make_nil();
+    if let Some(inst_idx) = proc.mop.make_instance(class_id, nil) {
+        Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32))))
+    } else {
+        Err(crate::eval::ControlSignal::Error(
+            "Failed to allocate instance".to_string(),
+        ))
+    }
 }
 
 fn prim_ensure_method(

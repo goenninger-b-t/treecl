@@ -276,9 +276,10 @@
 
 (defmacro defclass (name direct-superclasses direct-slots &rest options)
   ;; Simplified DEFCLASS: options ignored for now
-  `(ensure-class ',name 
-                 :direct-superclasses ',direct-superclasses 
-                 :direct-slots ',direct-slots))
+  (let ((supers (if (null direct-superclasses) '(standard-object) direct-superclasses)))
+    `(ensure-class ',name 
+                   :direct-superclasses ',supers 
+                   :direct-slots ',direct-slots)))
 
 (defmacro defgeneric (name lambda-list &rest options)
   `(ensure-generic-function ',name :lambda-list ',lambda-list))
@@ -294,13 +295,15 @@
   (if (null args)
       (list (nreverse clean-ll) (nreverse specs))
       (let ((arg (car args)))
-        (if (consp arg)
-            (parse-defmethod-lambda-list (cdr args) 
-                                         (cons (car arg) clean-ll) 
-                                         (cons (cadr arg) specs))
-            (parse-defmethod-lambda-list (cdr args) 
-                                         (cons arg clean-ll) 
-                                         (cons t specs))))))
+        (if (or (eq arg '&optional) (eq arg '&rest) (eq arg '&key) (eq arg '&aux))
+            (list (append (nreverse clean-ll) args) (nreverse specs))
+            (if (consp arg)
+                (parse-defmethod-lambda-list (cdr args) 
+                                             (cons (car arg) clean-ll) 
+                                             (cons (cadr arg) specs))
+                (parse-defmethod-lambda-list (cdr args) 
+                                             (cons arg clean-ll) 
+                                             (cons t specs)))))))
 
 (defmacro defmethod (name &rest args)
   (let ((parse-result (parse-defmethod-qualifiers args nil)))
@@ -350,4 +353,6 @@
 (print "Defining method make-instance (symbol)")
 (defmethod make-instance ((class symbol) &rest initargs)
   (apply #'make-instance (find-class class) initargs))
+
+(defclass point () (x y))
 

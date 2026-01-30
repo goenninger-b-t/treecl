@@ -62,17 +62,6 @@
 (defun nreverse (list)
   (reverse list))
 
-(defun member (item list)
-  (if (null list)
-      nil
-      (if (eql item (car list))
-          list
-          (member item (cdr list)))))
-
-(defun eql (x y)
-  (eq x y)) ;;; primitive eq handles everything for now? or need primitive eql
-
-
 (defun caar (x) (car (car x)))
 (defun cadr (x) (car (cdr x)))
 (defun cdar (x) (cdr (car x)))
@@ -302,21 +291,16 @@
       (list qualifiers args)))
 
 (defun parse-defmethod-lambda-list (args clean-ll specs)
-  (print (list "PARSE-LL" args))
   (if (null args)
       (list (nreverse clean-ll) (nreverse specs))
       (let ((arg (car args)))
-        (if (or (eq arg '&optional) (eq arg '&rest) (eq arg '&key) (eq arg '&aux))
-            (progn
-               (print (list "Found keyword" arg))
-               (list (append (nreverse clean-ll) args) (nreverse specs)))
-            (if (consp arg)
-                (parse-defmethod-lambda-list (cdr args) 
-                                             (cons (car arg) clean-ll) 
-                                             (cons (cadr arg) specs))
-                (parse-defmethod-lambda-list (cdr args) 
-                                             (cons arg clean-ll) 
-                                             (cons t specs)))))))
+        (if (consp arg)
+            (parse-defmethod-lambda-list (cdr args) 
+                                         (cons (car arg) clean-ll) 
+                                         (cons (cadr arg) specs))
+            (parse-defmethod-lambda-list (cdr args) 
+                                         (cons arg clean-ll) 
+                                         (cons t specs))))))
 
 (defmacro defmethod (name &rest args)
   (let ((parse-result (parse-defmethod-qualifiers args nil)))

@@ -87,6 +87,8 @@ pub struct MetaObjectProtocol {
     pub t_class: ClassId,
     pub standard_object: ClassId,
     pub standard_class: ClassId,
+    pub symbol_class: ClassId,
+    pub integer_class: ClassId,
     /// All generic functions
     generics: Vec<GenericFunction>,
     /// Generic name -> GenericId
@@ -121,6 +123,8 @@ impl MetaObjectProtocol {
             t_class: ClassId(0),
             standard_object: ClassId(1),
             standard_class: ClassId(2),
+            symbol_class: ClassId(3),
+            integer_class: ClassId(4),
             generics: Vec::new(),
             generic_names: HashMap::new(),
             methods: Vec::new(),
@@ -162,6 +166,28 @@ impl MetaObjectProtocol {
             instance_size: 0,
         });
         mop.class_names.insert(sc_name, ClassId(2));
+
+        // SYMBOL
+        let sym_name = symbols.intern_in("SYMBOL", cl);
+        mop.classes.push(Class {
+            name: sym_name,
+            supers: vec![ClassId(0)],
+            slots: Vec::new(),
+            cpl: vec![ClassId(3), ClassId(0)],
+            instance_size: 0,
+        });
+        mop.class_names.insert(sym_name, ClassId(3));
+
+        // INTEGER
+        let int_name = symbols.intern_in("INTEGER", cl);
+        mop.classes.push(Class {
+            name: int_name,
+            supers: vec![ClassId(0)],
+            slots: Vec::new(),
+            cpl: vec![ClassId(4), ClassId(0)],
+            instance_size: 0,
+        });
+        mop.class_names.insert(int_name, ClassId(4));
 
         mop
     }
@@ -454,7 +480,7 @@ impl MetaObjectProtocol {
         applicable
     }
 
-    fn method_applicable(&self, method: &Method, arg_classes: &[ClassId]) -> bool {
+    pub fn method_applicable(&self, method: &Method, arg_classes: &[ClassId]) -> bool {
         if method.specializers.len() > arg_classes.len() {
             return false;
         }
