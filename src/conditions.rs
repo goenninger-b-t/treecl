@@ -54,6 +54,8 @@ pub struct ConditionSystem {
     pub simple_warning_type: ConditionType,
     /// Type inheritance
     type_parents: HashMap<ConditionType, Vec<ConditionType>>,
+    /// Type names
+    type_names: HashMap<ConditionType, String>,
 }
 
 impl ConditionSystem {
@@ -69,7 +71,23 @@ impl ConditionSystem {
             simple_error_type: ConditionType(5),
             simple_warning_type: ConditionType(6),
             type_parents: HashMap::new(),
+            type_names: HashMap::new(),
         };
+
+        // Register names
+        sys.type_names
+            .insert(ConditionType(0), "Condition".to_string());
+        sys.type_names
+            .insert(ConditionType(1), "Warning".to_string());
+        sys.type_names.insert(ConditionType(2), "Error".to_string());
+        sys.type_names
+            .insert(ConditionType(3), "Serious-Condition".to_string());
+        sys.type_names
+            .insert(ConditionType(4), "Simple-Condition".to_string());
+        sys.type_names
+            .insert(ConditionType(5), "Simple-Error".to_string());
+        sys.type_names
+            .insert(ConditionType(6), "Simple-Warning".to_string());
 
         // Set up type hierarchy
         // condition <- warning
@@ -229,6 +247,11 @@ impl ConditionSystem {
             }
         }
         roots
+    }
+
+    /// Get name of condition type
+    pub fn get_type_name(&self, type_id: ConditionType) -> Option<&String> {
+        self.type_names.get(&type_id)
     }
 }
 

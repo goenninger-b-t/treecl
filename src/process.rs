@@ -4,11 +4,23 @@ use crate::types::{NodeId, OpaqueValue, SymbolId};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Process ID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pid {
     pub node: u32,
     pub id: u32,
     pub serial: u32,
+}
+
+impl std::fmt::Display for Pid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{},{},{}>", self.node, self.id, self.serial)
+    }
+}
+
+impl std::fmt::Debug for Pid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{},{},{}>", self.node, self.id, self.serial)
+    }
 }
 
 /// Process Priority

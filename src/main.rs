@@ -442,20 +442,13 @@ fn main() -> io::Result<()> {
                         println!("\n*** Debugger Entered ***");
 
                         let proc = proc_ref.lock().unwrap();
-                        println!("Processing Error in Process {:?}", proc.pid);
-                        let type_name = if proc
+                        let type_name = proc
                             .conditions
-                            .subtypep(cond.condition_type, proc.conditions.error_type)
-                        {
-                            "Error"
-                        } else if proc
-                            .conditions
-                            .subtypep(cond.condition_type, proc.conditions.warning_type)
-                        {
-                            "Warning"
-                        } else {
-                            "Condition"
-                        };
+                            .get_type_name(cond.condition_type)
+                            .map(|s| s.as_str())
+                            .unwrap_or("Condition");
+
+                        println!("Processing {} in Process {}", type_name, proc.pid);
 
                         if let Some(fmt) = &cond.format_control {
                             let symbols = globals.symbols.read().unwrap();
@@ -469,6 +462,7 @@ fn main() -> io::Result<()> {
                         } else {
                             println!("{}: {:?}", type_name, cond);
                         }
+
                         println!("Restarts:");
                         let restarts = proc.conditions.find_restarts();
                         for (i, r) in restarts.iter().enumerate() {
