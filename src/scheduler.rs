@@ -225,7 +225,9 @@ pub fn run_worker(
                             }
                         }
                         ExecutionResult::Blocked => {
-                            proc.status = Status::Waiting(None);
+                            if !matches!(proc.status, Status::Debugger(_)) {
+                                proc.status = Status::Waiting(None);
+                            }
                         }
                         ExecutionResult::SysCall(syscall) => {
                             // Handle SysCall

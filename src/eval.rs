@@ -106,6 +106,8 @@ pub enum ControlSignal {
     Throw { tag: NodeId, value: NodeId },
     /// Runtime error
     Error(String),
+    /// Uncaught Condition -> Debugger
+    Debugger(crate::conditions::Condition),
     /// System Call (Concurrency)
     SysCall(crate::syscall::SysCall),
 }
@@ -172,6 +174,10 @@ pub enum Continuation {
     // Actually, step_return_from evaluates the value.
     // Then the continuation receives the value and unwinds.
     ReturnFrom { target: SymbolId },
+    /// Return to Debugger
+    DebuggerRest {
+        condition: crate::conditions::Condition,
+    },
 }
 
 enum LambdaListMode {
@@ -451,7 +457,9 @@ impl<'a> Interpreter<'a> {
             }
         }
 
-        Err(ControlSignal::Error(format.to_string()))
+        // If no handler handled it (or no handlers found), break to debugger
+        self.process.status = crate::process::Status::Debugger(cond.clone());
+        Err(ControlSignal::Debugger(cond))
     }
 
     // Register primitive is now in GlobalContext, but this helper might wrap it?
@@ -1358,6 +1366,11 @@ impl<'a> Interpreter<'a> {
                         .saturating_sub(depth + 1);
                     self.process.continuation_stack.truncate(new_len);
 
+                    // Result is already in 'program' (passed as 'result' to apply_continuation?)
+                    // apply_continuation doesn't take 'result' arg, it assumes process.program holds result if returning?
+                    // Wait, apply_continuation is called when ExecutionMode::Return.
+                    // The 'result' is in process.program.
+
                     self.process.execution_mode = crate::process::ExecutionMode::Return;
                     Ok(true)
                 } else {
@@ -1365,6 +1378,10 @@ impl<'a> Interpreter<'a> {
                         "return-from: block not found"
                     )))
                 }
+            }
+            Continuation::DebuggerRest { condition } => {
+                self.process.status = crate::process::Status::Debugger(condition.clone());
+                Err(ControlSignal::Debugger(condition))
             }
             Continuation::Tagbody { mut rest, tag_map } => {
                 // Return from a form inside tagbody (result ignored)

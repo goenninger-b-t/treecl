@@ -27,7 +27,8 @@ pub enum Status {
     Waiting(Option<NodeId>), // Waiting for message (optional pattern)
     Sleeping(u64),           // Timer
     Terminated,
-    Failed(String), // Crash reason
+    Failed(String),                         // Crash reason
+    Debugger(crate::conditions::Condition), // Condition causing the break
 }
 
 /// Result of a time slice execution
@@ -457,11 +458,34 @@ impl Process {
                     }
                 }
                 Err(crate::eval::ControlSignal::Error(msg)) => {
-                    interpreter.process.status = Status::Failed(msg);
-                    return ExecutionResult::Terminated;
+                    match interpreter.signal_error(&msg) {
+                        Err(crate::eval::ControlSignal::Debugger(cond)) => {
+                            interpreter.process.status = Status::Debugger(cond);
+                            return ExecutionResult::Blocked;
+                        }
+                        Err(crate::eval::ControlSignal::Error(m)) => {
+                            interpreter.process.status = Status::Failed(m);
+                            return ExecutionResult::Terminated;
+                        }
+                        Ok(_) => {
+                            // Should not be reachable as signal_error currently always returns Err
+                            interpreter.process.status =
+                                Status::Failed(format!("Error handler declined: {}", msg));
+                            return ExecutionResult::Terminated;
+                        }
+                        Err(e) => {
+                            let m = format!("Unhandled signal from error handler: {:?}", e);
+                            interpreter.process.status = Status::Failed(m);
+                            return ExecutionResult::Terminated;
+                        }
+                    }
                 }
                 Err(crate::eval::ControlSignal::SysCall(sys)) => {
                     return ExecutionResult::SysCall(sys);
+                }
+                Err(crate::eval::ControlSignal::Debugger(cond)) => {
+                    interpreter.process.status = Status::Debugger(cond);
+                    return ExecutionResult::Blocked; // Or a specific result? Blocked works for now.
                 }
                 Err(e) => {
                     // Unhandled signal (Go, ReturnFrom, Throw) at top level

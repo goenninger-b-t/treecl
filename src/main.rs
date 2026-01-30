@@ -302,30 +302,102 @@ fn main() -> io::Result<()> {
                         let input_source = code_buffer.clone();
                         code_buffer.clear(); // Clear buffer for next command
 
-                        waiting_for_input = false; // We are now executing
-
-                        match treecl::reader::read_from_string(
-                            &input_source,
-                            &mut process.arena.inner,
-                            &mut *globals.symbols.write().unwrap(),
-                        ) {
-                            Ok(expr) => {
-                                // TCO Setup
-                                process.program = expr;
-                                process.execution_mode = treecl::process::ExecutionMode::Eval;
-                                process.continuation_stack.clear();
-                                process
-                                    .continuation_stack
-                                    .push(treecl::eval::Continuation::Done);
-                                process.current_env = Some(treecl::eval::Environment::new());
-                                process.reduction_count = 0;
-                                process.status = Status::Runnable;
-                                scheduler.schedule(repl_pid);
+                        // Check for Debug Commands
+                        let trimmed = input_source.trim();
+                        if trimmed == ":bt" {
+                            println!("Backtrace:");
+                            for (i, frame) in process.continuation_stack.iter().rev().enumerate() {
+                                println!("  {}: {:?}", i, frame);
                             }
-                            Err(e) => {
-                                eprintln!("Parse Error: {:?}", e);
-                                let _ = prompt_tx.send("CL-USER> ".to_string());
+                            let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                            waiting_for_input = true;
+                        } else if trimmed == ":q" {
+                            // Abort to top level
+                            process.status = Status::Terminated; // Or just reset?
+                            process.program = process.make_nil();
+                            process.continuation_stack.clear();
+
+                            // This will cause the polling loop to see 'Terminated' and reset to CL-USER
+                            waiting_for_input = false;
+                        } else if trimmed.starts_with(":r ") {
+                            if let Ok(idx) = trimmed[3..].trim().parse::<usize>() {
+                                let restarts = process.conditions.find_restarts();
+                                if idx < restarts.len() {
+                                    let r = restarts[idx].clone();
+                                    // Invoke restart function
+                                    // (func)
+                                    let func = r.function;
+                                    let args = process.make_nil(); // No args for simple restart invocation for now?
+                                                                   // Actually usually restarts might take args if interactive, but here we assume thunks
+
+                                    // Helper to make call: (func)
+                                    let bare_call = process
+                                        .arena
+                                        .inner
+                                        .alloc(treecl::arena::Node::Fork(func, args));
+                                    process.program = bare_call;
+
+                                    // If we are debugging, we want to return result to debugger?
+                                    // Or if restart handles it, we exit debugger.
+                                    // Let's assume restart handles it -> Exit debugger.
+                                    // We do NOT push DebuggerRest.
+
+                                    process.status = Status::Runnable;
+                                    waiting_for_input = false;
+                                    scheduler.schedule(repl_pid);
+                                } else {
+                                    println!("Invalid restart index");
+                                    let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                                    waiting_for_input = true;
+                                }
+                            } else {
+                                println!("Invalid restart format");
+                                let _ = prompt_tx.send("[DEBUG]> ".to_string());
                                 waiting_for_input = true;
+                            }
+                        } else {
+                            match treecl::reader::read_from_string(
+                                &input_source,
+                                &mut process.arena.inner,
+                                &mut *globals.symbols.write().unwrap(),
+                            ) {
+                                Ok(expr) => {
+                                    // TCO Setup
+                                    process.program = expr;
+                                    process.execution_mode = treecl::process::ExecutionMode::Eval;
+
+                                    // If in debugger, push DebuggerRest and preserve env
+                                    if let Status::Debugger(cond) = &process.status {
+                                        process.continuation_stack.push(
+                                            treecl::eval::Continuation::DebuggerRest {
+                                                condition: cond.clone(),
+                                            },
+                                        );
+                                        // Do not reset env! Use the one from the crash site.
+                                        if process.current_env.is_none() {
+                                            process.current_env =
+                                                Some(treecl::eval::Environment::new());
+                                        }
+                                    } else {
+                                        // Normal REPL: Reset stack and env
+                                        process.continuation_stack.clear();
+                                        process
+                                            .continuation_stack
+                                            .push(treecl::eval::Continuation::Done);
+                                        process.reduction_count = 0;
+                                        process.current_env =
+                                            Some(treecl::eval::Environment::new());
+                                    }
+
+                                    process.status = Status::Runnable;
+                                    scheduler.schedule(repl_pid);
+                                    waiting_for_input = false;
+                                }
+                                Err(e) => {
+                                    eprintln!("Parse Error: {:?}", e);
+                                    let _ = prompt_tx.send("CL-USER> ".to_string());
+                                    waiting_for_input = true;
+                                }
                             }
                         }
                     }
@@ -342,18 +414,88 @@ fn main() -> io::Result<()> {
             if let Some(proc_ref) = scheduler.registry.get(&repl_pid) {
                 let mut finished = false;
                 let mut result_node = None;
+                let mut debugger_state = None;
+
                 {
                     let mut proc = proc_ref.lock().unwrap();
-                    if proc.status == Status::Terminated {
-                        finished = true;
-                        result_node = Some(proc.program);
-                    } else if let Status::Failed(msg) = &proc.status {
-                        eprintln!("Error: {}", msg);
-                        finished = true;
+                    match &proc.status {
+                        Status::Terminated => {
+                            finished = true;
+                            result_node = Some(proc.program);
+                        }
+                        Status::Failed(msg) => {
+                            eprintln!("Error: {}", msg);
+                            finished = true;
+                        }
+                        Status::Debugger(cond) => {
+                            // Captured condition
+                            debugger_state = Some(cond.clone());
+                        }
+                        _ => {}
                     }
                 }
 
-                if finished {
+                if let Some(cond) = debugger_state {
+                    // We are in debugger.
+                    // If we just arrived (waiting_for_input was false), print info
+                    if !waiting_for_input {
+                        println!("\n*** Debugger Entered ***");
+
+                        let proc = proc_ref.lock().unwrap();
+                        let type_name = if proc
+                            .conditions
+                            .subtypep(cond.condition_type, proc.conditions.error_type)
+                        {
+                            "Error"
+                        } else if proc
+                            .conditions
+                            .subtypep(cond.condition_type, proc.conditions.warning_type)
+                        {
+                            "Warning"
+                        } else {
+                            "Condition"
+                        };
+
+                        if let Some(fmt) = &cond.format_control {
+                            let symbols = globals.symbols.read().unwrap();
+                            let msg = treecl::printer::format(
+                                &proc.arena.inner,
+                                &*symbols,
+                                fmt,
+                                &cond.format_arguments,
+                            );
+                            println!("{}: {}", type_name, msg);
+                        } else {
+                            println!("{}: {:?}", type_name, cond);
+                        }
+                        println!("Restarts:");
+                        let restarts = proc.conditions.find_restarts();
+                        for (i, r) in restarts.iter().enumerate() {
+                            let name = globals
+                                .symbols
+                                .read()
+                                .unwrap()
+                                .symbol_name(r.name)
+                                .unwrap_or("?")
+                                .to_string();
+                            println!("  {}: [{}] {}", i, name, r.report.as_deref().unwrap_or(""));
+                        }
+                        println!("\nDebug commands: :bt (backtrace), :r N (restart N), :q (abort)");
+                    } else {
+                        // We returned from a debug-eval step
+                        let proc = proc_ref.lock().unwrap();
+                        let s = print_to_string(
+                            &proc.arena.inner,
+                            &*globals.symbols.read().unwrap(),
+                            proc.program,
+                        );
+                        // Print result with "=> " to distinguish
+                        println!("=> {}", s);
+                    }
+
+                    let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                    waiting_for_input = true;
+                } else if finished {
                     if let Some(res) = result_node {
                         let proc_guard = proc_ref.lock().unwrap();
                         let s = print_to_string(
