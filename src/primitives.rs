@@ -2527,14 +2527,18 @@ fn prim_shared_initialize(
     )?;
 
     // Get slots
-    let slots_info: Vec<(usize, Option<crate::symbol::SymbolId>)> =
+    let slots_info: Vec<(usize, Option<crate::symbol::SymbolId>, Option<NodeId>)> =
         if let Some(slots) = proc.mop.get_class_slots(class_id.0) {
-            slots.iter().map(|s| (s.index, s.initarg)).collect()
+            slots
+                .iter()
+                .map(|s| (s.index, s.initarg, s.initform))
+                .collect()
         } else {
             Vec::new()
         };
 
-    for (idx, initarg) in slots_info {
+    for (idx, initarg, initform) in slots_info {
+        let mut initialized = false;
         if let Some(key) = initarg {
             if let Some(&val) = initargs_map.get(&key) {
                 eprintln!(
@@ -2542,6 +2546,7 @@ fn prim_shared_initialize(
                     idx, val, key
                 );
                 proc.mop.set_slot_value(inst_idx, idx, val);
+                initialized = true;
             } else {
                 eprintln!(
                     "DEBUG: initarg Key {:?} not found in initargs map for slot index {}",
@@ -2550,6 +2555,17 @@ fn prim_shared_initialize(
             }
         } else {
             eprintln!("DEBUG: slot index {} has no initarg", idx);
+        }
+
+        if !initialized {
+            if let Some(form) = initform {
+                // NOTE: We treat initform as a literal node for now.
+                proc.mop.set_slot_value(inst_idx, idx, form);
+                eprintln!(
+                    "DEBUG: setting slot index {} from initform {:?}",
+                    idx, form
+                );
+            }
         }
     }
 
@@ -2584,7 +2600,7 @@ fn prim_class_of(
     use crate::clos::ClassId;
     if let Some(&arg) = args.first() {
         let class_id = match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::Integer(_)) => ClassId(0), // T/Integer map not full yet
+            Node::Leaf(OpaqueValue::Integer(_)) => proc.mop.integer_class,
             Node::Leaf(OpaqueValue::Instance(idx)) => proc
                 .mop
                 .get_instance(*idx as usize)
@@ -2782,7 +2798,10 @@ fn parse_keywords_list(proc: &Process, args: &[NodeId]) -> HashMap<SymbolId, Nod
             break;
         }
         if let Some(key) = node_to_symbol(proc, args[i]) {
-            keywords.insert(key, args[i + 1]);
+            // ANSI: the leftmost occurrence wins.
+            if !keywords.contains_key(&key) {
+                keywords.insert(key, args[i + 1]);
+            }
         }
         i += 2;
     }

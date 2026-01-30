@@ -136,6 +136,7 @@ impl MetaObjectProtocol {
 
         // T class (root)
         let t_name = symbols.intern_in("T", cl);
+        symbols.export_symbol(t_name);
         mop.classes.push(Class {
             name: t_name,
             supers: Vec::new(),
@@ -147,6 +148,7 @@ impl MetaObjectProtocol {
 
         // STANDARD-OBJECT
         let so_name = symbols.intern_in("STANDARD-OBJECT", cl);
+        symbols.export_symbol(so_name);
         mop.classes.push(Class {
             name: so_name,
             supers: vec![ClassId(0)],
@@ -158,6 +160,7 @@ impl MetaObjectProtocol {
 
         // STANDARD-CLASS
         let sc_name = symbols.intern_in("STANDARD-CLASS", cl);
+        symbols.export_symbol(sc_name);
         mop.classes.push(Class {
             name: sc_name,
             supers: vec![ClassId(1)],
@@ -169,6 +172,7 @@ impl MetaObjectProtocol {
 
         // SYMBOL
         let sym_name = symbols.intern_in("SYMBOL", cl);
+        symbols.export_symbol(sym_name);
         mop.classes.push(Class {
             name: sym_name,
             supers: vec![ClassId(0)],
@@ -180,6 +184,7 @@ impl MetaObjectProtocol {
 
         // INTEGER
         let int_name = symbols.intern_in("INTEGER", cl);
+        symbols.export_symbol(int_name);
         mop.classes.push(Class {
             name: int_name,
             supers: vec![ClassId(0)],
@@ -219,6 +224,12 @@ impl MetaObjectProtocol {
             existing_id
         } else {
             ClassId(self.classes.len() as u32)
+        };
+
+        let supers = if supers.is_empty() {
+            vec![self.standard_object]
+        } else {
+            supers
         };
 
         // Compute CPL independent of mutation
@@ -295,11 +306,7 @@ impl MetaObjectProtocol {
         // For now, let's just create/overwrite.
         let class_def = Class {
             name,
-            supers: if supers.is_empty() {
-                vec![self.standard_object]
-            } else {
-                supers
-            },
+            supers,
             slots: effective_slots,
             cpl,
             instance_size,
@@ -504,26 +511,26 @@ impl MetaObjectProtocol {
         &self,
         ma: &Method,
         mb: &Method,
-        _arg_classes: &[ClassId],
+        arg_classes: &[ClassId],
     ) -> std::cmp::Ordering {
-        // Compare based on first specializer difference
-        for (sa, sb) in ma.specializers.iter().zip(mb.specializers.iter()) {
-            if sa != sb {
-                // More specific class = appears later in CPL
-                if let (Some(ca), Some(cb)) = (
-                    self.classes.get(sa.0 as usize),
-                    self.classes.get(sb.0 as usize),
-                ) {
-                    // If sa's class is in sb's CPL, sa is more specific
-                    if cb.cpl.contains(sa) {
-                        return std::cmp::Ordering::Less;
-                    }
-                    if ca.cpl.contains(sb) {
-                        return std::cmp::Ordering::Greater;
-                    }
-                }
+        // Compare based on argument class precedence lists (most specific first).
+        for (i, arg_class) in arg_classes.iter().enumerate() {
+            let cpl = match self.classes.get(arg_class.0 as usize) {
+                Some(c) => &c.cpl,
+                None => continue,
+            };
+
+            let sa = ma.specializers.get(i).copied().unwrap_or(self.t_class);
+            let sb = mb.specializers.get(i).copied().unwrap_or(self.t_class);
+
+            let posa = cpl.iter().position(|c| *c == sa).unwrap_or(usize::MAX);
+            let posb = cpl.iter().position(|c| *c == sb).unwrap_or(usize::MAX);
+
+            if posa != posb {
+                return posa.cmp(&posb);
             }
         }
+
         std::cmp::Ordering::Equal
     }
     /// Get GC roots
