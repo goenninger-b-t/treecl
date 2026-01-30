@@ -180,6 +180,9 @@ pub struct Process {
 
     /// Pending SysCall info (if stopped)
     pub pending_syscall: Option<crate::syscall::SysCall>,
+
+    /// Next Method States (CLOS call-next-method)
+    pub next_method_states: Vec<crate::clos::NextMethodState>,
 }
 
 impl Process {
@@ -227,6 +230,7 @@ impl Process {
             reduction_count: 0,
             pending_redex: None,
             pending_syscall: None,
+            next_method_states: Vec::new(),
         };
 
         // Create T and NIL in local arena
@@ -300,6 +304,13 @@ impl Process {
                 for root in closure.env.iter_roots() {
                     self.mark_node(root, &mut marked);
                 }
+            }
+        }
+
+        // Mark Next Method States
+        for state in &self.next_method_states {
+            for &arg in &state.args {
+                self.mark_node(arg, &mut marked);
             }
         }
 
@@ -391,7 +402,8 @@ impl Process {
             let val = crate::types::OpaqueValue::Closure(idx as u32);
             Some(self.arena.inner.alloc(crate::arena::Node::Leaf(val)))
         } else {
-            None
+            // Fallback to dictionary
+            self.dictionary.get(&sym).and_then(|b| b.function)
         }
     }
 

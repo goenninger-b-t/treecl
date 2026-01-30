@@ -370,6 +370,8 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Pid(pid) => format!("#<{}.{}.{}>", pid.node, pid.id, pid.serial),
             OpaqueValue::HashHandle(h) => format!("#<hash-table:{}>", h),
             OpaqueValue::Package(id) => format!("#<package:{}>", id),
+            OpaqueValue::NextMethod(id) => format!("#<next-method:{}>", id),
+            OpaqueValue::MethodWrapper(a, b) => format!("#<method-wrapper:{}:{}>", a, b),
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!(

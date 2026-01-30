@@ -14,7 +14,7 @@ use treecl::process::Status;
 use treecl::scheduler::Scheduler;
 use treecl::symbol::PackageId;
 
-const INIT_LISP: &str = include_str!("init.lisp");
+const INIT_LISP: &str = include_str!("init_new.lisp");
 
 fn main() -> io::Result<()> {
     println!("TreeCL v0.2.0 - DEBUG BUILD - ANSI Common Lisp on Tree Calculus");
@@ -175,6 +175,10 @@ fn main() -> io::Result<()> {
                     exit_code = 0;
                 } else if let Status::Failed(msg) = &proc.status {
                     eprintln!("Execution Failed: {}", msg);
+                    finished = true;
+                    exit_code = 1;
+                } else if let Status::Debugger(cond) = &proc.status {
+                    eprintln!("Execution entered Debugger (unhandled error): {:?}", cond);
                     finished = true;
                     exit_code = 1;
                 }

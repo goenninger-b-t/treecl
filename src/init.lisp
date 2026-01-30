@@ -48,6 +48,20 @@
           t
           (some pred (cdr list)))))
 
+(defun append (l1 l2)
+  (if (null l1)
+      l2
+      (cons (car l1) (append (cdr l1) l2))))
+
+(defun reverse (list)
+  (let ((result nil))
+    (dolist (x list)
+      (setq result (cons x result)))
+    result))
+
+(defun nreverse (list)
+  (reverse list))
+
 (defun caar (x) (car (car x)))
 (defun cadr (x) (car (cdr x)))
 (defun cdar (x) (cdr (car x)))
@@ -107,29 +121,29 @@
           (let ((,(car lambda-list) (cdr place))) 
              ,@body)))))
 
-(defmacro get-setf-expansion (place &optional environment)
+(defun get-setf-expansion (place &optional environment)
   (if (symbolp place)
       (let ((store (gensym "STORE")))
-        `(list nil nil (list ',store) (list 'setq ',place ',store) ',place))
+        (list nil nil (list store) (list 'setq place store) place))
       (if (consp place)
           (let ((op (car place))
                 (args (cdr place)))
             (let ((expander (get op 'setf-expander)))
               (if expander
-                  `(funcall ,expander ',place ,environment)
+                  (funcall expander place environment)
                   (let ((expansion-result (macroexpand-1 place environment)))
                     (let ((expansion (car expansion-result))
                           (expanded-p (cadr expansion-result)))
                        (if expanded-p
-                           `(get-setf-expansion ,expansion ,environment)
+                           (get-setf-expansion expansion environment)
                            (let ((temps (mapcar (lambda (x) (gensym)) args))
                                  (store (gensym "STORE")))
-                             `(list ',temps
-                                    (list ,@args)
-                                    (list ',store)
-                                    (list 'funcall (function (setf ,op)) ',store ,@temps)
-                                    (list ',op ,@temps)))))))))
-           `(error "Invalid place"))))
+                             (list temps
+                                    args
+                                    (list store)
+                                    (append (list 'funcall (list 'function (list 'setf op)) store) temps)
+                                    (cons op temps))))))))) 
+           (error "Invalid place"))))
 
 (defmacro defsetf (access-fn &rest rest)
   (if (symbolp (car rest))
@@ -188,11 +202,11 @@
 (defmacro decf (place &optional (delta 1))
   `(setf ,place (- ,place ,delta)))
 
-;; (defsetf car rplaca)
-;; (defsetf cdr rplacd)
+(defsetf car rplaca)
+(defsetf cdr rplacd)
 ;; (defsetf aref set-aref)
-;; (defsetf slot-value set-slot-value)
-;; (defsetf symbol-value set)
+(defsetf slot-value set-slot-value)
+(defsetf symbol-value set)
 ;; (defsetf symbol-function (sym) (store)
 ;;   `(set-symbol-function ,sym ,store))
 ;; (defsetf get (sym indicator &optional default) (store)
@@ -256,4 +270,86 @@
         (progn ,@body)
         ,val)))
 
+
+
+;;; CLOS Macros
+
+(defmacro defclass (name direct-superclasses direct-slots &rest options)
+  ;; Simplified DEFCLASS: options ignored for now
+  `(ensure-class ',name 
+                 :direct-superclasses ',direct-superclasses 
+                 :direct-slots ',direct-slots))
+
+(defmacro defgeneric (name lambda-list &rest options)
+  `(ensure-generic-function ',name :lambda-list ',lambda-list))
+
+(defun parse-defmethod-qualifiers (args qualifiers)
+  (if (and (consp args) (symbolp (car args)) (not (null (car args))))
+      (if (listp (car args))
+          (list qualifiers args) ; Done, return (qualifiers rest)
+          (parse-defmethod-qualifiers (cdr args) (cons (car args) qualifiers)))
+      (list qualifiers args)))
+
+(defun parse-defmethod-lambda-list (args clean-ll specs)
+  (if (null args)
+      (list (nreverse clean-ll) (nreverse specs))
+      (let ((arg (car args)))
+        (if (consp arg)
+            (parse-defmethod-lambda-list (cdr args) 
+                                         (cons (car arg) clean-ll) 
+                                         (cons (cadr arg) specs))
+            (parse-defmethod-lambda-list (cdr args) 
+                                         (cons arg clean-ll) 
+                                         (cons t specs))))))
+
+(defmacro defmethod (name &rest args)
+  (let ((parse-result (parse-defmethod-qualifiers args nil)))
+    (let ((qualifiers (nreverse (car parse-result)))
+          (rest (cadr parse-result)))
+    
+    (let ((ll (car rest)))
+      (setq body (cdr rest))
+      ;; Parse lambda list to extract specializers
+      (let ((ll-result (parse-defmethod-lambda-list ll nil nil)))
+        (let ((clean-ll (car ll-result))
+              (specs (cadr ll-result)))
+        
+        (let ((expansion `(ensure-method ',name 
+                        :lambda-list ',clean-ll 
+                        :qualifiers ',qualifiers 
+                        :specializers ',specs 
+                        :body (function (lambda ,clean-ll ,@body)))))
+          (print expansion)
+          expansion))))))
+
+(print "Defining allocate-instance generic")
+(defgeneric allocate-instance (class &rest initargs))
+(print "Defining initialize-instance generic")
+(defgeneric initialize-instance (instance &rest initargs))
+(print "Defining shared-initialize generic")
+(defgeneric shared-initialize (instance slot-names &rest initargs))
+(print "Defining make-instance generic")
+(defgeneric make-instance (class &rest initargs))
+
+(print "Defining method allocate-instance")
+(defmethod allocate-instance ((class standard-class) &rest initargs)
+  (sys-allocate-instance class))
+
+(print "Defining method initialize-instance")
+(defmethod initialize-instance ((instance standard-object) &rest initargs)
+  (apply #'shared-initialize instance t initargs))
+
+(print "Defining method shared-initialize")
+(defmethod shared-initialize ((instance standard-object) slot-names &rest initargs)
+  (apply #'sys-shared-initialize-prim instance slot-names initargs))
+
+(print "Defining method make-instance (standard-class)")
+(defmethod make-instance ((class standard-class) &rest initargs)
+  (let ((instance (apply #'allocate-instance class initargs)))
+    (apply #'initialize-instance instance initargs)
+    instance))
+
+(print "Defining method make-instance (symbol)")
+(defmethod make-instance ((class symbol) &rest initargs)
+  (apply #'make-instance (find-class class) initargs))
 
