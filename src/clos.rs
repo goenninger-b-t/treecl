@@ -72,6 +72,22 @@ pub enum MethodCombination {
         operator: SymbolId,
         identity_with_one_arg: bool,
     },
+    UserLong {
+        name: SymbolId,
+        expander: NodeId,
+        options: NodeId,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum MethodCombinationDef {
+    Operator {
+        operator: SymbolId,
+        identity_with_one_arg: bool,
+    },
+    Long {
+        expander: NodeId,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WrapperKind {
@@ -114,6 +130,8 @@ pub struct MetaObjectProtocol {
     /// Cached wrapper methods for standard method combination
     before_wrappers: HashMap<MethodId, MethodId>,
     after_wrappers: HashMap<MethodId, MethodId>,
+    /// Registered method combinations
+    method_combinations: HashMap<SymbolId, MethodCombinationDef>,
     /// All instances
     instances: Vec<Instance>,
 }
@@ -149,6 +167,7 @@ impl MetaObjectProtocol {
             methods: Vec::new(),
             before_wrappers: HashMap::new(),
             after_wrappers: HashMap::new(),
+            method_combinations: HashMap::new(),
             instances: Vec::new(),
         };
 
@@ -367,27 +386,17 @@ impl MetaObjectProtocol {
             .instances
             .get(instance_idx)
             .and_then(|inst| inst.slots.get(slot_idx).copied());
-        eprintln!(
-            "DEBUG: slot_value inst={} slot={} -> {:?}",
-            instance_idx, slot_idx, val
-        );
         val
     }
 
     /// Set slot value
     pub fn set_slot_value(&mut self, instance_idx: usize, slot_idx: usize, value: NodeId) {
-        eprintln!(
-            "DEBUG: set_slot_value inst={} slot={} val={:?}",
-            instance_idx, slot_idx, value
-        );
         if let Some(inst) = self.instances.get_mut(instance_idx) {
             if slot_idx < inst.slots.len() {
                 inst.slots[slot_idx] = value;
             } else {
-                eprintln!("DEBUG: set_slot_value OOB! len={}", inst.slots.len());
             }
         } else {
-            eprintln!("DEBUG: set_slot_value Instance not found!");
         }
     }
 
@@ -434,6 +443,18 @@ impl MetaObjectProtocol {
         }
     }
 
+    pub fn register_method_combination(
+        &mut self,
+        name: SymbolId,
+        def: MethodCombinationDef,
+    ) {
+        self.method_combinations.insert(name, def);
+    }
+
+    pub fn get_method_combination(&self, name: SymbolId) -> Option<&MethodCombinationDef> {
+        self.method_combinations.get(&name)
+    }
+
     /// Add a method to a generic function
     pub fn add_method(
         &mut self,
@@ -476,6 +497,10 @@ impl MetaObjectProtocol {
     /// Get method by ID
     pub fn get_method(&self, id: MethodId) -> Option<&Method> {
         self.methods.get(id.0 as usize)
+    }
+
+    pub fn get_method_qualifiers(&self, id: MethodId) -> Option<&[SymbolId]> {
+        self.methods.get(id.0 as usize).map(|m| m.qualifiers.as_slice())
     }
 
     pub fn get_wrapper(&self, kind: WrapperKind, id: MethodId) -> Option<MethodId> {
@@ -598,6 +623,21 @@ impl MetaObjectProtocol {
         // Trace Methods (bodies)
         for method in &self.methods {
             roots.push(method.body);
+        }
+
+        // Trace registered method combination expanders
+        for def in self.method_combinations.values() {
+            if let MethodCombinationDef::Long { expander } = def {
+                roots.push(*expander);
+            }
+        }
+
+        // Trace method combination options/expanders stored on generics
+        for gf in &self.generics {
+            if let MethodCombination::UserLong { expander, options, .. } = gf.method_combination {
+                roots.push(expander);
+                roots.push(options);
+            }
         }
 
         // Trace Instances (slot values) - REMOVED

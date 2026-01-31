@@ -110,6 +110,13 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("ENSURE-CLASS", cl, prim_ensure_class);
     globals.register_primitive("ENSURE-GENERIC-FUNCTION", cl, prim_ensure_generic_function);
     globals.register_primitive("ENSURE-METHOD", cl, prim_ensure_method);
+    globals.register_primitive(
+        "REGISTER-METHOD-COMBINATION",
+        cl,
+        prim_register_method_combination,
+    );
+    globals.register_primitive("METHOD-QUALIFIERS", cl, prim_method_qualifiers);
+    globals.register_primitive("SYS-MAKE-METHOD", cl, prim_sys_make_method);
 
     // Error handling
     globals.register_primitive("ERROR", cl, prim_error);
@@ -2458,10 +2465,6 @@ fn prim_allocate_instance(
                     .arena
                     .inner
                     .alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32)));
-                eprintln!(
-                    "DEBUG: prim_allocate_instance returning Instance idx={}",
-                    inst_idx
-                );
                 return Ok(inst_node);
             }
         }
@@ -2477,10 +2480,6 @@ fn prim_shared_initialize(
     args: &[NodeId],
 ) -> EvalResult {
     // (shared-initialize instance slot-names &rest initargs)
-    eprintln!(
-        "DEBUG: prim_shared_initialize called with {} args",
-        args.len()
-    );
     if args.len() < 2 {
         return Err(crate::eval::ControlSignal::Error(
             "shared-initialize: too few args".into(),
@@ -2509,19 +2508,6 @@ fn prim_shared_initialize(
     // So scan.
     let initargs_map = parse_keywords_list(proc, initargs);
 
-    // DEBUG: Print initargs map contents
-    eprintln!("DEBUG: prim_shared_initialize initargs map keys:");
-    for (k, v) in &initargs_map {
-        let name = ctx
-            .symbols
-            .read()
-            .unwrap()
-            .symbol_name(*k)
-            .unwrap_or("?")
-            .to_string();
-        eprintln!("  KEY: {:?} ({}) VAL: {:?}", k, name, v);
-    }
-
     let class_id = proc.mop.get_instance(inst_idx).map(|i| i.class).ok_or(
         crate::eval::ControlSignal::Error("Instance lost class?".into()),
     )?;
@@ -2541,30 +2527,15 @@ fn prim_shared_initialize(
         let mut initialized = false;
         if let Some(key) = initarg {
             if let Some(&val) = initargs_map.get(&key) {
-                eprintln!(
-                    "DEBUG: setting slot index {} with VAL {:?} (Matched Key {:?})",
-                    idx, val, key
-                );
                 proc.mop.set_slot_value(inst_idx, idx, val);
                 initialized = true;
-            } else {
-                eprintln!(
-                    "DEBUG: initarg Key {:?} not found in initargs map for slot index {}",
-                    key, idx
-                );
             }
-        } else {
-            eprintln!("DEBUG: slot index {} has no initarg", idx);
         }
 
         if !initialized {
             if let Some(form) = initform {
                 // NOTE: We treat initform as a literal node for now.
                 proc.mop.set_slot_value(inst_idx, idx, form);
-                eprintln!(
-                    "DEBUG: setting slot index {} from initform {:?}",
-                    idx, form
-                );
             }
         }
     }
@@ -2620,34 +2591,9 @@ fn prim_class_of(
 
 fn prim_slot_value(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    eprintln!("DEBUG: prim_slot_value called with {} args", args.len());
-    if args.len() > 0 {
-        let node = proc.arena.inner.get_unchecked(args[0]);
-        eprintln!("DEBUG: prim_slot_value args[0] node={:?}", node);
-        match node {
-            Node::Fork(head, tail) => {
-                eprintln!(
-                    "DEBUG: prim_slot_value args[0] is List/Form. Head: {:?} Tail: {:?}",
-                    proc.arena.inner.get_unchecked(*head),
-                    proc.arena.inner.get_unchecked(*tail)
-                );
-                if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(*head) {
-                    let sym_name = ctx
-                        .symbols
-                        .read()
-                        .unwrap()
-                        .symbol_name(crate::symbol::SymbolId(*id))
-                        .unwrap_or("?")
-                        .to_string();
-                    eprintln!("DEBUG: Head is Symbol: {}", sym_name);
-                }
-            }
-            _ => {}
-        }
-    }
     let mut inst_idx = None;
     let mut slot_sym = None;
 
@@ -2680,42 +2626,6 @@ fn prim_slot_value(
         }
     }
 
-    // Report debug info about failure
-    if let Some(idx) = inst_idx {
-        if let Some(inst) = proc.mop.get_instance(idx) {
-            if let Some(class) = proc.mop.get_class(inst.class) {
-                let s_name = slot_sym
-                    .and_then(|s| {
-                        ctx.symbols
-                            .read()
-                            .unwrap()
-                            .symbol_name(s)
-                            .map(|x| x.to_string())
-                    })
-                    .unwrap_or("?".to_string());
-                let c_name = ctx
-                    .symbols
-                    .read()
-                    .unwrap()
-                    .symbol_name(class.name)
-                    .unwrap_or("?")
-                    .to_string();
-
-                eprintln!("DEBUG: prim_slot_value failed. Slot '{:?}' not found in class '{}'. Available slots:", s_name, c_name);
-                for s in &class.slots {
-                    let sn = ctx
-                        .symbols
-                        .read()
-                        .unwrap()
-                        .symbol_name(s.name)
-                        .unwrap_or("?")
-                        .to_string();
-                    eprintln!("  - {}", sn);
-                }
-            }
-        }
-    }
-
     Err(crate::eval::ControlSignal::Error(
         "Invalid slot access".to_string(),
     ))
@@ -2726,7 +2636,6 @@ fn prim_set_slot_value(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    eprintln!("DEBUG: prim_set_slot_value args len={}", args.len());
     if args.len() >= 3 {
         let instance = args[0];
         let slot_name = args[1];
@@ -2738,18 +2647,11 @@ fn prim_set_slot_value(
         {
             Some(*idx as usize)
         } else {
-            eprintln!(
-                "DEBUG: arg[0] is not an instance: {:?}",
-                proc.arena.inner.get_unchecked(instance)
-            );
             None
         };
 
         // Extract slot name symbol
         let slot_sym = node_to_symbol(proc, slot_name);
-        if slot_sym.is_none() {
-            eprintln!("DEBUG: arg[1] is not a symbol");
-        }
 
         if let (Some(idx), Some(sym)) = (inst_idx, slot_sym) {
             // Find slot index in class
@@ -2759,18 +2661,8 @@ fn prim_set_slot_value(
                     if let Some(pos) = class.slots.iter().position(|s| s.name == sym) {
                         proc.mop.set_slot_value(idx, pos, new_val);
                         return Ok(new_val);
-                    } else {
-                        eprintln!("DEBUG: Slot {:?} not found in class {:?}", sym, class.name);
-                        eprintln!(
-                            "DEBUG: Available slots: {:?}",
-                            class.slots.iter().map(|s| s.name).collect::<Vec<_>>()
-                        );
                     }
-                } else {
-                    eprintln!("DEBUG: Class not found for instance");
                 }
-            } else {
-                eprintln!("DEBUG: Instance idx {} not found", idx);
             }
         }
     }
@@ -3026,9 +2918,11 @@ fn prim_ensure_generic_function(
 
     let gid = proc.mop.define_generic(name, lambda_list);
     if let Some(mc_node) = method_combination_node {
+        let mut comb_args = proc.make_nil();
         let comb_sym = if let Some(sym) = node_to_symbol(proc, mc_node) {
             Some(sym)
-        } else if let Node::Fork(head, _tail) = proc.arena.inner.get_unchecked(mc_node) {
+        } else if let Node::Fork(head, tail) = proc.arena.inner.get_unchecked(mc_node) {
+            comb_args = *tail;
             node_to_symbol(proc, *head)
         } else {
             None
@@ -3043,20 +2937,38 @@ fn prim_ensure_generic_function(
                 .unwrap_or("")
                 .to_string();
 
-            use crate::clos::MethodCombination;
-            let comb = match comb_name.as_str() {
-                "STANDARD" | "STANDARD-METHOD-COMBINATION" => MethodCombination::Standard,
-                "+" | "*" | "APPEND" | "LIST" | "MAX" | "MIN" | "NCONC" | "PROGN" | "AND"
-                | "OR" => MethodCombination::Operator {
-                    name: comb_sym,
-                    operator: comb_sym,
-                    identity_with_one_arg: matches!(comb_name.as_str(), "AND" | "OR" | "PROGN"),
-                },
-                _ => {
-                    return Err(crate::eval::ControlSignal::Error(format!(
-                        "Unsupported method-combination: {}",
-                        comb_name
-                    )));
+            use crate::clos::{MethodCombination, MethodCombinationDef};
+            let comb = if let Some(def) = proc.mop.get_method_combination(comb_sym) {
+                match def {
+                    MethodCombinationDef::Operator {
+                        operator,
+                        identity_with_one_arg,
+                    } => MethodCombination::Operator {
+                        name: comb_sym,
+                        operator: *operator,
+                        identity_with_one_arg: *identity_with_one_arg,
+                    },
+                    MethodCombinationDef::Long { expander } => MethodCombination::UserLong {
+                        name: comb_sym,
+                        expander: *expander,
+                        options: comb_args,
+                    },
+                }
+            } else {
+                match comb_name.as_str() {
+                    "STANDARD" | "STANDARD-METHOD-COMBINATION" => MethodCombination::Standard,
+                    "+" | "*" | "APPEND" | "LIST" | "MAX" | "MIN" | "NCONC" | "PROGN" | "AND"
+                    | "OR" => MethodCombination::Operator {
+                        name: comb_sym,
+                        operator: comb_sym,
+                        identity_with_one_arg: matches!(comb_name.as_str(), "AND" | "OR" | "PROGN"),
+                    },
+                    _ => {
+                        return Err(crate::eval::ControlSignal::Error(format!(
+                            "Unsupported method-combination: {}",
+                            comb_name
+                        )));
+                    }
                 }
             };
 
@@ -3079,7 +2991,6 @@ fn prim_sys_allocate_instance(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    eprintln!("DEBUG: prim_sys_allocate_instance called. Args: {:?}", args);
     if args.is_empty() {
         return Err(crate::eval::ControlSignal::Error(
             "sys-allocate-instance requires class".to_string(),
@@ -3195,10 +3106,171 @@ fn prim_ensure_method(
         }
     }
 
-    proc.mop.add_method(gf_id, specializers, qualifiers, body);
+    let method_id = proc.mop.add_method(gf_id, specializers, qualifiers, body);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Method(method_id.0))))
+}
 
-    // Return method object? For now, NIL.
-    Ok(proc.make_nil())
+fn prim_register_method_combination(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return Err(ControlSignal::Error(
+            "REGISTER-METHOD-COMBINATION requires name".to_string(),
+        ));
+    }
+
+    let name = node_to_symbol(proc, args[0]).ok_or(ControlSignal::Error(
+        "REGISTER-METHOD-COMBINATION name must be symbol".to_string(),
+    ))?;
+
+    let kwargs = parse_keywords_list(proc, &args[1..]);
+
+    let syms = ctx.symbols.read().unwrap();
+    let keyword_pkg = syms.get_package(crate::symbol::PackageId(0));
+    let kw_type = keyword_pkg.and_then(|p| p.find_external("TYPE"));
+    let kw_operator = keyword_pkg.and_then(|p| p.find_external("OPERATOR"));
+    let kw_identity = keyword_pkg.and_then(|p| p.find_external("IDENTITY-WITH-ONE-ARGUMENT"));
+    let kw_expander = keyword_pkg.and_then(|p| p.find_external("EXPANDER"));
+    drop(syms);
+
+    let type_name = kw_type
+        .and_then(|k| kwargs.get(&k))
+        .and_then(|node| node_to_symbol(proc, *node))
+        .and_then(|sym| {
+            ctx.symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "OPERATOR".to_string());
+
+    let has_expander = kw_expander.and_then(|k| kwargs.get(&k)).is_some();
+    let is_long = has_expander || matches!(type_name.as_str(), "LONG" | "LONG-FORM");
+
+    if is_long {
+        let expander_node = kw_expander
+            .and_then(|k| kwargs.get(&k))
+            .copied()
+            .ok_or(ControlSignal::Error(
+                "REGISTER-METHOD-COMBINATION long form requires :EXPANDER".to_string(),
+            ))?;
+
+        if let Node::Leaf(OpaqueValue::Closure(_)) = proc.arena.inner.get_unchecked(expander_node)
+        {
+            proc.mop.register_method_combination(
+                name,
+                crate::clos::MethodCombinationDef::Long {
+                    expander: expander_node,
+                },
+            );
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(name.0))));
+        }
+
+        return Err(ControlSignal::Error(
+            "REGISTER-METHOD-COMBINATION :EXPANDER must be a function".to_string(),
+        ));
+    }
+
+    let operator_sym = if let Some(k) = kw_operator {
+        if let Some(node) = kwargs.get(&k) {
+            node_to_symbol(proc, *node).ok_or(ControlSignal::Error(
+                "REGISTER-METHOD-COMBINATION :OPERATOR must be a symbol".to_string(),
+            ))?
+        } else {
+            name
+        }
+    } else {
+        name
+    };
+
+    let identity_with_one_arg = kw_identity
+        .and_then(|k| kwargs.get(&k))
+        .map(|node| !matches!(proc.arena.inner.get_unchecked(*node), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(false);
+
+    proc.mop.register_method_combination(
+        name,
+        crate::clos::MethodCombinationDef::Operator {
+            operator: operator_sym,
+            identity_with_one_arg,
+        },
+    );
+
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(name.0))))
+}
+
+fn prim_method_qualifiers(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "METHOD-QUALIFIERS requires one argument".to_string(),
+        ));
+    }
+
+    let method_id = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Method(id)) => crate::clos::MethodId(*id),
+        _ => {
+            return Err(ControlSignal::Error(
+                "METHOD-QUALIFIERS expects a method object".to_string(),
+            ))
+        }
+    };
+
+    let qualifiers = proc
+        .mop
+        .get_method_qualifiers(method_id)
+        .ok_or_else(|| ControlSignal::Error("Invalid method object".to_string()))?;
+
+    let mut nodes = Vec::with_capacity(qualifiers.len());
+    for &q in qualifiers {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(q.0))),
+        );
+    }
+
+    Ok(proc.make_list(&nodes))
+}
+
+fn prim_sys_make_method(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SYS-MAKE-METHOD requires one argument".to_string(),
+        ));
+    }
+
+    let body = args[0];
+    if let Node::Leaf(OpaqueValue::Closure(_)) = proc.arena.inner.get_unchecked(body) {
+        let method_id = proc.mop.add_method_raw(Vec::new(), Vec::new(), body);
+        return Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Method(method_id.0))));
+    }
+
+    Err(ControlSignal::Error(
+        "SYS-MAKE-METHOD requires a function".to_string(),
+    ))
 }
 
 fn prim_error(

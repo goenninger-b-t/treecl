@@ -17,7 +17,7 @@ use treecl::symbol::PackageId;
 const INIT_LISP: &str = include_str!("init_new.lisp");
 
 fn main() -> io::Result<()> {
-    println!("TreeCL v0.2.0 - DEBUG BUILD - ANSI Common Lisp on Tree Calculus");
+    println!("TreeCL v0.2.0 - ANSI Common Lisp on Tree Calculus");
     println!("Type (quit) or Ctrl-D to exit");
     println!();
 
@@ -26,6 +26,15 @@ fn main() -> io::Result<()> {
     register_primitives(&mut globals);
     // Register MP primitives
     treecl::mp::register_mp_primitives(&mut globals);
+
+    // Ensure core CLOS symbols are interned in COMMON-LISP before reading Lisp files.
+    {
+        let mut symbols_guard = globals.symbols.write().unwrap();
+        for name in ["CALL-METHOD", "CALL-NEXT-METHOD", "NEXT-METHOD-P"] {
+            let sym = symbols_guard.intern_in(name, PackageId(1));
+            symbols_guard.export_symbol(sym);
+        }
+    }
 
     // Intern REPL history variables
     let mut symbols_guard = globals.symbols.write().unwrap();
@@ -311,7 +320,7 @@ fn main() -> io::Result<()> {
                             for (i, frame) in process.continuation_stack.iter().rev().enumerate() {
                                 println!("  {}: {:?}", i, frame);
                             }
-                            let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                            let _ = prompt_tx.send("CL-USER> ".to_string());
                             waiting_for_input = true;
                         } else if trimmed == ":q" {
                             // Abort to top level
@@ -349,12 +358,12 @@ fn main() -> io::Result<()> {
                                     scheduler.schedule(repl_pid);
                                 } else {
                                     println!("Invalid restart index");
-                                    let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                                    let _ = prompt_tx.send("CL-USER> ".to_string());
                                     waiting_for_input = true;
                                 }
                             } else {
                                 println!("Invalid restart format");
-                                let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                                let _ = prompt_tx.send("CL-USER> ".to_string());
                                 waiting_for_input = true;
                             }
                         } else {
@@ -490,7 +499,7 @@ fn main() -> io::Result<()> {
                         println!("=> {}", s);
                     }
 
-                    let _ = prompt_tx.send("[DEBUG]> ".to_string());
+                    let _ = prompt_tx.send("CL-USER> ".to_string());
                     waiting_for_input = true;
                 } else if finished {
                     if let Some(res) = result_node {

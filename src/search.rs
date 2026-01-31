@@ -372,7 +372,9 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Package(id) => format!("#<package:{}>", id),
             OpaqueValue::NextMethod(id) => format!("#<next-method:{}>", id),
             OpaqueValue::NextMethodP(id) => format!("#<next-method-p:{}>", id),
+            OpaqueValue::CallMethod(id) => format!("#<call-method:{}>", id),
             OpaqueValue::MethodWrapper(a, b) => format!("#<method-wrapper:{}:{}>", a, b),
+            OpaqueValue::Method(id) => format!("#<method:{}>", id),
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!(

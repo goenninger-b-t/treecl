@@ -248,12 +248,6 @@ impl SymbolTable {
 
         // Create new symbol
         let sym_id = SymbolId(self.symbols.len() as u32);
-        if upper == "PROGN" {
-            println!(
-                "DEBUG: Creating NEW symbol PROGN. ID: {:?}. Package: {:?}",
-                sym_id, pkg_id
-            );
-        }
         let symbol = Symbol::new(upper.clone(), Some(pkg_id));
         self.symbols.push(symbol);
 
