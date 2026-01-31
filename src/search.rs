@@ -24,14 +24,58 @@ impl EvalContext {
 /// Perform reduction on the given root until normal form or step limit.
 ///
 /// Implements canonical Tree Calculus reduction rules:
-/// - △ △ y → y                    (leaf-leaf: identity/K behavior)
-/// - △ (△ x) y → x                (leaf-stem: K combinator)
-/// - △ (△ x z) y → ((x y) (z y))  (leaf-fork: S combinator)
+/// - △ △ y z → y                  (K rule)
+/// - △ (△ x) y z → y z (x z)      (S rule)
+/// - △ (△ w x) y z → z w x        (F rule)
 ///
 /// The key insight: △ is the sole operator. It pattern-matches on its first argument
-/// to decide which reduction rule applies. Reduction fires when △ has TWO arguments.
+/// to decide which reduction rule applies. Reduction fires when △ has THREE arguments.
+///
+/// This reducer is strict about Tree Calculus structure: only Nil leaves are valid.
+/// If any non-Nil leaf is present, no reduction is performed.
+fn is_delta(arena: &Arena, id: NodeId) -> bool {
+    matches!(arena.get_unchecked(id), Node::Leaf(OpaqueValue::Nil))
+}
+
+fn is_pure_tree(arena: &Arena, root: NodeId) -> bool {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match arena.get_unchecked(id) {
+            Node::Leaf(val) => {
+                if !matches!(val, OpaqueValue::Nil) {
+                    return false;
+                }
+            }
+            Node::Stem(child) => stack.push(*child),
+            Node::Fork(left, right) => {
+                stack.push(*left);
+                stack.push(*right);
+            }
+        }
+    }
+    true
+}
+
+fn split_delta1(arena: &Arena, id: NodeId) -> Option<NodeId> {
+    match arena.get_unchecked(id) {
+        Node::Stem(x) => Some(*x),
+        Node::Fork(op, x) if is_delta(arena, *op) => Some(*x),
+        _ => None,
+    }
+}
+
+fn split_delta2(arena: &Arena, id: NodeId) -> Option<(NodeId, NodeId)> {
+    match arena.get_unchecked(id) {
+        Node::Fork(left, y) => split_delta1(arena, *left).map(|x| (x, *y)),
+        _ => None,
+    }
+}
+
 pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId {
     let mut current = root;
+    if !is_pure_tree(arena, current) {
+        return current;
+    }
 
     loop {
         if ctx.steps >= ctx.max_steps {
@@ -39,75 +83,44 @@ pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId 
         }
 
         match arena.get_unchecked(current).clone() {
-            Node::Fork(left, y) => {
-                // We have an application (left y)
+            Node::Fork(left, z) => {
+                // We have an application (left z)
                 // Reduce left to WHNF first
                 let reduced_left = reduce_whnf(arena, left, ctx);
 
-                // Check if reduced_left is of form (△ x) = Fork(nil, x)
-                if let Node::Fork(op, x) = arena.get_unchecked(reduced_left).clone() {
-                    // Check if op is △ (nil)
-                    if let Node::Leaf(OpaqueValue::Nil) = arena.get_unchecked(op) {
-                        // We have ((△ x) y) - this is a redex!
-                        // Dispatch based on structure of x
-                        let reduced_x = reduce_whnf(arena, x, ctx);
+                // Check for △ applied to two args: (△ x) y
+                if let Some((x, y)) = split_delta2(arena, reduced_left) {
+                    // Dispatch based on structure of x
+                    let reduced_x = reduce_whnf(arena, x, ctx);
 
-                        match arena.get_unchecked(reduced_x).clone() {
-                            Node::Leaf(OpaqueValue::Nil) => {
-                                // △ △ y → y
-                                ctx.steps += 1;
-                                current = y;
-                                continue;
-                            }
-                            Node::Fork(a, b) => {
-                                // Check if this is (△ z) pattern for K, or (△ z w) for S
-                                if let Node::Leaf(OpaqueValue::Nil) = arena.get_unchecked(a) {
-                                    // x = (△ b), so we have △ (△ b) y → b (K combinator)
-                                    ctx.steps += 1;
-                                    current = b;
-                                    continue;
-                                } else {
-                                    // x = (a b) where a is not △
-                                    // This is the S pattern: △ (a b) y → ((a y) (b y))
-                                    // But wait - in canonical TC, first arg must be of form (△ z w)
-                                    // Let's check if this should be S: △ (△ z w) y → ((z y) (w y))
+                    if is_delta(arena, reduced_x) {
+                        // △ △ y z → y
+                        ctx.steps += 1;
+                        current = y;
+                        continue;
+                    }
 
-                                    // x = Fork(a, b), we need a to be (△ z) = Fork(nil, z)
-                                    if let Node::Fork(a_op, z) = arena.get_unchecked(a).clone() {
-                                        if let Node::Leaf(OpaqueValue::Nil) =
-                                            arena.get_unchecked(a_op)
-                                        {
-                                            // a = (△ z), so x = ((△ z) b) = (△ z b) in syntax
-                                            // We have △ (△ z b) y → ((z y) (b y))
-                                            ctx.steps += 1;
-                                            let zy = arena.alloc(Node::Fork(z, y));
-                                            let by = arena.alloc(Node::Fork(b, y));
-                                            current = arena.alloc(Node::Fork(zy, by));
-                                            continue;
-                                        }
-                                    }
-                                    // Not a valid S pattern - no reduction
-                                    return current;
-                                }
-                            }
-                            Node::Stem(z) => {
-                                // x is Stem(z) - this represents (△ z) in internal form
-                                // △ (△ z) y → z (K combinator)
-                                ctx.steps += 1;
-                                current = z;
-                                continue;
-                            }
-                            _ => {
-                                // x is non-nil leaf - no reduction
-                                return current;
-                            }
-                        }
+                    if let Some(x_inner) = split_delta1(arena, reduced_x) {
+                        // △ (△ x) y z → y z (x z)
+                        ctx.steps += 1;
+                        let yz = arena.alloc(Node::Fork(y, z));
+                        let xz = arena.alloc(Node::Fork(x_inner, z));
+                        current = arena.alloc(Node::Fork(yz, xz));
+                        continue;
+                    }
+
+                    if let Some((w, x_inner)) = split_delta2(arena, reduced_x) {
+                        // △ (△ w x) y z → z w x
+                        ctx.steps += 1;
+                        let zw = arena.alloc(Node::Fork(z, w));
+                        current = arena.alloc(Node::Fork(zw, x_inner));
+                        continue;
                     }
                 }
 
                 // Not a redex - return with reduced left if different
                 if reduced_left != left {
-                    return arena.alloc(Node::Fork(reduced_left, y));
+                    return arena.alloc(Node::Fork(reduced_left, z));
                 }
                 return current;
             }
@@ -128,6 +141,9 @@ pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId 
 /// Uses same rules as reduce but stops at head normal form.
 pub fn reduce_whnf(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId {
     let mut current = root;
+    if !is_pure_tree(arena, current) {
+        return current;
+    }
 
     loop {
         if ctx.steps >= ctx.max_steps {
@@ -135,47 +151,40 @@ pub fn reduce_whnf(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> No
         }
 
         match arena.get_unchecked(current).clone() {
-            Node::Fork(left, y) => {
+            Node::Fork(left, z) => {
                 let reduced_left = reduce_whnf(arena, left, ctx);
 
-                // Check if reduced_left is of form (△ x) = Fork(nil, x)
-                if let Node::Fork(op, x) = arena.get_unchecked(reduced_left).clone() {
-                    if let Node::Leaf(OpaqueValue::Nil) = arena.get_unchecked(op) {
-                        // We have ((△ x) y) - check for redex
-                        let reduced_x = reduce_whnf(arena, x, ctx);
+                if let Some((x, y)) = split_delta2(arena, reduced_left) {
+                    let reduced_x = reduce_whnf(arena, x, ctx);
 
-                        match arena.get_unchecked(reduced_x).clone() {
-                            Node::Leaf(OpaqueValue::Nil) => {
-                                // △ △ y → y
-                                ctx.steps += 1;
-                                current = y;
-                                continue;
-                            }
-                            Node::Fork(a, b) => {
-                                // Check K pattern: x = (△ b)
-                                if let Node::Leaf(OpaqueValue::Nil) = arena.get_unchecked(a) {
-                                    // △ (△ b) y → b
-                                    ctx.steps += 1;
-                                    current = b;
-                                    continue;
-                                }
-                                // S-redex - in WHNF we stop here
-                                return current;
-                            }
-                            Node::Stem(z) => {
-                                // Stem form of K
-                                ctx.steps += 1;
-                                current = z;
-                                continue;
-                            }
-                            _ => return current,
-                        }
+                    if is_delta(arena, reduced_x) {
+                        // △ △ y z → y
+                        ctx.steps += 1;
+                        current = y;
+                        continue;
+                    }
+
+                    if let Some(x_inner) = split_delta1(arena, reduced_x) {
+                        // △ (△ x) y z → y z (x z)
+                        ctx.steps += 1;
+                        let yz = arena.alloc(Node::Fork(y, z));
+                        let xz = arena.alloc(Node::Fork(x_inner, z));
+                        current = arena.alloc(Node::Fork(yz, xz));
+                        continue;
+                    }
+
+                    if let Some((w, x_inner)) = split_delta2(arena, reduced_x) {
+                        // △ (△ w x) y z → z w x
+                        ctx.steps += 1;
+                        let zw = arena.alloc(Node::Fork(z, w));
+                        current = arena.alloc(Node::Fork(zw, x_inner));
+                        continue;
                     }
                 }
 
                 // Not a redex
                 if reduced_left != left {
-                    return arena.alloc(Node::Fork(reduced_left, y));
+                    return arena.alloc(Node::Fork(reduced_left, z));
                 }
                 return current;
             }
@@ -432,159 +441,151 @@ impl ControlStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::deep_equal;
 
-    // Helper: create nil (△)
-    fn nil(arena: &mut Arena) -> NodeId {
+    // Helper: create △
+    fn delta(arena: &mut Arena) -> NodeId {
         arena.alloc(Node::Leaf(OpaqueValue::Nil))
     }
 
-    // Helper: create K = △ △
-    fn k(arena: &mut Arena) -> NodeId {
-        let n = nil(arena);
-        arena.alloc(Node::Fork(n, n))
+    fn app(arena: &mut Arena, f: NodeId, x: NodeId) -> NodeId {
+        arena.alloc(Node::Fork(f, x))
+    }
+
+    fn stem(arena: &mut Arena, x: NodeId) -> NodeId {
+        arena.alloc(Node::Stem(x))
+    }
+
+    fn fork(arena: &mut Arena, l: NodeId, r: NodeId) -> NodeId {
+        arena.alloc(Node::Fork(l, r))
     }
 
     #[test]
-    fn test_identity_rule() {
-        // △ △ y → y
+    fn test_k_rule() {
+        // △ △ y z → y
         let mut arena = Arena::new();
         let mut ctx = EvalContext::default();
 
-        let n = nil(&mut arena);
-        let y = arena.alloc(Node::Leaf(OpaqueValue::Integer(42)));
+        let d = delta(&mut arena);
+        let leaf = delta(&mut arena);
+        let y = leaf;
+        let z = stem(&mut arena, leaf);
 
-        // Build △ △: Fork(nil, nil)
-        let nn = arena.alloc(Node::Fork(n, n));
+        let k = app(&mut arena, d, d); // 4 4
+        let k_y = app(&mut arena, k, y);
+        let term = app(&mut arena, k_y, z);
 
-        // Build (△ △) y: Fork(nn, y)
-        let app = arena.alloc(Node::Fork(nn, y));
-
-        let result = reduce(&mut arena, app, &mut ctx);
-        assert_eq!(extract_int(&arena, result), Some(42));
+        let result = reduce(&mut arena, term, &mut ctx);
+        assert!(deep_equal(&arena, result, y));
     }
 
     #[test]
-    fn test_k_combinator() {
-        // △ (△ x) y → x
+    fn test_s_rule() {
+        // △ (△ x) y z → y z (x z)
         let mut arena = Arena::new();
         let mut ctx = EvalContext::default();
 
-        let n = nil(&mut arena);
-        let x = arena.alloc(Node::Leaf(OpaqueValue::Integer(1)));
-        let y = arena.alloc(Node::Leaf(OpaqueValue::Integer(2)));
+        let d = delta(&mut arena);
+        let leaf = delta(&mut arena);
+        let x = stem(&mut arena, leaf);
+        let y = leaf;
+        let z = fork(&mut arena, leaf, leaf);
 
-        // Build △ x: Fork(nil, x)
-        let nx = arena.alloc(Node::Fork(n, x));
+        let stem_x = app(&mut arena, d, x); // 4 x
+        let d_stem = app(&mut arena, d, stem_x);
+        let d_stem_y = app(&mut arena, d_stem, y);
+        let term = app(&mut arena, d_stem_y, z);
 
-        // Build △ (△ x): Fork(nil, nx)
-        let n_nx = arena.alloc(Node::Fork(n, nx));
+        let result = reduce(&mut arena, term, &mut ctx);
 
-        // Build (△ (△ x)) y: Fork(n_nx, y)
-        let app = arena.alloc(Node::Fork(n_nx, y));
-
-        let result = reduce(&mut arena, app, &mut ctx);
-        assert_eq!(extract_int(&arena, result), Some(1));
+        // Expect ((y z) (x z))
+        let yz = app(&mut arena, y, z);
+        let xz = app(&mut arena, x, z);
+        let expected = app(&mut arena, yz, xz);
+        assert!(deep_equal(&arena, result, expected));
     }
 
     #[test]
-    fn test_s_combinator() {
-        // S pattern: △ (△ x z) y → ((x y) (z y))
-        // Use simple non-reducing integers for x and z
-        // Then result is Fork(Fork(x,y), Fork(z,y)) which doesn't reduce further
-
+    fn test_f_rule() {
+        // △ (△ w x) y z → z w x
         let mut arena = Arena::new();
         let mut ctx = EvalContext::default();
 
-        let n = nil(&mut arena);
-        let x = arena.alloc(Node::Leaf(OpaqueValue::Integer(1))); // Simple value, not △
-        let z = arena.alloc(Node::Leaf(OpaqueValue::Integer(2))); // Simple value, not △
-        let y = arena.alloc(Node::Leaf(OpaqueValue::Integer(3)));
+        let d = delta(&mut arena);
+        let leaf = delta(&mut arena);
+        let w = stem(&mut arena, leaf);
+        let x = fork(&mut arena, leaf, leaf);
+        let y = stem(&mut arena, leaf);
+        let z = leaf;
 
-        // Build △ x = Fork(nil, x)
-        let nx = arena.alloc(Node::Fork(n, x));
+        let stem_w = arena.alloc(Node::Stem(w)); // Canonical stem for 4 w
+        let fork = app(&mut arena, stem_w, x); // (4 w x)
+        let d_fork = app(&mut arena, d, fork);
+        let d_fork_y = app(&mut arena, d_fork, y);
+        let term = app(&mut arena, d_fork_y, z);
 
-        // Build (△ x) z = Fork(nx, z) = (△ x z)
-        let nx_z = arena.alloc(Node::Fork(nx, z));
+        let result = reduce(&mut arena, term, &mut ctx);
 
-        // Build △ (△ x z) = Fork(nil, nx_z)
-        let triage = arena.alloc(Node::Fork(n, nx_z));
-
-        // Build (△ (△ x z)) y = Fork(triage, y)
-        let app = arena.alloc(Node::Fork(triage, y));
-
-        let result = reduce(&mut arena, app, &mut ctx);
-
-        // S rule: △ (△ x z) y → ((x y) (z y))
-        // = Fork(Fork(1, 3), Fork(2, 3))
-        // Neither (1 3) nor (2 3) reduce because 1 and 2 are not △
-
-        // Result should be Fork(Fork(1,3), Fork(2,3))
-        match arena.get_unchecked(result) {
-            Node::Fork(left, right) => {
-                // Left should be Fork(1, 3)
-                match arena.get_unchecked(*left) {
-                    Node::Fork(a, b) => {
-                        assert_eq!(extract_int(&arena, *a), Some(1));
-                        assert_eq!(extract_int(&arena, *b), Some(3));
-                    }
-                    other => panic!("Expected Fork(1,3), got {:?}", other),
-                }
-                // Right should be Fork(2, 3)
-                match arena.get_unchecked(*right) {
-                    Node::Fork(c, d) => {
-                        assert_eq!(extract_int(&arena, *c), Some(2));
-                        assert_eq!(extract_int(&arena, *d), Some(3));
-                    }
-                    other => panic!("Expected Fork(2,3), got {:?}", other),
-                }
-            }
-            other => panic!("Expected Fork(Fork(1,3), Fork(2,3)), got {:?}", other),
-        }
+        // Expect ((z w) x)
+        let zw = app(&mut arena, z, w);
+        let expected = app(&mut arena, zw, x);
+        assert!(deep_equal(&arena, result, expected));
     }
 
     #[test]
-    fn test_i_combinator() {
-        // I = K K = (△ △) (△ △)
-        // But K = △ △ is already identity! So K x = x.
-        // I = K K = (△ △) (△ △) → (△ △) by identity.
-        // Then I x = K x = x. So I behaves like identity too.
+    fn test_no_reduce_two_args() {
+        // △ △ y should not reduce without third argument
         let mut arena = Arena::new();
         let mut ctx = EvalContext::default();
 
-        let kk = k(&mut arena);
-        let i = arena.alloc(Node::Fork(kk, kk)); // I = K K
+        let d = delta(&mut arena);
+        let leaf = delta(&mut arena);
+        let y = stem(&mut arena, leaf);
 
-        let x = arena.alloc(Node::Leaf(OpaqueValue::Integer(99)));
-
-        // Build I x: Fork(i, x)
-        let app = arena.alloc(Node::Fork(i, x));
-
-        let result = reduce(&mut arena, app, &mut ctx);
-        assert_eq!(extract_int(&arena, result), Some(99));
+        let d_d = app(&mut arena, d, d);
+        let term = app(&mut arena, d_d, y);
+        let result = reduce(&mut arena, term, &mut ctx);
+        assert_eq!(result, term);
     }
 
     #[test]
-    fn test_constant_combinator() {
-        // The constant combinator: △ (△ x) y → x
-        // This drops the second argument and returns the first
+    fn test_stem_representation() {
+        // Ensure Stem(x) is treated as (△ x) in the S rule.
         let mut arena = Arena::new();
         let mut ctx = EvalContext::default();
 
-        let n = nil(&mut arena);
-        let x_val = arena.alloc(Node::Leaf(OpaqueValue::Integer(42)));
-        let y_val = arena.alloc(Node::Leaf(OpaqueValue::Integer(99)));
+        let d = delta(&mut arena);
+        let leaf = delta(&mut arena);
+        let x = stem(&mut arena, leaf);
+        let y = leaf;
+        let z = fork(&mut arena, leaf, leaf);
 
-        // Build △ x = Fork(nil, x)
-        let nx = arena.alloc(Node::Fork(n, x_val));
+        let stem_x = arena.alloc(Node::Stem(x));
+        let d_stem = app(&mut arena, d, stem_x);
+        let d_stem_y = app(&mut arena, d_stem, y);
+        let term = app(&mut arena, d_stem_y, z);
+        let result = reduce(&mut arena, term, &mut ctx);
 
-        // Build △ (△ x) = Fork(nil, nx)
-        let n_nx = arena.alloc(Node::Fork(n, nx));
+        let yz = app(&mut arena, y, z);
+        let xz = app(&mut arena, x, z);
+        let expected = app(&mut arena, yz, xz);
+        assert!(deep_equal(&arena, result, expected));
+    }
 
-        // Build (△ (△ x)) y = Fork(n_nx, y)
-        let app = arena.alloc(Node::Fork(n_nx, y_val));
+    #[test]
+    fn test_non_structural_leaf_blocks_reduction() {
+        // Any non-Nil leaf should prevent reduction.
+        let mut arena = Arena::new();
+        let mut ctx = EvalContext::default();
 
-        let result = reduce(&mut arena, app, &mut ctx);
-        // Should return x = 42, dropping y
-        assert_eq!(extract_int(&arena, result), Some(42));
+        let d = delta(&mut arena);
+        let y = arena.alloc(Node::Leaf(OpaqueValue::Integer(1)));
+        let z = delta(&mut arena);
+
+        let d_d = app(&mut arena, d, d);
+        let d_d_y = app(&mut arena, d_d, y);
+        let term = app(&mut arena, d_d_y, z);
+        let result = reduce(&mut arena, term, &mut ctx);
+        assert_eq!(result, term);
     }
 }
