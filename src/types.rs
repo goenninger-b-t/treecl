@@ -32,6 +32,11 @@ pub enum OpaqueValue {
     Pid(crate::process::Pid),   // Process ID
     HashHandle(u32),            // Handle to Hash Table
     Package(u32),               // Package ID
+    NextMethod(u32),            // Handle to Next Method State (CLOS)
+    NextMethodP(u32),           // Handle to Next Method State predicate (CLOS)
+    CallMethod(u32),            // Handle to Call-Method state (CLOS)
+    MethodWrapper(u32, u32),    // (ClosureIndex, NextMethodIndex)
+    Method(u32),                // Handle to Method (CLOS)
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)

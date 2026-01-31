@@ -928,7 +928,6 @@ fn attempt_reduction(g: &mut Graph, root: NodeId, head: NodeId, args: &[NodeId],
                                  // Let's rely on extract_list to traverse.
                                  
                                  // Extract tasks
-                                 // println!("DEBUG: SearchStep data = {}", unparse(g, arg1));
                                  let mut tasks = Vec::new();
                                  if let Some(items) = crate::search::extract_list(g, arg1) {
                                      let mut multi_task_success = false;

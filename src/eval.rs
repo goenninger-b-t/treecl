@@ -9,12 +9,15 @@ use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
 
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// Environment for lexical bindings
 #[derive(Debug, Clone)]
 pub struct Environment {
     /// Lexical bindings: SymbolId -> NodeId
-    bindings: HashMap<SymbolId, NodeId>,
+    bindings: Arc<RwLock<HashMap<SymbolId, NodeId>>>,
+    /// Function bindings: SymbolId -> NodeId
+    functions: Arc<RwLock<HashMap<SymbolId, NodeId>>>,
     /// Parent environment (for nested scopes)
     parent: Option<Box<Environment>>,
 }
@@ -22,34 +25,64 @@ pub struct Environment {
 impl Environment {
     pub fn new() -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: Arc::new(RwLock::new(HashMap::new())),
+            functions: Arc::new(RwLock::new(HashMap::new())),
             parent: None,
         }
     }
 
     pub fn with_parent(parent: Environment) -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: Arc::new(RwLock::new(HashMap::new())),
+            functions: Arc::new(RwLock::new(HashMap::new())),
             parent: Some(Box::new(parent)),
         }
     }
 
-    pub fn bind(&mut self, sym: SymbolId, val: NodeId) {
-        self.bindings.insert(sym, val);
+    pub fn bind(&self, sym: SymbolId, val: NodeId) {
+        self.bindings.write().unwrap().insert(sym, val);
+    }
+
+    pub fn set(&self, sym: SymbolId, val: NodeId) -> bool {
+        // Try to set in current bindings
+        let mut guard = self.bindings.write().unwrap();
+        if guard.contains_key(&sym) {
+            guard.insert(sym, val);
+            return true;
+        }
+        drop(guard);
+
+        // Try parent
+        if let Some(parent) = &self.parent {
+            return parent.set(sym, val);
+        }
+        false
+    }
+
+    pub fn set_function(&self, sym: SymbolId, val: NodeId) {
+        self.functions.write().unwrap().insert(sym, val);
     }
 
     pub fn lookup(&self, sym: SymbolId) -> Option<NodeId> {
-        self.bindings
-            .get(&sym)
-            .copied()
-            .or_else(|| self.parent.as_ref().and_then(|p| p.lookup(sym)))
+        if let Some(val) = self.bindings.read().unwrap().get(&sym) {
+            return Some(*val);
+        }
+        self.parent.as_ref().and_then(|p| p.lookup(sym))
+    }
+
+    pub fn lookup_function(&self, sym: SymbolId) -> Option<NodeId> {
+        if let Some(val) = self.functions.read().unwrap().get(&sym) {
+            return Some(*val);
+        }
+        self.parent.as_ref().and_then(|p| p.lookup_function(sym))
     }
 
     pub fn iter_roots(&self) -> Vec<NodeId> {
         let mut roots = Vec::new();
         let mut current = Some(self);
         while let Some(env) = current {
-            roots.extend(env.bindings.values().copied());
+            roots.extend(env.bindings.read().unwrap().values().copied());
+            roots.extend(env.functions.read().unwrap().values().copied());
             current = env.parent.as_deref();
         }
         roots
@@ -131,10 +164,7 @@ pub enum Continuation {
     /// Apply function after args evaluated
     /// (function, args)
     Apply {
-        func: NodeId,
-        // Env is captured in closure or current?
-        // Usually Apply just needs func and args.
-        // Logic will handle dispatch (primitive or closure)
+        // Restore caller environment after a function application.
         saved_env: Environment,
     },
     /// Evaluate sequences (PROGN)
@@ -165,6 +195,7 @@ pub enum Continuation {
     Tagbody {
         rest: Vec<NodeId>,
         tag_map: HashMap<TagKey, Vec<NodeId>>,
+        env: Environment,
     },
     /// Block frame (named progn)
     /// (name, remaining_forms)
@@ -508,7 +539,6 @@ impl<'a> Interpreter<'a> {
             {}
         }
         // Legacy recursive eval - eventually replace or wrap step
-        let node = self.process.arena.get_unchecked(expr).clone();
         // ... (existing eval logic to be kept for reference or backup until full switch)
         // For now, let's keep eval as is, and add step separately.
         // But the user asked to refactor Eval.
@@ -528,21 +558,13 @@ impl<'a> Interpreter<'a> {
         self.process.continuation_stack.push(Continuation::Done);
         self.process.execution_mode = crate::process::ExecutionMode::Eval;
 
-        let mut result = Ok(self.process.make_nil()); // Default
-
-        loop {
+        let result = loop {
             match self.step() {
                 Ok(true) => continue,
-                Ok(false) => {
-                    result = Ok(self.process.program);
-                    break;
-                }
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
+                Ok(false) => break Ok(self.process.program),
+                Err(e) => break Err(e),
             }
-        }
+        };
 
         // Restore State
         self.process.program = saved_program;
@@ -550,7 +572,7 @@ impl<'a> Interpreter<'a> {
         self.process.current_env = saved_env;
         self.process.continuation_stack = saved_stack;
 
-        return result;
+        result
     }
 
     /// Perform one step of TCO evaluation
@@ -586,34 +608,22 @@ impl<'a> Interpreter<'a> {
                                         .unwrap_or("?")
                                         .to_string();
 
-                                    // DEBUG: Check P
-                                    if name == "P" {
-                                        println!(
-                                            "DEBUG: PAIRS lookup failure. SymId: {:?}.",
-                                            sym_id
-                                        );
-                                        println!("DEBUG: Env bindings keys:");
-                                        for key in env.bindings.keys() {
-                                            println!(
-                                                "  Key: {:?} Name: {:?}",
-                                                key,
-                                                self.globals
-                                                    .symbols
-                                                    .read()
-                                                    .unwrap()
-                                                    .symbol_name(*key)
-                                            );
-                                        }
-                                        if let Some(p) = &env.parent {
-                                            println!("DEBUG: Parent env present.");
-                                        } else {
-                                            println!("DEBUG: No parent env.");
-                                        }
-                                    }
+                                    // Retrieve symbol details for the missing symbol
+                                    let sym_info = {
+                                        let globals = self.globals.symbols.read().unwrap();
+                                        let name =
+                                            globals.symbol_name(sym_id).unwrap_or("?").to_string();
+                                        let pkg = globals
+                                            .get_symbol(sym_id)
+                                            .and_then(|s| s.package)
+                                            .unwrap_or(crate::symbol::PackageId(0))
+                                            .0;
+                                        format!("{}:{} ({:?})", pkg, name, sym_id)
+                                    };
 
                                     return Err(ControlSignal::Error(format!(
-                                        "Variable '{}' is not bound",
-                                        name
+                                        "Variable '{}' (ID: {:?}) is not bound. Info: {}",
+                                        name, sym_id, sym_info
                                     )));
                                 }
                             }
@@ -660,24 +670,6 @@ impl<'a> Interpreter<'a> {
         // Check Special Forms
         if let Some(sym_id) = self.node_to_symbol(op) {
             let sf = &self.globals.special_forms;
-            if sym_id == sf.progn {
-                println!("DEBUG: Matched PROGN in step_app for op={:?}", op);
-            } else {
-                if self
-                    .globals
-                    .symbols
-                    .read()
-                    .unwrap()
-                    .symbol_name(sym_id)
-                    .unwrap_or("")
-                    == "PROGN"
-                {
-                    println!(
-                        "DEBUG: step_app MISSED PROGN. sym: {:?}, sf.progn: {:?}",
-                        sym_id, sf.progn
-                    );
-                }
-            }
 
             if sym_id == sf.setq {
                 return self.step_setq(args, env);
@@ -687,6 +679,12 @@ impl<'a> Interpreter<'a> {
             }
             if sym_id == sf.progn {
                 return self.step_progn(args, env);
+            }
+            if sym_id == sf.lambda {
+                let res = self.eval_lambda(args, &env)?;
+                self.process.program = res;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
             }
             if sym_id == sf.quote {
                 if let Node::Fork(arg, _) = self.process.arena.get_unchecked(args) {
@@ -749,6 +747,17 @@ impl<'a> Interpreter<'a> {
             }
         }
 
+        // Handle CALL-METHOD when it is lexically bound.
+        if let Some(sym_id) = self.node_to_symbol(op) {
+            if let Some(func_node) = env.lookup_function(sym_id) {
+                if let Node::Leaf(OpaqueValue::CallMethod(state_idx)) =
+                    self.process.arena.get_unchecked(func_node)
+                {
+                    return self.step_call_method_form(*state_idx as usize, args, env);
+                }
+            }
+        }
+
         // Check for Macros
         if let Some(sym_id) = self.node_to_symbol(op) {
             if let Some(&macro_idx) = self.process.macros.get(&sym_id) {
@@ -766,6 +775,9 @@ impl<'a> Interpreter<'a> {
 
         if arg_list.is_empty() {
             // Immediate Apply (no args)
+            self.process
+                .continuation_stack
+                .push(Continuation::Apply { saved_env: env.clone() });
             return self.step_apply(op, Vec::new(), env);
         } else {
             // Start evaluating first arg
@@ -855,6 +867,7 @@ impl<'a> Interpreter<'a> {
         self.process.continuation_stack.push(Continuation::Tagbody {
             rest: body_list,
             tag_map,
+            env: _env,
         });
 
         // Start execution (Return mode -> pop continuation -> run logic)
@@ -899,7 +912,7 @@ impl<'a> Interpreter<'a> {
                 self.process.continuation_stack.truncate(new_len);
 
                 // Now top is the Tagbody. Update its 'rest'.
-                if let Some(Continuation::Tagbody { tag_map, rest }) =
+                if let Some(Continuation::Tagbody { tag_map, rest, .. }) =
                     self.process.continuation_stack.last_mut()
                 {
                     if let Some(target_rest) = tag_map.get(&key) {
@@ -1072,7 +1085,23 @@ impl<'a> Interpreter<'a> {
         // But `init.lisp` might use it.
         // Let's handle Symbol case (return symbol) and Lambda case (create closure).
 
-        if let Some(_) = self.node_to_symbol(target) {
+        if let Some(sym) = self.node_to_symbol(target) {
+            // If it is a known function (lexical or global generic/closure), resolve it!
+            // First check lexical env (flet/labels)
+            if let Some(func_node) = _env.lookup_function(sym) {
+                self.process.program = func_node;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+            // Then check global functions (defun/defgeneric)
+            // Note: primitives are not stored in global functions map usually.
+            // If function is not found, return symbol (for primitives via try_reduce_primitive fallback)
+            if let Some(func_node) = self.process.get_function(sym) {
+                self.process.program = func_node;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
+            }
+            // Fallback: Return Symbol (Designator)
             self.process.program = target;
             self.process.execution_mode = crate::process::ExecutionMode::Return;
             return Ok(true);
@@ -1085,12 +1114,54 @@ impl<'a> Interpreter<'a> {
             if let Some(s) = self.node_to_symbol(head) {
                 if s == self.globals.special_forms.lambda {
                     // It is (lambda params body...)
-                    // Parse and create closure
-                    // Need to parse params from tail.
-                    // tail is (params body...)
-                    // reuse step_defun logic?
-                    // I'll leave "Lambda" support as Todo or simple panic/error if hit to see.
-                    // Usually `defun` covers 90%.
+                    let tail_node = self.process.arena.get_unchecked(tail).clone();
+                    if let Node::Fork(params, body_forms) = tail_node {
+                        let lambda_list = match self.parse_lambda_list(params) {
+                            Ok(l) => l,
+                            Err(e) => return Err(ControlSignal::Error(e)),
+                        };
+
+                        // Create Progn Body
+                        let progn_sym = self.globals.special_forms.progn;
+                        let progn_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
+                        let progn_node = self.process.arena.inner.alloc(Node::Leaf(progn_val));
+                        let body_expr = self
+                            .process
+                            .arena
+                            .inner
+                            .alloc(Node::Fork(progn_node, body_forms));
+
+                        // Capture Environment
+                        let captured_env = self
+                            .process
+                            .current_env
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| Environment::new());
+
+                        let closure = Closure {
+                            lambda_list,
+                            body: body_expr,
+                            env: captured_env,
+                        };
+
+                        let closure_idx = self.process.closures.len();
+                        self.process.closures.push(closure);
+
+                        let closure_handle_val =
+                            crate::types::OpaqueValue::Closure(closure_idx as u32);
+                        let closure_handle = self
+                            .process
+                            .arena
+                            .inner
+                            .alloc(Node::Leaf(closure_handle_val));
+
+                        self.process.program = closure_handle;
+                        self.process.execution_mode = crate::process::ExecutionMode::Return;
+                        return Ok(true);
+                    } else {
+                        return Err(ControlSignal::Error("function: malformed lambda".into()));
+                    }
                 }
             }
         }
@@ -1186,7 +1257,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_setq(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
-        self.process.current_env = Some(env);
+        self.process.current_env = Some(env.clone());
         if let Node::Fork(var_node, rest) = self.process.arena.get_unchecked(args).clone() {
             if let Node::Fork(val_expr, next) = self.process.arena.get_unchecked(rest).clone() {
                 if let Some(sym) = self.node_to_symbol(var_node) {
@@ -1383,7 +1454,14 @@ impl<'a> Interpreter<'a> {
                 self.process.status = crate::process::Status::Debugger(condition.clone());
                 Err(ControlSignal::Debugger(condition))
             }
-            Continuation::Tagbody { mut rest, tag_map } => {
+            Continuation::Tagbody {
+                mut rest,
+                tag_map,
+                env,
+            } => {
+                // Restore environment for tagbody execution (crucial for GO)
+                self.process.current_env = Some(env.clone());
+
                 // Return from a form inside tagbody (result ignored)
                 // Need to find NEXT form to execute.
                 // Loop through 'rest' until we find a form that is NOT a tag.
@@ -1424,9 +1502,11 @@ impl<'a> Interpreter<'a> {
 
                 if let Some(form) = next_form {
                     // Execute this form
-                    self.process
-                        .continuation_stack
-                        .push(Continuation::Tagbody { rest, tag_map });
+                    self.process.continuation_stack.push(Continuation::Tagbody {
+                        rest,
+                        tag_map,
+                        env,
+                    });
                     self.process.program = form;
                     self.process.execution_mode = crate::process::ExecutionMode::Eval;
                 } else {
@@ -1437,7 +1517,29 @@ impl<'a> Interpreter<'a> {
                 Ok(true)
             }
             Continuation::EvSetq { sym, rest } => {
-                self.process.set_value(sym, result);
+                let mut set_lexical = false;
+                if let Some(env) = &self.process.current_env {
+                    if env.set(sym, result) {
+                        set_lexical = true;
+                    }
+                }
+
+                if !set_lexical {
+                    // Check for protected symbol - since we are setting global
+                    if self.globals.symbols.read().unwrap().is_protected(sym) {
+                        return Err(ControlSignal::Error(format!(
+                            "SETQ: cannot set protected symbol {:?}",
+                            self.globals
+                                .symbols
+                                .read()
+                                .unwrap()
+                                .get_symbol(sym)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("?")
+                        )));
+                    }
+                    self.process.set_value(sym, result);
+                }
 
                 if rest.is_empty() {
                     self.process.execution_mode = crate::process::ExecutionMode::Return;
@@ -1465,7 +1567,7 @@ impl<'a> Interpreter<'a> {
             }
             Continuation::EvArgs {
                 op,
-                mut args,
+                args,
                 mut vals,
                 env,
             } => {
@@ -1483,7 +1585,9 @@ impl<'a> Interpreter<'a> {
                     // Crucially, if we continue execution (e.g. if apply pushes more continuations),
                     // we want the environment to be clean (unpolluted by args).
                     self.process.current_env = Some(env.clone());
-
+                    self.process
+                        .continuation_stack
+                        .push(Continuation::Apply { saved_env: env.clone() });
                     return self.step_apply(op, vals, env);
                 } else {
                     let next = args[0];
@@ -1503,19 +1607,11 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(true)
             }
-            Continuation::Apply { func, saved_env } => {
-                // We arrived here via explicit transition (e.g. no args).
-                // Logic handled in step_apply.
-                // If we use Continuation::Apply, we need to store args in it?
-                // EvArgs transforms to step_apply call.
-                // So we don't strictly need Continuation::Apply unless we pause DURING apply init?
-                // But step_apply will handle it.
-                // The case where we push Apply manually in step_application (empty args):
-                // We come here. We need to know args (empty).
-                // So Apply needs args.
-                // Update Continuation::Apply definition?
-                // Or just handle empty args inside step_application by calling step_apply directly.
-                Ok(false) // Should not happen if handled directly
+            Continuation::Apply { saved_env } => {
+                // Restore caller environment after function application.
+                self.process.current_env = Some(saved_env);
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                Ok(true)
             }
             _ => Ok(false),
         }
@@ -1530,8 +1626,12 @@ impl<'a> Interpreter<'a> {
         // Resolve operator
         // op could be Symbol or Function Object (Closure/Primitive)
         // If symbol, lookup function.
+        // If symbol, lookup function.
         let func_node = if let Some(sym) = self.node_to_symbol(op) {
-            if let Some(f) = self.process.get_function(sym) {
+            // Check Lexical Function Bindings first (Lisp-2)
+            if let Some(f) = env.lookup_function(sym) {
+                f
+            } else if let Some(f) = self.process.get_function(sym) {
                 f
             } else if self.globals.primitives.contains_key(&sym) {
                 op
@@ -1563,12 +1663,134 @@ impl<'a> Interpreter<'a> {
             }
         }
 
+        // Check for Generic Function
+        if let Node::Leaf(OpaqueValue::Generic(gid)) = self.process.arena.get_unchecked(func_node) {
+            return self.apply_generic_function(crate::clos::GenericId(*gid), args, &env);
+        }
+
+        // Check for NextMethod (call-next-method invocation)
+        if let Node::Leaf(OpaqueValue::NextMethod(state_idx)) =
+            self.process.arena.get_unchecked(func_node)
+        {
+            let state_idx = *state_idx as usize;
+            if state_idx >= self.process.next_method_states.len() {
+                return Err(ControlSignal::Error("Invalid NextMethod state".into()));
+            }
+
+            let current_state = self.process.next_method_states[state_idx].clone();
+            if current_state.methods.is_empty() {
+                return Err(ControlSignal::Error("No next method".into()));
+            }
+
+            let next_method_id = current_state.methods[0];
+            let remaining = current_state.methods[1..].to_vec();
+
+            // Create new state for the NEXT method
+            let next_args = if args.is_empty() {
+                current_state.args.clone()
+            } else {
+                args // Use new args
+            };
+
+            let next_state = crate::clos::NextMethodState {
+                methods: remaining,
+                args: next_args.clone(),
+            };
+
+            self.process.next_method_states.push(next_state);
+            let next_state_idx = (self.process.next_method_states.len() - 1) as u32;
+
+            let method = self.process.mop.get_method(next_method_id).unwrap();
+            let body = method.body;
+
+            // Wrap
+            if let Node::Leaf(OpaqueValue::Closure(idx)) = self.process.arena.get_unchecked(body) {
+                let wrapper = OpaqueValue::MethodWrapper(*idx, next_state_idx);
+                let wrapper_node = self.process.arena.inner.alloc(Node::Leaf(wrapper));
+                // Apply wrapper with next_args
+                // We use step_apply to ensure recursion/TCO is handled properly
+                return self.step_apply(wrapper_node, next_args, env);
+            } else {
+                return Err(ControlSignal::Error(
+                    "Next method body is not closure".into(),
+                ));
+            }
+        }
+        // Check for NextMethodP (next-method-p invocation)
+        if let Node::Leaf(OpaqueValue::NextMethodP(state_idx)) =
+            self.process.arena.get_unchecked(func_node)
+        {
+            let state_idx = *state_idx as usize;
+            if state_idx >= self.process.next_method_states.len() {
+                return Err(ControlSignal::Error("Invalid NextMethod state".into()));
+            }
+
+            let has_next = !self.process.next_method_states[state_idx].methods.is_empty();
+            self.process.program = if has_next {
+                self.process.make_t(&self.globals)
+            } else {
+                self.process.make_nil()
+            };
+            self.process.execution_mode = crate::process::ExecutionMode::Return;
+            return Ok(true);
+        }
+
+        // Check for CallMethod (call-method invocation)
+        if let Node::Leaf(OpaqueValue::CallMethod(state_idx)) =
+            self.process.arena.get_unchecked(func_node)
+        {
+            let state_idx = *state_idx as usize;
+            if state_idx >= self.process.next_method_states.len() {
+                return Err(ControlSignal::Error("Invalid CallMethod state".into()));
+            }
+
+            if args.is_empty() {
+                return Err(ControlSignal::Error(
+                    "CALL-METHOD requires a method".into(),
+                ));
+            }
+
+            let method_node = args[0];
+            let next_methods_node = if args.len() > 1 {
+                args[1]
+            } else {
+                self.process.make_nil()
+            };
+
+            let method_id = self.method_id_from_node(method_node)?;
+            let next_methods = self.collect_method_ids(next_methods_node)?;
+
+            let call_args = self.process.next_method_states[state_idx].args.clone();
+            return self.call_method_with_next_methods(
+                method_id,
+                next_methods,
+                call_args,
+                env,
+            );
+        }
+
+        let mut inject_next_method = None;
+        let effective_func_node = if let Node::Leaf(OpaqueValue::MethodWrapper(idx, state)) =
+            self.process.arena.get_unchecked(func_node)
+        {
+            inject_next_method = Some(*state);
+            // We need to fetch the closure node
+            let c_node = self
+                .process
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Closure(*idx)));
+            c_node
+        } else {
+            func_node
+        };
+
         // Check if Lambda Expression (List starting with LAMBDA)
         // (lambda params body...)
         // This is necessary because LET expands to ((lambda ...) ...)
         let lambda_sym = self.globals.special_forms.lambda;
         let mut is_lambda = false;
-        if let Node::Fork(head, _) = self.process.arena.inner.get_unchecked(func_node) {
+        if let Node::Fork(head, _) = self.process.arena.inner.get_unchecked(effective_func_node) {
             if let Some(s) = self.node_to_symbol(*head) {
                 if s == lambda_sym {
                     is_lambda = true;
@@ -1578,7 +1800,7 @@ impl<'a> Interpreter<'a> {
         let closure = if is_lambda {
             // Parse Lambda List (Code copied/adapted from step_defun)
             // func_node is (lambda params body...)
-            let parts = self.cons_to_vec(func_node);
+            let parts = self.cons_to_vec(effective_func_node);
             if parts.len() < 2 {
                 return Err(ControlSignal::Error("lambda: too few parts".into()));
             }
@@ -1599,26 +1821,28 @@ impl<'a> Interpreter<'a> {
                 .alloc(Node::Fork(progn_sym_node, body_list));
 
             // Parse lambda list
-            // We use the new parser.
-            // Note: Parser helper returns Result<ParsedLambdaList, String>
             let parsed_lambda_list = match self.parse_lambda_list(params_node) {
                 Ok(l) => l,
                 Err(e) => return Err(ControlSignal::Error(e)),
             };
 
             // Create Closure capturing CURRENT environment
-            // lambda expression evaluation returns a closure that captures the lexical environment.
-            // When appearing as operator in ((lambda ...)), it should behave the same.
             crate::eval::Closure {
                 lambda_list: parsed_lambda_list,
                 body: body_node,
-                env: env.clone(), // Capture the application point env (lexical scope)
+                env: {
+                    env.clone() // Capture application env
+                },
             }
         } else {
             // Check if Closure Object
             // Node might be Leaf(Closure(idx))
             let closure_idx = {
-                let node = self.process.arena.get_unchecked(func_node).clone();
+                let node = self
+                    .process
+                    .arena
+                    .get_unchecked(effective_func_node)
+                    .clone();
                 if let Node::Leaf(crate::types::OpaqueValue::Closure(idx)) = node {
                     Some(idx as usize)
                 } else {
@@ -1634,22 +1858,52 @@ impl<'a> Interpreter<'a> {
             } else {
                 // Fallthrough to error
                 // Debug node type
-                let node = self.process.arena.get_unchecked(func_node);
+                let node = self.process.arena.get_unchecked(effective_func_node);
                 return Err(ControlSignal::Error(format!(
                     "TCO Apply not fully implemented for {:?} (Node ID: {:?} - {:?})",
-                    func_node, func_node, node
+                    effective_func_node, effective_func_node, node
                 )));
             }
         };
 
-        // Execute Closure (Shared logic)
-        // Bind Arguments using ParsedLambdaList logic
-        // We need a helper method to perform binding because it's complex.
-        // But we can implement it here or as a method on Interpreter/ParsedLambdaList.
-        // Implementing as method on Interpreter is better to access Arena/Globals.
+        let new_env = self.bind_lambda_list(&closure, &args, inject_next_method)?;
 
-        // REWRITE BINDING LOGIC using indices
-        let mut new_env: Environment = closure.env.clone();
+        // Apply Process
+        self.process.program = closure.body;
+        self.process.current_env = Some(new_env);
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        return Ok(true);
+    }
+
+    fn bind_lambda_list(
+        &mut self,
+        closure: &Closure,
+        args: &[NodeId],
+        inject_next_method: Option<u32>,
+    ) -> Result<Environment, ControlSignal> {
+        let mut new_env: Environment = Environment::with_parent(closure.env.clone());
+
+        // Inject call-next-method / next-method-p if needed
+        if let Some(state_idx) = inject_next_method {
+            // "The function call-next-method is lexically scoped."
+            // Bind both CALL-NEXT-METHOD and NEXT-METHOD-P.
+            let cnm_sym = self.ensure_cl_symbol("CALL-NEXT-METHOD");
+            let nmp_sym = self.ensure_cl_symbol("NEXT-METHOD-P");
+            let cm_sym = self.ensure_cl_symbol("CALL-METHOD");
+
+            let nm_val = OpaqueValue::NextMethod(state_idx);
+            let nm_node = self.process.arena.inner.alloc(Node::Leaf(nm_val));
+            new_env.set_function(cnm_sym, nm_node);
+
+            let nmp_val = OpaqueValue::NextMethodP(state_idx);
+            let nmp_node = self.process.arena.inner.alloc(Node::Leaf(nmp_val));
+            new_env.set_function(nmp_sym, nmp_node);
+
+            let cm_val = OpaqueValue::CallMethod(state_idx);
+            let cm_node = self.process.arena.inner.alloc(Node::Leaf(cm_val));
+            new_env.set_function(cm_sym, cm_node);
+        }
+
         let mut arg_idx = 0;
 
         // 1. Required
@@ -1693,35 +1947,14 @@ impl<'a> Interpreter<'a> {
         // 4. Keys
         if !closure.lambda_list.key.is_empty() {
             // Check even number of rest args
-            if rest_args.len() % 2 != 0 {
-                // Unless &rest captured them? ANSI says error if odd keys.
-                // "Order of argument processing: 1. Req, 2. Opt, 3. Rest, 4. Key"
-                // "If &key is specified, there must be an even number of remaining arguments."
-                // But &allow-other-keys?
-                if !closure.lambda_list.allow_other_keys {
-                    // Check strictly?
-                    // Actually, if allow-other-keys is true, odd length is still weird?
-                    // No, key/value pairs must be pairs.
-                    return Err(ControlSignal::Error(
-                        "Odd number of keyword arguments".into(),
-                    ));
-                }
+            if rest_args.len() % 2 != 0 && !closure.lambda_list.allow_other_keys {
+                return Err(ControlSignal::Error(
+                    "Odd number of keyword arguments".into(),
+                ));
             }
 
             for (key_sym, var, init, sup) in &closure.lambda_list.key {
-                // Scan rest_args for key_sym
-                // key_sym is the VAR symbol?
-                // No, in parse_lambda_list we stored (key, var, init...).
-                // And we decided key is the symbol itself (simple) or derived.
-                // We need to match against the keywords passed in args.
-                // The args contain KEYWORD symbols (usually).
-                // We need to check if arg matches key_sym.
-
                 let mut found_val = None;
-
-                // Linear scan for now (last win? OR first win?)
-                // ANSI: "Leftmost occurrence of keyword"
-
                 let mut i = 0;
                 while i < rest_args.len() {
                     let k = rest_args[i];
@@ -1731,17 +1964,7 @@ impl<'a> Interpreter<'a> {
                         self.process.make_nil()
                     };
 
-                    // Compare k with key_sym (keyword)
-                    // k is a NodeId. key_sym is SymbolId.
-                    // Get symbol from k.
                     if let Some(ks) = self.node_to_symbol(k) {
-                        // Robust comparison: Pkg + Name?
-                        // Ideally exact symbol ID match if interned correctly.
-                        // But caller used :KEY, def used &key (x y).
-                        // x is symbol X. :X is keyword.
-                        // We need to compare name?
-
-                        // Check names
                         let k_name = self
                             .globals
                             .symbols
@@ -1760,7 +1983,6 @@ impl<'a> Interpreter<'a> {
                             .to_string();
 
                         if k_name.eq_ignore_ascii_case(&target_name) {
-                            // Match! (Simple name match for now)
                             found_val = Some(v);
                             break;
                         }
@@ -1782,10 +2004,6 @@ impl<'a> Interpreter<'a> {
                     }
                 }
             }
-
-            // Check &allow-other-keys or validity of keys?
-            // If not allowed, check if all keys in args are valid?
-            // Skip for now for simplicity.
         }
 
         // 5. Aux
@@ -1794,11 +2012,110 @@ impl<'a> Interpreter<'a> {
             new_env.bind(*var, val);
         }
 
-        // Apply Process
-        self.process.program = closure.body;
-        self.process.current_env = Some(new_env);
-        self.process.execution_mode = crate::process::ExecutionMode::Eval;
-        return Ok(true);
+        Ok(new_env)
+    }
+
+    fn looks_like_method_list(&self, node: NodeId) -> bool {
+        if self.is_nil(node) {
+            return true;
+        }
+
+        match self.process.arena.get_unchecked(node) {
+            Node::Fork(head, tail) => match self.process.arena.get_unchecked(*head) {
+                Node::Leaf(OpaqueValue::Method(_)) => self.looks_like_method_list(*tail),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn step_call_method_form(
+        &mut self,
+        state_idx: usize,
+        args: NodeId,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        if state_idx >= self.process.next_method_states.len() {
+            return Err(ControlSignal::Error("Invalid CallMethod state".into()));
+        }
+
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error(
+                "CALL-METHOD requires a method".into(),
+            ));
+        }
+
+        let method_form = args_vec[0];
+        let next_form = args_vec.get(1).copied();
+
+        let method_val = self.eval(method_form, &env)?;
+        let next_val = match next_form {
+            Some(form) => {
+                if self.looks_like_method_list(form) {
+                    form
+                } else {
+                    self.eval(form, &env)?
+                }
+            }
+            None => self.process.make_nil(),
+        };
+
+        let method_id = self.method_id_from_node(method_val)?;
+        let next_ids = self.collect_method_ids(next_val)?;
+        let call_args = self.process.next_method_states[state_idx].args.clone();
+
+        self.call_method_with_next_methods(method_id, next_ids, call_args, env)
+    }
+
+    fn eval_call_method_form(
+        &mut self,
+        state_idx: usize,
+        args: NodeId,
+        env: &Environment,
+    ) -> EvalResult {
+        if state_idx >= self.process.next_method_states.len() {
+            return Err(ControlSignal::Error("Invalid CallMethod state".into()));
+        }
+
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error(
+                "CALL-METHOD requires a method".into(),
+            ));
+        }
+
+        let method_form = args_vec[0];
+        let next_form = args_vec.get(1).copied();
+
+        let method_val = self.eval(method_form, env)?;
+        let next_val = match next_form {
+            Some(form) => {
+                if self.looks_like_method_list(form) {
+                    form
+                } else {
+                    self.eval(form, env)?
+                }
+            }
+            None => self.process.make_nil(),
+        };
+
+        let method_id = self.method_id_from_node(method_val)?;
+        let next_ids = self.collect_method_ids(next_val)?;
+        let call_args = self.process.next_method_states[state_idx].args.clone();
+
+        self.call_method_with_next_methods(method_id, next_ids, call_args, env.clone())?;
+
+        loop {
+            match self.process.execution_mode {
+                crate::process::ExecutionMode::Return => return Ok(self.process.program),
+                crate::process::ExecutionMode::Eval => {
+                    if !self.step()? {
+                        // Paused
+                    }
+                }
+            }
+        }
     }
 
     fn cons_to_vec(&self, list: NodeId) -> Vec<NodeId> {
@@ -1817,20 +2134,6 @@ impl<'a> Interpreter<'a> {
         if let Some(sym_id) = self.node_to_symbol(op) {
             // Check special forms
             let sf = &self.globals.special_forms;
-            if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym_id) {
-                if name == "SETQ" {
-                    eprintln!(
-                        "DEBUG: SETQ dispatch: {:?} vs sf.setq {:?}",
-                        sym_id, sf.setq
-                    );
-                }
-            }
-            if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym_id) {
-                if name == "LET" {
-                    // eprintln!("DEBUG: eval_application evaluating LET symbol. ID={:?} SF.LET={:?} Match={}", sym_id, sf.r#let, sym_id == sf.r#let);
-                }
-            }
-
             // 0. Check for macro expansion
             if let Some(&macro_idx) = self.process.macros.get(&sym_id) {
                 if let Some(closure) = self.process.closures.get(macro_idx).cloned() {
@@ -1843,28 +2146,7 @@ impl<'a> Interpreter<'a> {
                 return self.eval_quote(args);
             }
             if sym_id == sf.r#let {
-                // println!("DEBUG: eval matched let (ID {:?})", sym_id);
                 return self.eval_let(args, env);
-            }
-            // Debug failure to match LET
-            if self
-                .globals
-                .symbols
-                .read()
-                .unwrap()
-                .symbol_name(sym_id)
-                .unwrap_or("?")
-                == "LET"
-            {
-                println!(
-                    "DEBUG: Failed match LET. Got {:?}, Expected {:?}",
-                    sym_id, sf.r#let
-                );
-                let sym_table = self.globals.symbols.read().unwrap();
-                let s = sym_table.get_symbol(sym_id).unwrap();
-                let sf_s = sym_table.get_symbol(sf.r#let).unwrap();
-                println!("DEBUG: Got Sym: {:?} Pkg: {:?}", s.name, s.package);
-                println!("DEBUG: Exp Sym: {:?} Pkg: {:?}", sf_s.name, sf_s.package);
             }
 
             if sym_id == sf.r#if {
@@ -1934,6 +2216,19 @@ impl<'a> Interpreter<'a> {
                 return self.eval_locally(args, env);
             }
 
+            if let Some(func_node) = env.lookup_function(sym_id) {
+                if let Node::Leaf(OpaqueValue::CallMethod(state_idx)) =
+                    self.process.arena.get_unchecked(func_node)
+                {
+                    return self.eval_call_method_form(*state_idx as usize, args, env);
+                }
+            }
+
+            // Check lexical function bindings (Lisp-2)
+            if let Some(func) = env.lookup_function(sym_id) {
+                return self.apply_function(func, args, env);
+            }
+
             // Check if symbol is a primitive
             if let Some(&prim_fn) = self.globals.primitives.get(&sym_id) {
                 // Evaluate arguments
@@ -1961,10 +2256,7 @@ impl<'a> Interpreter<'a> {
                 return self.apply_function(val, args, env);
             }
         } else {
-            // eprintln!("DEBUG: eval_application op is NOT a symbol! Op Node: {:?}", op);
             match self.process.arena.inner.get_unchecked(op) {
-                // Node::Fork(_, _) => eprintln!("DEBUG: Op is a List (Fork)"),
-                // Node::Leaf(val) => eprintln!("DEBUG: Op is a Leaf: {:?}", val),
                 _ => {}
             }
         }
@@ -1976,13 +2268,517 @@ impl<'a> Interpreter<'a> {
         self.apply_function(op_val, args, env)
     }
 
+    /// Apply Generic Function
+    fn apply_generic_function(
+        &mut self,
+        gid: crate::clos::GenericId,
+        args: Vec<NodeId>,
+        _env: &Environment,
+    ) -> Result<bool, ControlSignal> {
+        // Ensure CALL-NEXT-METHOD is present in COMMON-LISP for lexical binding.
+        let _ = self.ensure_cl_symbol("CALL-NEXT-METHOD");
+
+        let arg_classes: Vec<_> = args.iter().map(|&a| self.get_arg_class(a)).collect();
+        let methods = self
+            .process
+            .mop
+            .compute_applicable_methods(gid, &arg_classes);
+
+        if methods.is_empty() {
+            return Err(ControlSignal::Error(format!(
+                "No applicable method for generic function {:?} with args {:?}",
+                gid, args
+            )));
+        }
+
+        let kw_before = self.ensure_keyword_symbol("BEFORE");
+        let kw_after = self.ensure_keyword_symbol("AFTER");
+        let kw_around = self.ensure_keyword_symbol("AROUND");
+
+        let method_combination = self
+            .process
+            .mop
+            .get_generic(gid)
+            .map(|g| g.method_combination.clone())
+            .unwrap_or(crate::clos::MethodCombination::Standard);
+
+        // Build method chain based on method combination.
+        let mut chain: Vec<crate::clos::MethodId> = Vec::new();
+
+        match &method_combination {
+            crate::clos::MethodCombination::Standard => {
+                // Standard Method Combination (around, before, primary, after)
+                let mut arounds = Vec::new();
+                let mut befores = Vec::new();
+                let mut primaries = Vec::new();
+                let mut afters = Vec::new();
+
+                for &mid in &methods {
+                    let method = self.process.mop.get_method(mid).unwrap();
+                    let has_around = method.qualifiers.iter().any(|q| *q == kw_around);
+                    let has_before = method.qualifiers.iter().any(|q| *q == kw_before);
+                    let has_after = method.qualifiers.iter().any(|q| *q == kw_after);
+
+                    if has_around {
+                        arounds.push(mid);
+                    } else if has_before {
+                        befores.push(mid);
+                    } else if has_after {
+                        afters.push(mid);
+                    } else {
+                        primaries.push(mid);
+                    }
+                }
+
+                if primaries.is_empty() && arounds.is_empty() {
+                    return Err(ControlSignal::Error(format!(
+                        "No applicable primary method for generic function {:?} with args {:?}",
+                        gid, args
+                    )));
+                }
+
+                chain.extend(arounds);
+
+                for mid in befores {
+                    let wrapper = self.get_or_create_wrapper(mid, crate::clos::WrapperKind::Before);
+                    chain.push(wrapper);
+                }
+
+                for mid in afters {
+                    let wrapper = self.get_or_create_wrapper(mid, crate::clos::WrapperKind::After);
+                    chain.push(wrapper);
+                }
+
+                chain.extend(primaries);
+            }
+            crate::clos::MethodCombination::Operator {
+                name,
+                operator,
+                identity_with_one_arg,
+            } => {
+                let mut arounds = Vec::new();
+                let mut primaries = Vec::new();
+
+                for &mid in &methods {
+                    let method = self.process.mop.get_method(mid).unwrap();
+                    let has_around = method.qualifiers.iter().any(|q| *q == kw_around);
+                    if has_around {
+                        arounds.push(mid);
+                        continue;
+                    }
+
+                    if method.qualifiers.len() == 1 && method.qualifiers[0] == *name {
+                        primaries.push(mid);
+                    }
+                }
+
+                if primaries.is_empty() && arounds.is_empty() {
+                    return Err(ControlSignal::Error(format!(
+                        "No applicable primary method for generic function {:?} with args {:?}",
+                        gid, args
+                    )));
+                }
+
+                if primaries.is_empty() {
+                    return Err(ControlSignal::Error(format!(
+                        "No applicable primary method for operator method combination {:?}",
+                        gid
+                    )));
+                }
+
+                let comb_method =
+                    self.build_operator_wrapper(&primaries, *operator, *identity_with_one_arg);
+                chain.extend(arounds);
+                chain.push(comb_method);
+            }
+            crate::clos::MethodCombination::UserLong {
+                expander,
+                options,
+                ..
+            } => {
+                if methods.is_empty() {
+                    return Err(ControlSignal::Error(format!(
+                        "No applicable method for generic function {:?} with args {:?}",
+                        gid, args
+                    )));
+                }
+
+                // Build list of method objects (most specific first).
+                let mut method_nodes = Vec::with_capacity(methods.len());
+                for &mid in &methods {
+                    let mnode = self
+                        .process
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Method(mid.0)));
+                    method_nodes.push(mnode);
+                }
+                let methods_list = self.process.make_list(&method_nodes);
+
+                let gf_node = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Generic(gid.0)));
+                let options_list = *options;
+                let args_list = self.process.make_list(&args);
+
+                // Invoke expander with evaluated arguments.
+                let expander_args = vec![gf_node, methods_list, options_list, args_list];
+                let expansion = match self.process.arena.get_unchecked(*expander) {
+                    Node::Leaf(OpaqueValue::Closure(idx)) => {
+                        let closure = self.process.closures[*idx as usize].clone();
+                        let new_env = self.bind_lambda_list(&closure, &expander_args, None)?;
+                        self.eval(closure.body, &new_env)?
+                    }
+                    _ => {
+                        return Err(ControlSignal::Error(
+                            "Method combination expander is not a closure".into(),
+                        ))
+                    }
+                };
+
+                // Wrap expansion in a closure that receives &rest args.
+                let args_sym = {
+                    let mut syms = self.globals.symbols.write().unwrap();
+                    syms.make_symbol("ARGS")
+                };
+                let progn_sym = self.globals.special_forms.progn;
+                let progn_sym_node = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(progn_sym.0)));
+                let body_list = self.process.make_list(&[expansion]);
+                let body_node = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Fork(progn_sym_node, body_list));
+
+                let mut lambda_list = ParsedLambdaList::default();
+                lambda_list.rest = Some(args_sym);
+                let closure = Closure {
+                    lambda_list,
+                    body: body_node,
+                    env: Environment::new(),
+                };
+                let closure_idx = self.process.closures.len();
+                self.process.closures.push(closure);
+
+                // Bind call-method in the expansion evaluation context.
+                let next_state = crate::clos::NextMethodState {
+                    methods: Vec::new(),
+                    args: args.clone(),
+                };
+                self.process.next_method_states.push(next_state);
+                let next_state_idx = (self.process.next_method_states.len() - 1) as u32;
+
+                let wrapper = OpaqueValue::MethodWrapper(closure_idx as u32, next_state_idx);
+                let wrapper_node = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(wrapper));
+
+                return self.step_apply(wrapper_node, args.clone(), Environment::new());
+            }
+        }
+
+        // Method Chain Logic
+        let first_method_id = chain[0];
+        let remaining_methods = chain[1..].to_vec();
+
+        let state = crate::clos::NextMethodState {
+            methods: remaining_methods,
+            args: args.clone(),
+        };
+
+        self.process.next_method_states.push(state);
+        let state_idx = (self.process.next_method_states.len() - 1) as u32;
+
+        let method = self.process.mop.get_method(first_method_id).unwrap();
+
+        // Method body is expected to be a Closure NodeId
+        let method_body_node = method.body;
+        // Check if method body is a closure
+        let closure_idx = if let Node::Leaf(OpaqueValue::Closure(idx)) =
+            self.process.arena.get_unchecked(method_body_node)
+        {
+            Some(*idx)
+        } else {
+            None
+        };
+
+        if let Some(idx) = closure_idx {
+            // Create Wrapper
+            let wrapper = OpaqueValue::MethodWrapper(idx, state_idx);
+            let wrapper_node = self.process.arena.inner.alloc(Node::Leaf(wrapper));
+
+            // Apply wrapper
+            self.step_apply(wrapper_node, args, Environment::new())
+        } else {
+            let body_str = {
+                let syms = self.globals.symbols.read().unwrap();
+                crate::printer::print_to_string(&self.process.arena.inner, &syms, method_body_node)
+            };
+            Err(ControlSignal::Error(format!(
+                "Method body is not a closure code: {} ({:?})",
+                body_str,
+                self.process.arena.get_unchecked(method_body_node)
+            )))
+        }
+    }
+
+    fn ensure_keyword_symbol(&mut self, name: &str) -> SymbolId {
+        let mut syms = self.globals.symbols.write().unwrap();
+        let sym = syms.intern_in(name, crate::symbol::PackageId(0));
+        sym
+    }
+
+    fn ensure_cl_symbol(&mut self, name: &str) -> SymbolId {
+        let mut syms = self.globals.symbols.write().unwrap();
+        let sym = syms.intern_in(name, crate::symbol::PackageId(1));
+        syms.export_symbol(sym);
+        sym
+    }
+
+    fn sym_node(&mut self, sym: SymbolId) -> NodeId {
+        self.process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)))
+    }
+
+    fn get_or_create_wrapper(
+        &mut self,
+        method_id: crate::clos::MethodId,
+        kind: crate::clos::WrapperKind,
+    ) -> crate::clos::MethodId {
+        if let Some(w) = self.process.mop.get_wrapper(kind, method_id) {
+            return w;
+        }
+
+        let method = self.process.mop.get_method(method_id).unwrap();
+        let method_body = method.body;
+
+        // Build wrapper closure with (&rest args)
+        let args_sym = {
+            let mut syms = self.globals.symbols.write().unwrap();
+            syms.make_symbol("ARGS")
+        };
+        let args_node = self.sym_node(args_sym);
+
+        let apply_sym = self.ensure_cl_symbol("APPLY");
+        let call_next_sym = self.ensure_cl_symbol("CALL-NEXT-METHOD");
+        let progn_sym = self.ensure_cl_symbol("PROGN");
+        let let_sym = self.ensure_cl_symbol("LET");
+
+        let apply_sym_node = self.sym_node(apply_sym);
+        let call_next_sym_node = self.sym_node(call_next_sym);
+        let progn_sym_node = self.sym_node(progn_sym);
+        let let_sym_node = self.sym_node(let_sym);
+
+        let apply_call = self
+            .process
+            .make_list(&[apply_sym_node, method_body, args_node]);
+        let call_next_call = self.process.make_list(&[call_next_sym_node]);
+
+        let body_node = match kind {
+            crate::clos::WrapperKind::Before => {
+                self.process
+                    .make_list(&[progn_sym_node, apply_call, call_next_call])
+            }
+            crate::clos::WrapperKind::After => {
+                let result_sym = {
+                    let mut syms = self.globals.symbols.write().unwrap();
+                    syms.make_symbol("RESULT")
+                };
+                let result_node = self.sym_node(result_sym);
+
+                // (let ((result (call-next-method))) (apply method args) result)
+                let binding = self.process.make_list(&[result_node, call_next_call]);
+                let bindings = self.process.make_list(&[binding]);
+                self.process
+                    .make_list(&[let_sym_node, bindings, apply_call, result_node])
+            }
+        };
+
+        let mut lambda_list = ParsedLambdaList::default();
+        lambda_list.rest = Some(args_sym);
+
+        let closure = Closure {
+            lambda_list,
+            body: body_node,
+            env: Environment::new(),
+        };
+        let closure_idx = self.process.closures.len();
+        self.process.closures.push(closure);
+        let closure_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
+
+        let wrapper_id = self
+            .process
+            .mop
+            .add_method_raw(Vec::new(), Vec::new(), closure_node);
+        self.process.mop.set_wrapper(kind, method_id, wrapper_id);
+        wrapper_id
+    }
+
+    fn build_operator_wrapper(
+        &mut self,
+        primaries: &[crate::clos::MethodId],
+        operator: SymbolId,
+        identity_with_one_arg: bool,
+    ) -> crate::clos::MethodId {
+        // Build wrapper closure with (&rest args)
+        let args_sym = {
+            let mut syms = self.globals.symbols.write().unwrap();
+            syms.make_symbol("ARGS")
+        };
+        let args_node = self.sym_node(args_sym);
+
+        let apply_sym = self.ensure_cl_symbol("APPLY");
+        let apply_sym_node = self.sym_node(apply_sym);
+        let operator_node = self.sym_node(operator);
+
+        let mut calls = Vec::new();
+        for &mid in primaries {
+            let method = self.process.mop.get_method(mid).unwrap();
+            let method_body = method.body;
+            let apply_call = self
+                .process
+                .make_list(&[apply_sym_node, method_body, args_node]);
+            calls.push(apply_call);
+        }
+
+        let body_node = if identity_with_one_arg && calls.len() == 1 {
+            calls[0]
+        } else {
+            let mut elems = Vec::with_capacity(calls.len() + 1);
+            elems.push(operator_node);
+            elems.extend(calls);
+            self.process.make_list(&elems)
+        };
+
+        let mut lambda_list = ParsedLambdaList::default();
+        lambda_list.rest = Some(args_sym);
+
+        let closure = Closure {
+            lambda_list,
+            body: body_node,
+            env: Environment::new(),
+        };
+        let closure_idx = self.process.closures.len();
+        self.process.closures.push(closure);
+        let closure_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
+
+        self.process
+            .mop
+            .add_method_raw(Vec::new(), Vec::new(), closure_node)
+    }
+
+    fn get_arg_class(&self, arg: NodeId) -> crate::clos::ClassId {
+        match self.process.arena.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::Instance(id)) => {
+                if let Some(inst) = self.process.mop.get_instance(*id as usize) {
+                    inst.class
+                } else {
+                    self.process.mop.standard_object
+                }
+            }
+            Node::Leaf(OpaqueValue::Class(_)) => self.process.mop.standard_class,
+            Node::Leaf(OpaqueValue::Symbol(_)) => self.process.mop.symbol_class,
+            Node::Leaf(OpaqueValue::Integer(_)) => self.process.mop.integer_class,
+            _ => {
+                self.process.mop.t_class
+            }
+        }
+    }
+
+    fn method_id_from_node(
+        &mut self,
+        node: NodeId,
+    ) -> Result<crate::clos::MethodId, ControlSignal> {
+        match self.process.arena.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Method(id)) => Ok(crate::clos::MethodId(*id)),
+            Node::Leaf(OpaqueValue::Closure(_)) => {
+                let mid = self.process.mop.add_method_raw(Vec::new(), Vec::new(), node);
+                Ok(mid)
+            }
+            other => Err(ControlSignal::Error(format!(
+                "CALL-METHOD requires a method object, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn collect_method_ids(
+        &mut self,
+        list: NodeId,
+    ) -> Result<Vec<crate::clos::MethodId>, ControlSignal> {
+        if self.is_nil(list) {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        let mut current = list;
+        while let Node::Fork(head, tail) = self.process.arena.get_unchecked(current).clone() {
+            let mid = self.method_id_from_node(head)?;
+            out.push(mid);
+            current = tail;
+        }
+        Ok(out)
+    }
+
+    fn call_method_with_next_methods(
+        &mut self,
+        method_id: crate::clos::MethodId,
+        next_methods: Vec<crate::clos::MethodId>,
+        args: Vec<NodeId>,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        let next_state = crate::clos::NextMethodState {
+            methods: next_methods,
+            args: args.clone(),
+        };
+
+        self.process.next_method_states.push(next_state);
+        let next_state_idx = (self.process.next_method_states.len() - 1) as u32;
+
+        let method = self
+            .process
+            .mop
+            .get_method(method_id)
+            .ok_or_else(|| ControlSignal::Error("Invalid method object".into()))?;
+        let body = method.body;
+
+        if let Node::Leaf(OpaqueValue::Closure(idx)) = self.process.arena.get_unchecked(body) {
+            let wrapper = OpaqueValue::MethodWrapper(*idx, next_state_idx);
+            let wrapper_node = self.process.arena.inner.alloc(Node::Leaf(wrapper));
+            return self.step_apply(wrapper_node, args, env);
+        }
+
+        Err(ControlSignal::Error(
+            "Call-method body is not closure".into(),
+        ))
+    }
+
     /// Convert a node to a SymbolId if it represents a symbol
     pub fn node_to_symbol(&self, node_id: NodeId) -> Option<SymbolId> {
         let node = self.process.arena.get_unchecked(node_id);
-        if let Node::Leaf(OpaqueValue::Symbol(id)) = node {
-            return Some(SymbolId(*id));
+        match node {
+            Node::Leaf(OpaqueValue::Symbol(id)) => Some(SymbolId(*id)),
+            Node::Leaf(OpaqueValue::Nil) => Some(self.globals.nil_sym),
+            _ => None,
         }
-        None
     }
 
     /// Check if a node is NIL
@@ -2072,65 +2868,46 @@ impl<'a> Interpreter<'a> {
                                     if let Some(name) =
                                         self.globals.symbols.read().unwrap().symbol_name(op_sym)
                                     {
-                                        eprintln!("DEBUG: eval_setq saw fork with op: {}", name);
                                         if name == "SYMBOL-VALUE" {
                                             let res = self.node_to_symbol(*arg);
-                                            eprintln!("DEBUG: eval_setq extracted arg: {:?}", res);
                                             return res;
                                         }
-                                    } else {
-                                        eprintln!("DEBUG: eval_setq op symbol has no name");
                                     }
-                                } else {
-                                    eprintln!("DEBUG: eval_setq op is not a symbol");
                                 }
-                            } else {
-                                eprintln!("DEBUG: eval_setq var_node is not Fork or Symbol");
                             }
                             None
                         });
 
                         if let Some(sym) = raw_sym_opt {
-                            // Check for protected symbol
-                            if self.globals.symbols.read().unwrap().is_protected(sym) {
-                                return Err(ControlSignal::Error(format!(
-                                    "SETQ: cannot set protected symbol {:?}",
-                                    self.globals
-                                        .symbols
-                                        .read()
-                                        .unwrap()
-                                        .get_symbol(sym)
-                                        .map(|s| s.name.as_str())
-                                        .unwrap_or("?")
-                                )));
-                            }
-
                             let val = self.eval(val_node, env)?;
-                            // Set in Process Dictionary
-                            self.process.set_value(sym, val);
+
+                            let found = env.set(sym, val);
+                            if !found {
+                                // Check for protected symbol
+                                if self.globals.symbols.read().unwrap().is_protected(sym) {
+                                    return Err(ControlSignal::Error(format!(
+                                        "SETQ: cannot set protected symbol {:?}",
+                                        self.globals
+                                            .symbols
+                                            .read()
+                                            .unwrap()
+                                            .get_symbol(sym)
+                                            .map(|s| s.name.as_str())
+                                            .unwrap_or("?")
+                                    )));
+                                }
+
+                                // Set in Process Dictionary
+                                self.process.set_value(sym, val);
+                            }
                             result = val;
-                        } else {
-                            eprintln!(
-                                "DEBUG: eval_setq failed to extract symbol from {:?}",
-                                var_node
-                            );
                         }
                         current = next;
                     } else {
-                        eprintln!(
-                            "DEBUG: eval_setq broke loop on val parsing. rest={:?}",
-                            self.process.arena.get_unchecked(rest)
-                        );
                         break;
                     }
                 }
-                _ => {
-                    eprintln!(
-                        "DEBUG: eval_setq broke loop on var parsing. current={:?}",
-                        self.process.arena.get_unchecked(current)
-                    );
-                    break;
-                }
+                _ => break,
             }
         }
 
@@ -2173,7 +2950,7 @@ impl<'a> Interpreter<'a> {
     /// (let ((var val) ...) body*) -> create local bindings
     fn eval_let(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         if let Node::Fork(bindings, body) = self.process.arena.get_unchecked(args).clone() {
-            let mut new_env = Environment::with_parent(env.clone());
+            let new_env = Environment::with_parent(env.clone());
 
             // Process bindings
             let mut current = bindings;
@@ -2215,10 +2992,23 @@ impl<'a> Interpreter<'a> {
                 Err(e) => return Err(ControlSignal::Error(e)),
             };
 
+            // Wrap body in PROGN so multiple forms evaluate correctly.
+            let progn_sym = self.globals.special_forms.progn;
+            let progn_sym_node = self
+                .process
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(progn_sym.0)));
+            let body_node = self
+                .process
+                .arena
+                .inner
+                .alloc(Node::Fork(progn_sym_node, body));
+
             // Create closure
             let closure = Closure {
                 lambda_list: parsed_lambda_list,
-                body,
+                body: body_node,
                 env: env.clone(),
             };
 
@@ -2242,8 +3032,10 @@ impl<'a> Interpreter<'a> {
         if let Node::Fork(name, _) = self.process.arena.get_unchecked(args).clone() {
             // Check if it's a lambda
             if let Node::Fork(car, _) = self.process.arena.get_unchecked(name).clone() {
-                if self.node_to_symbol(car) == Some(self.globals.special_forms.lambda) {
-                    return self.eval(name, env);
+                if let Some(s) = self.node_to_symbol(car) {
+                    if s == self.globals.special_forms.lambda {
+                        return self.eval(name, env);
+                    }
                 }
             }
 
@@ -2531,6 +3323,118 @@ impl<'a> Interpreter<'a> {
                 self.apply_generic(id, args, env)
                 // Ok(self.process.make_nil())
             }
+            Node::Leaf(OpaqueValue::NextMethod(state_idx)) => {
+                let state_idx = state_idx as usize;
+                if state_idx >= self.process.next_method_states.len() {
+                    return Err(ControlSignal::Error("Invalid NextMethod state".into()));
+                }
+
+                let current_state = self.process.next_method_states[state_idx].clone();
+                if current_state.methods.is_empty() {
+                    return Err(ControlSignal::Error("No next method".into()));
+                }
+
+                let next_method_id = current_state.methods[0];
+                let remaining = current_state.methods[1..].to_vec();
+
+                let raw_args = self.cons_to_vec(args);
+                let next_args = if raw_args.is_empty() {
+                    current_state.args.clone()
+                } else {
+                    let mut evaluated_args = Vec::with_capacity(raw_args.len());
+                    for arg in raw_args {
+                        evaluated_args.push(self.eval(arg, env)?);
+                    }
+                    evaluated_args
+                };
+
+                let next_state = crate::clos::NextMethodState {
+                    methods: remaining,
+                    args: next_args.clone(),
+                };
+
+                self.process.next_method_states.push(next_state);
+                let next_state_idx = (self.process.next_method_states.len() - 1) as u32;
+
+                let method = self.process.mop.get_method(next_method_id).unwrap();
+                let body = method.body;
+
+                if let Node::Leaf(OpaqueValue::Closure(idx)) =
+                    self.process.arena.get_unchecked(body)
+                {
+                    let wrapper = OpaqueValue::MethodWrapper(*idx, next_state_idx);
+                    let wrapper_node = self.process.arena.inner.alloc(Node::Leaf(wrapper));
+                    self.step_apply(wrapper_node, next_args, env.clone())?;
+
+                    loop {
+                        match self.process.execution_mode {
+                            crate::process::ExecutionMode::Return => {
+                                return Ok(self.process.program);
+                            }
+                            crate::process::ExecutionMode::Eval => {
+                                if !self.step()? {
+                                    // Paused
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Err(ControlSignal::Error(
+                        "Next method body is not closure".into(),
+                    ))
+                }
+            }
+            Node::Leaf(OpaqueValue::NextMethodP(state_idx)) => {
+                let state_idx = state_idx as usize;
+                if state_idx >= self.process.next_method_states.len() {
+                    return Err(ControlSignal::Error("Invalid NextMethod state".into()));
+                }
+                let has_next = !self.process.next_method_states[state_idx].methods.is_empty();
+                Ok(if has_next {
+                    self.process.make_t(&self.globals)
+                } else {
+                    self.process.make_nil()
+                })
+            }
+            Node::Leaf(OpaqueValue::CallMethod(state_idx)) => {
+                let state_idx = state_idx as usize;
+                if state_idx >= self.process.next_method_states.len() {
+                    return Err(ControlSignal::Error("Invalid CallMethod state".into()));
+                }
+
+                let raw_args = self.cons_to_vec(args);
+                if raw_args.is_empty() {
+                    return Err(ControlSignal::Error(
+                        "CALL-METHOD requires a method".into(),
+                    ));
+                }
+
+                let method_node = self.eval(raw_args[0], env)?;
+                let next_methods_node = if raw_args.len() > 1 {
+                    self.eval(raw_args[1], env)?
+                } else {
+                    self.process.make_nil()
+                };
+
+                let method_id = self.method_id_from_node(method_node)?;
+                let next_methods = self.collect_method_ids(next_methods_node)?;
+
+                let call_args = self.process.next_method_states[state_idx].args.clone();
+                self.call_method_with_next_methods(method_id, next_methods, call_args, env.clone())?;
+
+                loop {
+                    match self.process.execution_mode {
+                        crate::process::ExecutionMode::Return => {
+                            return Ok(self.process.program);
+                        }
+                        crate::process::ExecutionMode::Eval => {
+                            if !self.step()? {
+                                // Paused
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
                 // Fall back to tree calculus reduction
                 // Evaluate arguments and apply one at a time (curried)
@@ -2545,6 +3449,60 @@ impl<'a> Interpreter<'a> {
                 {
                     // Evaluate the argument
                     let arg_val = self.eval(arg_expr, env)?;
+
+                    // Apply Tree Calculus: (result arg_val)
+                    let app = self.process.arena.alloc(Node::Fork(result, arg_val));
+                    result = reduce(
+                        &mut self.process.arena.inner,
+                        app,
+                        &mut self.process.eval_context,
+                    );
+
+                    current = rest;
+                }
+
+                Ok(self.try_reduce_primitive(result, env))
+            }
+        }
+    }
+
+    pub fn apply_values(&mut self, func: NodeId, args: NodeId, env: &Environment) -> EvalResult {
+        let func_node = self.process.arena.get_unchecked(func).clone();
+
+        match func_node {
+            Node::Leaf(OpaqueValue::Closure(_)) | Node::Leaf(OpaqueValue::Generic(_)) => {
+                let mut arg_vec = Vec::new();
+                let mut curr = args;
+                while let Node::Fork(h, t) = self.process.arena.inner.get_unchecked(curr).clone() {
+                    arg_vec.push(h);
+                    curr = t;
+                }
+                self.step_apply(func, arg_vec, env.clone())?;
+
+                // Adapter loop
+                loop {
+                    match self.process.execution_mode {
+                        crate::process::ExecutionMode::Return => return Ok(self.process.program),
+                        crate::process::ExecutionMode::Eval => {
+                            if !self.step()? {
+                                // Paused
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Fall back to tree calculus reduction (without evaluation of args)
+                use crate::search::reduce;
+
+                let mut result = func;
+                let mut current = args;
+
+                // Walk through argument list
+                while let Node::Fork(arg, rest) = self.process.arena.get_unchecked(current).clone()
+                {
+                    // Use argument as value directly
+                    let arg_val = arg;
 
                     // Apply Tree Calculus: (result arg_val)
                     let app = self.process.arena.alloc(Node::Fork(result, arg_val));
@@ -2646,24 +3604,7 @@ impl<'a> Interpreter<'a> {
             }
 
             // Check primitives
-            if self
-                .globals
-                .symbols
-                .read()
-                .unwrap()
-                .symbol_name(sym)
-                .unwrap_or("")
-                == "PROGN"
-            {
-                println!("DEBUG: CAUGHT eval(PROGN)! sym={:?}", sym);
-                let bt = std::backtrace::Backtrace::capture();
-                println!("Backtrace:\n{:?}", bt);
-            }
-            if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym) {
-                eprintln!("DEBUG: Checking primitive: {} ({:?})", name, sym);
-            }
             if let Some(&prim_fn) = self.globals.primitives.get(&sym) {
-                eprintln!("DEBUG: Primitive found: {:?}", sym);
                 // We have a primitive!
                 let raw_args = &spine[1..];
 
@@ -2687,12 +3628,10 @@ impl<'a> Interpreter<'a> {
                         return root;
                     }
                     Err(ControlSignal::Error(msg)) => {
-                        eprintln!("DEBUG: Swallowed error in try_reduce_primitive: {}", msg);
                         self.process.status = crate::process::Status::Failed(msg);
                         return root;
                     }
                     Err(e) => {
-                        eprintln!("DEBUG: Swallowed signal in try_reduce_primitive: {:?}", e);
                         return root; // Fallback on error (keep stuck state)
                     }
                 }
@@ -2825,8 +3764,16 @@ impl<'a> Interpreter<'a> {
             new_env.bind(*var, val);
         }
 
-        // Evaluate body
-        self.eval_progn(closure.body, &new_env)
+        // Evaluate body. Functions are stored as a single expression, usually a PROGN list.
+        let body = closure.body;
+        if let Node::Fork(head, tail) = self.process.arena.inner.get_unchecked(body).clone() {
+            if let Some(sym) = self.node_to_symbol(head) {
+                if sym == self.globals.special_forms.progn {
+                    return self.eval_progn(tail, &new_env);
+                }
+            }
+        }
+        self.eval_progn(body, &new_env)
     }
 
     /// Apply a macro closure to arguments (no eval of args)
@@ -2870,87 +3817,50 @@ impl<'a> Interpreter<'a> {
 
         // 3. Rest
         if let Some(rest_sym) = closure.lambda_list.rest {
-            println!("DEBUG: bind rest {:?} to {:?}", rest_sym, current_arg);
             new_env.bind(rest_sym, current_arg);
         }
 
         // Evaluate body - this produces the expansion
-        println!(
-            "DEBUG: apply_macro calling eval_progn. Env keys count: {}",
-            new_env.bindings.len()
-        );
         let expansion = self.eval_progn(closure.body, &new_env)?;
         Ok(expansion)
     }
 
     /// Apply a generic function
+    /// Apply a generic function
     fn apply_generic(&mut self, gf_id: u32, args: NodeId, env: &Environment) -> EvalResult {
-        use crate::clos::GenericId;
-
-        let gf_id = GenericId(gf_id);
-
-        // 1. Evaluate arguments to get classes
+        // 1. Evaluate arguments (Generic Function application expects evaluated args)
         let mut evaluated_args = Vec::new();
-        let mut executed_args = Vec::new(); // Values to pass to method
         let mut current = args;
         while let Node::Fork(arg, rest) = self.process.arena.inner.get_unchecked(current).clone() {
             let val = self.eval(arg, env)?;
-            executed_args.push(val);
-            evaluated_args.push(val); // In a real implementation, we might need these separate
+            evaluated_args.push(val);
             current = rest;
         }
 
-        // 2. Get classes of arguments
-        let mut arg_classes = Vec::new();
-        for &arg in &executed_args {
-            let class_id = self.class_of(arg);
-            arg_classes.push(class_id);
-        }
+        // 2. Delegate to apply_generic_function (TCO logic)
+        use crate::clos::GenericId;
+        self.apply_generic_function(GenericId(gf_id), evaluated_args, env)?;
 
-        // 3. Compute applicable methods
-        let applicable = self
-            .process
-            .mop
-            .compute_applicable_methods(gf_id, &arg_classes);
-
-        if applicable.is_empty() {
-            return Err(ControlSignal::Error(format!(
-                "No applicable method for generic function {:?} with args {:?}",
-                gf_id, arg_classes
-            )));
-        }
-
-        // 4. Call most specific method (primary only for now)
-        let method_id = applicable[0];
-        let method = self.process.mop.get_method(method_id).unwrap();
-        let method_body = method.body;
-
-        // Apply method closure
-        if let Node::Leaf(OpaqueValue::Closure(idx)) =
-            self.process.arena.inner.get_unchecked(method_body).clone()
-        {
-            if let Some(closure) = self.process.closures.get(idx as usize).cloned() {
-                // Manual binding
-                let mut method_env = Environment::with_parent(closure.env.clone());
-                if executed_args.len() != closure.lambda_list.req.len() {
-                    return Err(ControlSignal::Error(
-                        "Method argument count mismatch".to_string(),
-                    ));
+        // 3. Adapter: Run the interpreter loop until return (Simulate synchronous execution)
+        loop {
+            match self.process.execution_mode {
+                crate::process::ExecutionMode::Return => {
+                    return Ok(self.process.program);
                 }
-                for (param, val) in closure.lambda_list.req.iter().zip(executed_args.iter()) {
-                    self.bind_pattern(&mut method_env, *param, *val, false)?;
+                crate::process::ExecutionMode::Eval => {
+                    // Continue stepping
+                    if !self.step()? {
+                        // If step returns false (pause/interrupt), we might be in trouble here if we expect a result.
+                        // But for now assume it runs to completion.
+                        // Or wait?
+                    }
                 }
-                return self.eval_progn(closure.body, &method_env);
             }
         }
-
-        // Fallback
-        Err(ControlSignal::Error(
-            "Method body is not a valid closure".to_string(),
-        ))
     }
 
     /// Get class of value
+    #[allow(dead_code)]
     fn class_of(&self, val: NodeId) -> crate::clos::ClassId {
         match self.process.arena.inner.get_unchecked(val) {
             Node::Leaf(OpaqueValue::Integer(_)) => crate::clos::ClassId(0), // Fixme: map to Integer class
@@ -3313,7 +4223,8 @@ impl<'a> Interpreter<'a> {
         Ok(true)
     }
 
-    fn step_multiple_value_bind_DUP(
+    #[allow(dead_code)]
+    fn step_multiple_value_bind_dup(
         &mut self,
         args: NodeId,
         env: Environment,
@@ -3368,10 +4279,6 @@ impl<'a> Interpreter<'a> {
             Node::Fork(car, cdr) => {
                 // Check if car is UNQUOTE or UNQUOTE-SPLICING
                 if let Some(sym) = self.node_to_symbol(car) {
-                    println!(
-                        "DEBUG: eval_qq inner sym={:?} unquote={:?}",
-                        sym, self.globals.special_forms.unquote
-                    );
                     if sym == self.globals.special_forms.unquote {
                         // (unquote x) -> eval x
                         // (unquote . (x . nil))

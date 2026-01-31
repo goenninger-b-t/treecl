@@ -127,7 +127,7 @@ impl SchedulerHandle {
         }
     }
 
-    pub fn spawn_process(&self, globals: &crate::context::GlobalContext, func: NodeId) -> Pid {
+    pub fn spawn_process(&self, globals: &crate::context::GlobalContext, _func: NodeId) -> Pid {
         let mut pid_guard = self.next_pid.lock().unwrap();
         let pid = Pid {
             node: self.node_id,
@@ -148,6 +148,7 @@ impl SchedulerHandle {
         self.global_queue.push(pid);
     }
 
+    #[allow(dead_code)]
     fn resume_process(&self, pid: Pid, mut proc: Process, result: NodeId) {
         if let Some(redex) = proc.pending_redex.take() {
             let result_node = proc.arena.inner.get_unchecked(result).clone();
@@ -164,7 +165,7 @@ impl SchedulerHandle {
 pub fn run_worker(
     handle: SchedulerHandle,
     local: Worker<Pid>,
-    worker_idx: usize,
+    _worker_idx: usize,
     // Global context is problematic here. It's shared!
     // But Globals uses RwLock internally for Symbols.
     // Primitives are read-only HashMap.
@@ -225,7 +226,11 @@ pub fn run_worker(
                             }
                         }
                         ExecutionResult::Blocked => {
-                            if !matches!(proc.status, Status::Debugger(_)) {
+                            if matches!(proc.status, Status::Debugger(_)) {
+                                proc.debugger_thread_id = Some(os_thread_id());
+                                proc.debugger_thread_name =
+                                    std::thread::current().name().map(|s| s.to_string());
+                            } else {
                                 proc.status = Status::Waiting(None);
                             }
                         }
@@ -253,6 +258,23 @@ pub fn run_worker(
             thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn os_thread_id() -> u64 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn os_thread_id() -> u64 {
+    unsafe { libc::pthread_self() as u64 }
+}
+
+#[cfg(not(unix))]
+fn os_thread_id() -> u64 {
+    let raw = format!("{:?}", std::thread::current().id());
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().unwrap_or(0)
 }
 
 fn handle_syscall(
@@ -369,7 +391,7 @@ fn handle_syscall(
 
                     // Delivery logic
                     let mut wake = false;
-                    if let Status::Waiting(pat) = target_proc.status {
+                    if let Status::Waiting(_pat) = target_proc.status {
                         // Check pattern
                         wake = true; // Simplify
                     }

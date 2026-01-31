@@ -2,7 +2,6 @@ use crate::arena::Node;
 use crate::context::GlobalContext;
 use crate::eval::{ControlSignal, EvalResult};
 use crate::process::Process;
-use crate::symbol::PackageId;
 use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
 

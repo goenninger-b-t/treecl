@@ -221,6 +221,22 @@ impl<'a> Printer<'a> {
             OpaqueValue::Package(id) => {
                 self.output.push_str(&format!("#<package:{}>", id));
             }
+            OpaqueValue::NextMethod(id) => {
+                self.output.push_str(&format!("#<next-method:{}>", id));
+            }
+            OpaqueValue::NextMethodP(id) => {
+                self.output.push_str(&format!("#<next-method-p:{}>", id));
+            }
+            OpaqueValue::CallMethod(id) => {
+                self.output.push_str(&format!("#<call-method:{}>", id));
+            }
+            OpaqueValue::MethodWrapper(a, b) => {
+                self.output
+                    .push_str(&format!("#<method-wrapper:{}:{}>", a, b));
+            }
+            OpaqueValue::Method(id) => {
+                self.output.push_str(&format!("#<method:{}>", id));
+            }
         }
     }
 
@@ -419,6 +435,70 @@ impl<'a> TreePrinter<'a> {
 pub fn tree_format(arena: &Arena, node: NodeId) -> String {
     let mut p = TreePrinter::new(arena);
     p.print(node);
+    p.output
+}
+
+struct DotPrinter<'a> {
+    arena: &'a Arena,
+    symbols: &'a crate::symbol::SymbolTable,
+    output: String,
+    next_id: usize,
+}
+
+impl<'a> DotPrinter<'a> {
+    fn new(arena: &'a Arena, symbols: &'a crate::symbol::SymbolTable) -> Self {
+        Self {
+            arena,
+            symbols,
+            output: String::from("digraph Tree {\n node [shape=circle, width=0.1, height=0.1, label=\"\"];\n edge [arrowhead=none];\n"),
+            next_id: 0,
+        }
+    }
+
+    fn print(&mut self, node: NodeId) -> usize {
+        let my_id = self.next_id;
+        self.next_id += 1;
+
+        match self.arena.get_unchecked(node) {
+            Node::Leaf(val) => {
+                let label = match val {
+                    OpaqueValue::Nil => "NIL".to_string(),
+                    OpaqueValue::Symbol(id) => self
+                        .symbols
+                        .get_symbol(crate::symbol::SymbolId(*id))
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| format!("sym:{}", id)),
+                    OpaqueValue::Integer(i) => i.to_string(),
+                    OpaqueValue::Float(f) => f.to_string(),
+                    OpaqueValue::String(s) => format!("{:?}", s),
+                    _ => "?".to_string(),
+                };
+                self.output
+                    .push_str(&format!(" {} [shape=box, label={:?}];\n", my_id, label));
+            }
+            Node::Stem(inner) => {
+                self.output
+                    .push_str(&format!(" {} [label=\"n\"];\n", my_id));
+                let child_id = self.print(*inner);
+                self.output
+                    .push_str(&format!(" {} -> {};\n", my_id, child_id));
+            }
+            Node::Fork(l, r) => {
+                self.output.push_str(&format!(" {} [label=\"\"];\n", my_id));
+                let l_id = self.print(*l);
+                let r_id = self.print(*r);
+                self.output.push_str(&format!(" {} -> {};\n", my_id, l_id));
+                self.output.push_str(&format!(" {} -> {};\n", my_id, r_id));
+            }
+        }
+        my_id
+    }
+}
+
+pub fn tree_to_dot(arena: &Arena, symbols: &crate::symbol::SymbolTable, node: NodeId) -> String {
+    let mut p = DotPrinter::new(arena, symbols);
+    p.print(node);
+    p.output.push_str("}\n");
     p.output
 }
 
