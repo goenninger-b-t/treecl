@@ -110,6 +110,8 @@ pub struct Process {
     pub pid: Pid,
     pub priority: Priority,
     pub status: Status,
+    /// Debugger stack for nested debugger levels (outermost first).
+    pub debugger_stack: Vec<crate::conditions::Condition>,
 
     /// Process-Local Memory
     pub arena: ProcessArena,
@@ -208,6 +210,7 @@ impl Process {
             pid,
             priority: Priority::Normal,
             status: Status::Runnable,
+            debugger_stack: Vec::new(),
             arena,
             program,
             mailbox: VecDeque::new(),
@@ -276,6 +279,13 @@ impl Process {
         // Mark Condition System Roots
         for root in self.conditions.iter_roots() {
             self.mark_node(root, &mut marked);
+        }
+
+        if let Status::Debugger(cond) = &self.status {
+            self.mark_condition(cond, &mut marked);
+        }
+        for cond in &self.debugger_stack {
+            self.mark_condition(cond, &mut marked);
         }
 
         // Mark MOP Roots
@@ -376,6 +386,19 @@ impl Process {
                     }
                 }
             }
+        }
+    }
+
+    fn mark_condition(
+        &self,
+        condition: &crate::conditions::Condition,
+        marked: &mut HashSet<u32>,
+    ) {
+        for &arg in &condition.format_arguments {
+            self.mark_node(arg, marked);
+        }
+        for &val in condition.slots.values() {
+            self.mark_node(val, marked);
         }
     }
 
