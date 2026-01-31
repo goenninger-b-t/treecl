@@ -224,6 +224,9 @@ impl<'a> Printer<'a> {
             OpaqueValue::NextMethod(id) => {
                 self.output.push_str(&format!("#<next-method:{}>", id));
             }
+            OpaqueValue::NextMethodP(id) => {
+                self.output.push_str(&format!("#<next-method-p:{}>", id));
+            }
             OpaqueValue::MethodWrapper(a, b) => {
                 self.output
                     .push_str(&format!("#<method-wrapper:{}:{}>", a, b));

@@ -32,6 +32,12 @@ impl GlobalContext {
         symbols.export_symbol(nil_sym);
         symbols.export_symbol(t_sym);
 
+        // Ensure CALL-NEXT-METHOD/NEXT-METHOD-P are in COMMON-LISP so reader resolves them consistently.
+        let cnm_sym = symbols.intern_in("CALL-NEXT-METHOD", PackageId(1));
+        symbols.export_symbol(cnm_sym);
+        let nmp_sym = symbols.intern_in("NEXT-METHOD-P", PackageId(1));
+        symbols.export_symbol(nmp_sym);
+
         // Register Protected Combinator Keywords
         let kw = PackageId(0); // KEYWORD
         let s_comb = symbols.intern_in("S-COMBINATOR", kw);

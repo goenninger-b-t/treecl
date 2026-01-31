@@ -325,7 +325,7 @@ fn prim_get(
 
 fn prim_put(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if args.len() < 3 {
@@ -577,7 +577,7 @@ fn prim_find_package(
                 .unwrap()
                 .symbol_name(SymbolId(*id))
                 .map(|s| s.to_string()),
-            Node::Leaf(OpaqueValue::Package(id)) => {
+            Node::Leaf(OpaqueValue::Package(_id)) => {
                 return Ok(arg);
             }
             _ => None,
@@ -2597,7 +2597,6 @@ fn prim_class_of(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    use crate::clos::ClassId;
     if let Some(&arg) = args.first() {
         let class_id = match proc.arena.inner.get_unchecked(arg) {
             Node::Leaf(OpaqueValue::Integer(_)) => proc.mop.integer_class,
@@ -2915,7 +2914,15 @@ fn prim_ensure_class(
             for head in list_to_vec(proc, supers_node) {
                 let class_id = match proc.arena.inner.get_unchecked(head) {
                     Node::Leaf(OpaqueValue::Class(id)) => Some(ClassId(*id)),
-                    Node::Leaf(OpaqueValue::Symbol(id)) => proc.mop.find_class(SymbolId(*id)),
+                    Node::Leaf(OpaqueValue::Symbol(id)) => {
+                        let sym = SymbolId(*id);
+                        if let Some(cid) = proc.mop.find_class(sym) {
+                            Some(cid)
+                        } else {
+                            // Allow forward-referenced superclasses by creating a stub.
+                            Some(proc.mop.define_class(sym, Vec::new(), Vec::new()))
+                        }
+                    }
                     _ => None,
                 };
 
@@ -2970,6 +2977,7 @@ fn prim_ensure_generic_function(
     let syms = ctx.symbols.read().unwrap();
     let keyword_pkg = syms.get_package(crate::symbol::PackageId(0));
     let kw_lambda_list = keyword_pkg.and_then(|p| p.find_external("LAMBDA-LIST"));
+    let kw_method_combination = keyword_pkg.and_then(|p| p.find_external("METHOD-COMBINATION"));
     drop(syms);
 
     let mut lambda_list = Vec::new();
@@ -2988,7 +2996,73 @@ fn prim_ensure_generic_function(
         }
     }
 
+    // Parse method-combination option (short form / keyword style).
+    let mut method_combination_node = None;
+    if let Some(k) = kw_method_combination {
+        if let Some(&mc_node) = kwargs.get(&k) {
+            method_combination_node = Some(mc_node);
+        }
+    }
+
+    // Parse method-combination option (list form: (:method-combination comb ...))
+    if method_combination_node.is_none() {
+        for &opt in &args[1..] {
+            if let Node::Fork(head, tail) = proc.arena.inner.get_unchecked(opt) {
+                if let Some(sym) = node_to_symbol(proc, *head) {
+                    if let Some(k) = kw_method_combination {
+                        if sym == k {
+                            if let Node::Fork(comb_node, _rest) =
+                                proc.arena.inner.get_unchecked(*tail)
+                            {
+                                method_combination_node = Some(*comb_node);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let gid = proc.mop.define_generic(name, lambda_list);
+    if let Some(mc_node) = method_combination_node {
+        let comb_sym = if let Some(sym) = node_to_symbol(proc, mc_node) {
+            Some(sym)
+        } else if let Node::Fork(head, _tail) = proc.arena.inner.get_unchecked(mc_node) {
+            node_to_symbol(proc, *head)
+        } else {
+            None
+        };
+
+        if let Some(comb_sym) = comb_sym {
+            let comb_name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(comb_sym)
+                .unwrap_or("")
+                .to_string();
+
+            use crate::clos::MethodCombination;
+            let comb = match comb_name.as_str() {
+                "STANDARD" | "STANDARD-METHOD-COMBINATION" => MethodCombination::Standard,
+                "+" | "*" | "APPEND" | "LIST" | "MAX" | "MIN" | "NCONC" | "PROGN" | "AND"
+                | "OR" => MethodCombination::Operator {
+                    name: comb_sym,
+                    operator: comb_sym,
+                    identity_with_one_arg: matches!(comb_name.as_str(), "AND" | "OR" | "PROGN"),
+                },
+                _ => {
+                    return Err(crate::eval::ControlSignal::Error(format!(
+                        "Unsupported method-combination: {}",
+                        comb_name
+                    )));
+                }
+            };
+
+            proc.mop.set_generic_method_combination(gid, comb);
+        }
+    }
     let gf_node = proc
         .arena
         .inner
@@ -3121,7 +3195,7 @@ fn prim_ensure_method(
         }
     }
 
-    let mid = proc.mop.add_method(gf_id, specializers, qualifiers, body);
+    proc.mop.add_method(gf_id, specializers, qualifiers, body);
 
     // Return method object? For now, NIL.
     Ok(proc.make_nil())
@@ -3708,17 +3782,21 @@ fn prim_funcall(
         ));
     }
 
-    let mut interp = Interpreter::new(proc, ctx);
-
     let func = args[0];
     let func_args = if args.len() > 1 {
-        interp.list(&args[1..])
+        proc.make_list(&args[1..])
     } else {
-        interp.process.make_nil()
+        proc.make_nil()
     };
 
     let env = crate::eval::Environment::new();
-    interp.apply_function(func, func_args, &env)
+    let saved_env = proc.current_env.clone();
+    let result = {
+        let mut interp = Interpreter::new(proc, ctx);
+        interp.apply_values(func, func_args, &env)
+    };
+    proc.current_env = saved_env;
+    result
 }
 
 /// (eval form)
@@ -3753,19 +3831,27 @@ fn prim_apply(
         ));
     }
 
-    let mut interp = Interpreter::new(proc, ctx);
-
     let func = args[0];
     let last_arg = args[args.len() - 1]; // The list argument
 
     // Construct argument list.
     let mut final_args = last_arg;
     for &arg in args[1..args.len() - 1].iter().rev() {
-        final_args = interp.cons(arg, final_args);
+        final_args = proc.arena.inner.alloc(Node::Fork(arg, final_args));
     }
 
     let env = crate::eval::Environment::new();
-    interp.apply_values(func, final_args, &env)
+    // Preserve caller environment so APPLY doesn't clobber it.
+    let saved_env = proc.current_env.clone();
+
+    let result = {
+        let mut interp = Interpreter::new(proc, ctx);
+        interp.apply_values(func, final_args, &env)
+    };
+
+    proc.current_env = saved_env;
+
+    result
 }
 
 #[cfg(test)]

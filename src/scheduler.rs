@@ -127,7 +127,7 @@ impl SchedulerHandle {
         }
     }
 
-    pub fn spawn_process(&self, globals: &crate::context::GlobalContext, func: NodeId) -> Pid {
+    pub fn spawn_process(&self, globals: &crate::context::GlobalContext, _func: NodeId) -> Pid {
         let mut pid_guard = self.next_pid.lock().unwrap();
         let pid = Pid {
             node: self.node_id,
@@ -148,6 +148,7 @@ impl SchedulerHandle {
         self.global_queue.push(pid);
     }
 
+    #[allow(dead_code)]
     fn resume_process(&self, pid: Pid, mut proc: Process, result: NodeId) {
         if let Some(redex) = proc.pending_redex.take() {
             let result_node = proc.arena.inner.get_unchecked(result).clone();
@@ -164,7 +165,7 @@ impl SchedulerHandle {
 pub fn run_worker(
     handle: SchedulerHandle,
     local: Worker<Pid>,
-    worker_idx: usize,
+    _worker_idx: usize,
     // Global context is problematic here. It's shared!
     // But Globals uses RwLock internally for Symbols.
     // Primitives are read-only HashMap.
@@ -369,7 +370,7 @@ fn handle_syscall(
 
                     // Delivery logic
                     let mut wake = false;
-                    if let Status::Waiting(pat) = target_proc.status {
+                    if let Status::Waiting(_pat) = target_proc.status {
                         // Check pattern
                         wake = true; // Simplify
                     }

@@ -50,6 +50,7 @@ pub struct GenericFunction {
     pub name: SymbolId,
     pub lambda_list: Vec<SymbolId>,
     pub methods: Vec<MethodId>,
+    pub method_combination: MethodCombination,
 }
 
 /// A method
@@ -61,6 +62,21 @@ pub struct Method {
     pub qualifiers: Vec<SymbolId>,
     /// Method body as a closure index or NodeId
     pub body: NodeId,
+}
+
+#[derive(Debug, Clone)]
+pub enum MethodCombination {
+    Standard,
+    Operator {
+        name: SymbolId,
+        operator: SymbolId,
+        identity_with_one_arg: bool,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WrapperKind {
+    Before,
+    After,
 }
 
 /// An instance of a class
@@ -95,6 +111,9 @@ pub struct MetaObjectProtocol {
     generic_names: HashMap<SymbolId, GenericId>,
     /// All methods
     methods: Vec<Method>,
+    /// Cached wrapper methods for standard method combination
+    before_wrappers: HashMap<MethodId, MethodId>,
+    after_wrappers: HashMap<MethodId, MethodId>,
     /// All instances
     instances: Vec<Instance>,
 }
@@ -128,6 +147,8 @@ impl MetaObjectProtocol {
             generics: Vec::new(),
             generic_names: HashMap::new(),
             methods: Vec::new(),
+            before_wrappers: HashMap::new(),
+            after_wrappers: HashMap::new(),
             instances: Vec::new(),
         };
 
@@ -204,22 +225,6 @@ impl MetaObjectProtocol {
         supers: Vec<ClassId>,
         slots: Vec<SlotDefinition>,
     ) -> ClassId {
-        // Check for redefinition
-        if let Some(&existing_id) = self.class_names.get(&name) {
-            // Update existing class (in-place)
-            // Note: This is a simplification. Real CLOS would need `make-instances-obsolete` logic.
-            if let Some(class) = self.classes.get_mut(existing_id.0 as usize) {
-                // Compute CPL
-                let mut cpl = vec![existing_id];
-                for &super_id in &supers {
-                    if let Some(super_class) = self.classes.get(super_id.0 as usize) { // Safe because we aren't mutating other classes
-                         /* Accessing self.classes while mutating self.classes[id] is tricky in Rust borrow checker.
-                         We need to separate CPL computation. */
-                    }
-                }
-            }
-        }
-
         let id = if let Some(&existing_id) = self.class_names.get(&name) {
             existing_id
         } else {
@@ -402,6 +407,7 @@ impl MetaObjectProtocol {
             name,
             lambda_list,
             methods: Vec::new(),
+            method_combination: MethodCombination::Standard,
         });
 
         self.generic_names.insert(name, id);
@@ -416,6 +422,16 @@ impl MetaObjectProtocol {
     /// Get generic function by ID
     pub fn get_generic(&self, id: GenericId) -> Option<&GenericFunction> {
         self.generics.get(id.0 as usize)
+    }
+
+    pub fn set_generic_method_combination(
+        &mut self,
+        id: GenericId,
+        method_combination: MethodCombination,
+    ) {
+        if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+            gf.method_combination = method_combination;
+        }
     }
 
     /// Add a method to a generic function
@@ -441,9 +457,43 @@ impl MetaObjectProtocol {
         method_id
     }
 
+    /// Add a method without attaching it to a generic function (used for wrappers).
+    pub fn add_method_raw(
+        &mut self,
+        specializers: Vec<ClassId>,
+        qualifiers: Vec<SymbolId>,
+        body: NodeId,
+    ) -> MethodId {
+        let method_id = MethodId(self.methods.len() as u32);
+        self.methods.push(Method {
+            specializers,
+            qualifiers,
+            body,
+        });
+        method_id
+    }
+
     /// Get method by ID
     pub fn get_method(&self, id: MethodId) -> Option<&Method> {
         self.methods.get(id.0 as usize)
+    }
+
+    pub fn get_wrapper(&self, kind: WrapperKind, id: MethodId) -> Option<MethodId> {
+        match kind {
+            WrapperKind::Before => self.before_wrappers.get(&id).copied(),
+            WrapperKind::After => self.after_wrappers.get(&id).copied(),
+        }
+    }
+
+    pub fn set_wrapper(&mut self, kind: WrapperKind, id: MethodId, wrapper: MethodId) {
+        match kind {
+            WrapperKind::Before => {
+                self.before_wrappers.insert(id, wrapper);
+            }
+            WrapperKind::After => {
+                self.after_wrappers.insert(id, wrapper);
+            }
+        }
     }
 
     /// Check if instance is of class (or subclass)

@@ -292,7 +292,7 @@
                  :direct-slots ',direct-slots))
 
 (defmacro defgeneric (name lambda-list &rest options)
-  `(ensure-generic-function ',name :lambda-list ',lambda-list))
+  `(ensure-generic-function ',name :lambda-list ',lambda-list ,@options))
 
 (defun parse-defmethod-qualifiers (args qualifiers)
   (if (and (consp args) (symbolp (car args)) (not (null (car args))))
@@ -368,4 +368,3 @@
 (print "Defining method make-instance (symbol)")
 (defmethod make-instance ((class symbol) &rest initargs)
   (apply #'make-instance (find-class class) initargs))
-

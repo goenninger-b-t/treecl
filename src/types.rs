@@ -33,6 +33,7 @@ pub enum OpaqueValue {
     HashHandle(u32),            // Handle to Hash Table
     Package(u32),               // Package ID
     NextMethod(u32),            // Handle to Next Method State (CLOS)
+    NextMethodP(u32),           // Handle to Next Method State predicate (CLOS)
     MethodWrapper(u32, u32),    // (ClosureIndex, NextMethodIndex)
 }
 

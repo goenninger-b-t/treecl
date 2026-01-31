@@ -248,7 +248,6 @@ fn main() -> io::Result<()> {
 
     // REPL History values (NodeIds)
     let mut hist_1: Option<treecl::types::NodeId> = None;
-    let mut hist_2: Option<treecl::types::NodeId> = None;
 
     // Initial prompt
     let _ = prompt_tx.send("CL-USER> ".to_string());
@@ -294,7 +293,6 @@ fn main() -> io::Result<()> {
                         if hist_1.is_none() {
                             let nil = process.make_nil();
                             hist_1 = Some(nil);
-                            hist_2 = Some(nil);
                             process.set_value(star_1, nil);
                             process.set_value(star_2, nil);
                             process.set_value(star_3, nil);
@@ -421,7 +419,7 @@ fn main() -> io::Result<()> {
                 let mut debugger_state = None;
 
                 {
-                    let mut proc = proc_ref.lock().unwrap();
+                    let proc = proc_ref.lock().unwrap();
                     match &proc.status {
                         Status::Terminated => {
                             finished = true;
