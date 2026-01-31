@@ -653,9 +653,14 @@ fn print_debugger_banner(
         .map(|s| s.as_str())
         .unwrap_or("Condition");
     let type_upper = type_name.to_uppercase();
-    let thread = std::thread::current();
-    let tid = thread_id_display(&thread);
-    let thread_name = thread.name().unwrap_or("main thread");
+    let tid = proc
+        .debugger_thread_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| thread_id_display(&std::thread::current()));
+    let thread_name = proc
+        .debugger_thread_name
+        .as_deref()
+        .unwrap_or("main");
 
     println!("debugger invoked on a {} in thread", type_upper);
     println!(

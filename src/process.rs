@@ -112,6 +112,9 @@ pub struct Process {
     pub status: Status,
     /// Debugger stack for nested debugger levels (outermost first).
     pub debugger_stack: Vec<crate::conditions::Condition>,
+    /// Last scheduler worker thread id/name that entered the debugger.
+    pub debugger_thread_id: Option<u64>,
+    pub debugger_thread_name: Option<String>,
 
     /// Process-Local Memory
     pub arena: ProcessArena,
@@ -211,6 +214,8 @@ impl Process {
             priority: Priority::Normal,
             status: Status::Runnable,
             debugger_stack: Vec::new(),
+            debugger_thread_id: None,
+            debugger_thread_name: None,
             arena,
             program,
             mailbox: VecDeque::new(),

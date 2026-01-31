@@ -226,7 +226,11 @@ pub fn run_worker(
                             }
                         }
                         ExecutionResult::Blocked => {
-                            if !matches!(proc.status, Status::Debugger(_)) {
+                            if matches!(proc.status, Status::Debugger(_)) {
+                                proc.debugger_thread_id = Some(os_thread_id());
+                                proc.debugger_thread_name =
+                                    std::thread::current().name().map(|s| s.to_string());
+                            } else {
                                 proc.status = Status::Waiting(None);
                             }
                         }
@@ -254,6 +258,23 @@ pub fn run_worker(
             thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn os_thread_id() -> u64 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn os_thread_id() -> u64 {
+    unsafe { libc::pthread_self() as u64 }
+}
+
+#[cfg(not(unix))]
+fn os_thread_id() -> u64 {
+    let raw = format!("{:?}", std::thread::current().id());
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().unwrap_or(0)
 }
 
 fn handle_syscall(
