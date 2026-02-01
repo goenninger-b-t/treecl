@@ -18,6 +18,7 @@ pub mod search;
 pub mod streams;
 pub mod symbol;
 pub mod types;
+pub mod tree_calculus;
 
 // Legacy modules disabled - they use incompatible Node structure
 // pub mod engine;

@@ -1,9 +1,15 @@
 use crate::arena::{Arena, Node};
 use crate::types::{NodeId, OpaqueValue};
+use std::collections::HashMap;
 
 pub struct EvalContext {
     pub steps: usize,
     pub max_steps: usize,
+    exhausted: bool,
+    cache_epoch: u64,
+    purity_cache: HashMap<NodeId, bool>,
+    whnf_cache: HashMap<NodeId, NodeId>,
+    nf_cache: HashMap<NodeId, NodeId>,
 }
 
 impl Default for EvalContext {
@@ -11,6 +17,11 @@ impl Default for EvalContext {
         Self {
             steps: 0,
             max_steps: 10000,
+            exhausted: false,
+            cache_epoch: 0,
+            purity_cache: HashMap::new(),
+            whnf_cache: HashMap::new(),
+            nf_cache: HashMap::new(),
         }
     }
 }
@@ -18,6 +29,20 @@ impl Default for EvalContext {
 impl EvalContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn sync_epoch(&mut self, arena: &Arena) {
+        let epoch = arena.epoch();
+        if self.cache_epoch != epoch {
+            self.cache_epoch = epoch;
+            self.purity_cache.clear();
+            self.whnf_cache.clear();
+            self.nf_cache.clear();
+        }
+    }
+
+    fn reset_exhausted(&mut self) {
+        self.exhausted = false;
     }
 }
 
@@ -37,23 +62,45 @@ fn is_delta(arena: &Arena, id: NodeId) -> bool {
     matches!(arena.get_unchecked(id), Node::Leaf(OpaqueValue::Nil))
 }
 
-fn is_pure_tree(arena: &Arena, root: NodeId) -> bool {
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
+fn is_pure_tree(arena: &Arena, root: NodeId, cache: &mut HashMap<NodeId, bool>) -> bool {
+    if let Some(&res) = cache.get(&root) {
+        return res;
+    }
+
+    let mut stack: Vec<(NodeId, bool)> = vec![(root, false)];
+    while let Some((id, visited)) = stack.pop() {
+        if cache.contains_key(&id) {
+            continue;
+        }
+
         match arena.get_unchecked(id) {
             Node::Leaf(val) => {
-                if !matches!(val, OpaqueValue::Nil) {
-                    return false;
+                cache.insert(id, matches!(val, OpaqueValue::Nil));
+            }
+            Node::Stem(child) => {
+                if visited {
+                    let ok = cache.get(child).copied().unwrap_or(false);
+                    cache.insert(id, ok);
+                } else {
+                    stack.push((id, true));
+                    stack.push((*child, false));
                 }
             }
-            Node::Stem(child) => stack.push(*child),
             Node::Fork(left, right) => {
-                stack.push(*left);
-                stack.push(*right);
+                if visited {
+                    let ok_left = cache.get(left).copied().unwrap_or(false);
+                    let ok_right = cache.get(right).copied().unwrap_or(false);
+                    cache.insert(id, ok_left && ok_right);
+                } else {
+                    stack.push((id, true));
+                    stack.push((*left, false));
+                    stack.push((*right, false));
+                }
             }
         }
     }
-    true
+
+    cache.get(&root).copied().unwrap_or(false)
 }
 
 fn split_delta1(arena: &Arena, id: NodeId) -> Option<NodeId> {
@@ -71,126 +118,160 @@ fn split_delta2(arena: &Arena, id: NodeId) -> Option<(NodeId, NodeId)> {
     }
 }
 
+fn alloc_app(arena: &mut Arena, f: NodeId, a: NodeId) -> NodeId {
+    if is_delta(arena, f) {
+        arena.alloc(Node::Stem(a))
+    } else {
+        arena.alloc(Node::Fork(f, a))
+    }
+}
+
 pub fn reduce(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId {
-    let mut current = root;
-    if !is_pure_tree(arena, current) {
-        return current;
+    ctx.sync_epoch(arena);
+    ctx.reset_exhausted();
+
+    if !is_pure_tree(arena, root, &mut ctx.purity_cache) {
+        return root;
     }
 
-    loop {
-        if ctx.steps >= ctx.max_steps {
-            return current;
-        }
-
-        match arena.get_unchecked(current).clone() {
-            Node::Fork(left, z) => {
-                // We have an application (left z)
-                // Reduce left to WHNF first
-                let reduced_left = reduce_whnf(arena, left, ctx);
-
-                // Check for △ applied to two args: (△ x) y
-                if let Some((x, y)) = split_delta2(arena, reduced_left) {
-                    // Dispatch based on structure of x
-                    let reduced_x = reduce_whnf(arena, x, ctx);
-
-                    if is_delta(arena, reduced_x) {
-                        // △ △ y z → y
-                        ctx.steps += 1;
-                        current = y;
-                        continue;
-                    }
-
-                    if let Some(x_inner) = split_delta1(arena, reduced_x) {
-                        // △ (△ x) y z → y z (x z)
-                        ctx.steps += 1;
-                        let yz = arena.alloc(Node::Fork(y, z));
-                        let xz = arena.alloc(Node::Fork(x_inner, z));
-                        current = arena.alloc(Node::Fork(yz, xz));
-                        continue;
-                    }
-
-                    if let Some((w, x_inner)) = split_delta2(arena, reduced_x) {
-                        // △ (△ w x) y z → z w x
-                        ctx.steps += 1;
-                        let zw = arena.alloc(Node::Fork(z, w));
-                        current = arena.alloc(Node::Fork(zw, x_inner));
-                        continue;
-                    }
-                }
-
-                // Not a redex - return with reduced left if different
-                if reduced_left != left {
-                    return arena.alloc(Node::Fork(reduced_left, z));
-                }
-                return current;
-            }
-            Node::Stem(inner) => {
-                // Reduce inside Stem for full normalization
-                let reduced_inner = reduce(arena, inner, ctx);
-                if reduced_inner != inner {
-                    return arena.alloc(Node::Stem(reduced_inner));
-                }
-                return current;
-            }
-            Node::Leaf(_) => return current, // Leaves are normal forms
-        }
-    }
+    reduce_nf_inner(arena, root, ctx)
 }
 
 /// Reduce to Weak Head Normal Form
 /// Uses same rules as reduce but stops at head normal form.
 pub fn reduce_whnf(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId {
-    let mut current = root;
-    if !is_pure_tree(arena, current) {
-        return current;
+    ctx.sync_epoch(arena);
+    ctx.reset_exhausted();
+
+    if !is_pure_tree(arena, root, &mut ctx.purity_cache) {
+        return root;
     }
 
+    reduce_whnf_inner(arena, root, ctx)
+}
+
+fn reduce_nf_inner(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId {
+    if let Some(&cached) = ctx.nf_cache.get(&root) {
+        return cached;
+    }
+    if ctx.steps >= ctx.max_steps {
+        ctx.exhausted = true;
+        return root;
+    }
+
+    let result = match arena.get_unchecked(root).clone() {
+        Node::Leaf(_) => root,
+        Node::Stem(inner) => {
+            let reduced_inner = reduce_nf_inner(arena, inner, ctx);
+            if reduced_inner != inner {
+                arena.alloc(Node::Stem(reduced_inner))
+            } else {
+                root
+            }
+        }
+        Node::Fork(left, z) => {
+            let reduced_left = reduce_whnf_inner(arena, left, ctx);
+
+            if let Some((x, y)) = split_delta2(arena, reduced_left) {
+                let reduced_x = reduce_whnf_inner(arena, x, ctx);
+
+                if is_delta(arena, reduced_x) {
+                    ctx.steps += 1;
+                    return reduce_nf_inner(arena, y, ctx);
+                }
+
+                if let Some(x_inner) = split_delta1(arena, reduced_x) {
+                    ctx.steps += 1;
+                    let yz = alloc_app(arena, y, z);
+                    let xz = alloc_app(arena, x_inner, z);
+                    let new_root = alloc_app(arena, yz, xz);
+                    return reduce_nf_inner(arena, new_root, ctx);
+                }
+
+                if let Some((w, x_inner)) = split_delta2(arena, reduced_x) {
+                    ctx.steps += 1;
+                    let zw = alloc_app(arena, z, w);
+                    let new_root = alloc_app(arena, zw, x_inner);
+                    return reduce_nf_inner(arena, new_root, ctx);
+                }
+            }
+
+            let new_left = reduce_nf_inner(arena, reduced_left, ctx);
+            let new_right = reduce_nf_inner(arena, z, ctx);
+            if new_left != reduced_left || new_right != z {
+                alloc_app(arena, new_left, new_right)
+            } else if reduced_left != left {
+                alloc_app(arena, reduced_left, z)
+            } else {
+                root
+            }
+        }
+    };
+
+    if !ctx.exhausted {
+        ctx.nf_cache.insert(root, result);
+    }
+    result
+}
+
+fn reduce_whnf_inner(arena: &mut Arena, root: NodeId, ctx: &mut EvalContext) -> NodeId {
+    if let Some(&cached) = ctx.whnf_cache.get(&root) {
+        return cached;
+    }
+    if ctx.steps >= ctx.max_steps {
+        ctx.exhausted = true;
+        return root;
+    }
+
+    let mut current = root;
     loop {
         if ctx.steps >= ctx.max_steps {
-            return current;
+            ctx.exhausted = true;
+            break;
         }
 
         match arena.get_unchecked(current).clone() {
             Node::Fork(left, z) => {
-                let reduced_left = reduce_whnf(arena, left, ctx);
+                let reduced_left = reduce_whnf_inner(arena, left, ctx);
 
                 if let Some((x, y)) = split_delta2(arena, reduced_left) {
-                    let reduced_x = reduce_whnf(arena, x, ctx);
+                    let reduced_x = reduce_whnf_inner(arena, x, ctx);
 
                     if is_delta(arena, reduced_x) {
-                        // △ △ y z → y
                         ctx.steps += 1;
                         current = y;
                         continue;
                     }
 
                     if let Some(x_inner) = split_delta1(arena, reduced_x) {
-                        // △ (△ x) y z → y z (x z)
                         ctx.steps += 1;
-                        let yz = arena.alloc(Node::Fork(y, z));
-                        let xz = arena.alloc(Node::Fork(x_inner, z));
-                        current = arena.alloc(Node::Fork(yz, xz));
+                        let yz = alloc_app(arena, y, z);
+                        let xz = alloc_app(arena, x_inner, z);
+                        current = alloc_app(arena, yz, xz);
                         continue;
                     }
 
                     if let Some((w, x_inner)) = split_delta2(arena, reduced_x) {
-                        // △ (△ w x) y z → z w x
                         ctx.steps += 1;
-                        let zw = arena.alloc(Node::Fork(z, w));
-                        current = arena.alloc(Node::Fork(zw, x_inner));
+                        let zw = alloc_app(arena, z, w);
+                        current = alloc_app(arena, zw, x_inner);
                         continue;
                     }
                 }
 
-                // Not a redex
                 if reduced_left != left {
-                    return arena.alloc(Node::Fork(reduced_left, z));
+                    current = alloc_app(arena, reduced_left, z);
                 }
-                return current;
+                break;
             }
-            Node::Stem(_) | Node::Leaf(_) => return current,
+            Node::Stem(_) | Node::Leaf(_) => break,
         }
     }
+
+    if !ctx.exhausted {
+        ctx.whnf_cache.insert(root, current);
+    }
+    current
 }
 
 // ============================================================================
@@ -442,6 +523,7 @@ impl ControlStack {
 mod tests {
     use super::*;
     use crate::arena::deep_equal;
+    use crate::tree_calculus as tc;
 
     // Helper: create △
     fn delta(arena: &mut Arena) -> NodeId {
@@ -449,7 +531,11 @@ mod tests {
     }
 
     fn app(arena: &mut Arena, f: NodeId, x: NodeId) -> NodeId {
-        arena.alloc(Node::Fork(f, x))
+        if is_delta(arena, f) {
+            arena.alloc(Node::Stem(x))
+        } else {
+            arena.alloc(Node::Fork(f, x))
+        }
     }
 
     fn stem(arena: &mut Arena, x: NodeId) -> NodeId {
@@ -587,5 +673,80 @@ mod tests {
         let term = app(&mut arena, d_d_y, z);
         let result = reduce(&mut arena, term, &mut ctx);
         assert_eq!(result, term);
+    }
+
+    #[test]
+    fn test_reduce_normalizes_inner_branch() {
+        let mut arena = Arena::new();
+        let mut ctx = EvalContext::default();
+
+        let d = delta(&mut arena);
+        let leaf = d;
+        let left = stem(&mut arena, leaf);
+
+        // redex: ((4 4) 4) 4 -> 4
+        let k = app(&mut arena, d, d);
+        let k_y = app(&mut arena, k, d);
+        let redex = app(&mut arena, k_y, d);
+
+        let term = app(&mut arena, left, redex);
+        let result = reduce(&mut arena, term, &mut ctx);
+
+        let expected = app(&mut arena, left, leaf);
+        assert!(deep_equal(&arena, result, expected));
+    }
+
+    #[test]
+    fn test_fundamental_queries() {
+        let mut arena = Arena::new();
+        let mut ctx = EvalContext::default();
+
+        let leaf = tc::delta(&mut arena);
+        let stem_node = arena.alloc(Node::Stem(leaf));
+        let fork_left = arena.alloc(Node::Fork(leaf, leaf));
+        let fork_node = arena.alloc(Node::Fork(fork_left, leaf));
+
+        let k = tc::k(&mut arena);
+        let i = tc::i(&mut arena);
+        let k_i = tc::app(&mut arena, k, i);
+
+        let is_leaf = tc::is_leaf(&mut arena);
+        let is_stem = tc::is_stem(&mut arena);
+        let is_fork = tc::is_fork(&mut arena);
+
+        let leaf_app = app(&mut arena, is_leaf, leaf);
+        let stem_app = app(&mut arena, is_leaf, stem_node);
+        let fork_app = app(&mut arena, is_leaf, fork_node);
+        let leaf_res = reduce(&mut arena, leaf_app, &mut ctx);
+        let stem_res = reduce(&mut arena, stem_app, &mut ctx);
+        let fork_res = reduce(&mut arena, fork_app, &mut ctx);
+        assert!(
+            deep_equal(&arena, leaf_res, k),
+            "is_leaf on leaf -> {:?} (expected K {:?})",
+            crate::printer::tree_format(&arena, leaf_res),
+            crate::printer::tree_format(&arena, k)
+        );
+        assert!(deep_equal(&arena, stem_res, k_i));
+        assert!(deep_equal(&arena, fork_res, k_i));
+
+        let leaf_app = app(&mut arena, is_stem, leaf);
+        let stem_app = app(&mut arena, is_stem, stem_node);
+        let fork_app = app(&mut arena, is_stem, fork_node);
+        let leaf_res = reduce(&mut arena, leaf_app, &mut ctx);
+        let stem_res = reduce(&mut arena, stem_app, &mut ctx);
+        let fork_res = reduce(&mut arena, fork_app, &mut ctx);
+        assert!(deep_equal(&arena, leaf_res, k_i));
+        assert!(deep_equal(&arena, stem_res, k));
+        assert!(deep_equal(&arena, fork_res, k_i));
+
+        let leaf_app = app(&mut arena, is_fork, leaf);
+        let stem_app = app(&mut arena, is_fork, stem_node);
+        let fork_app = app(&mut arena, is_fork, fork_node);
+        let leaf_res = reduce(&mut arena, leaf_app, &mut ctx);
+        let stem_res = reduce(&mut arena, stem_app, &mut ctx);
+        let fork_res = reduce(&mut arena, fork_app, &mut ctx);
+        assert!(deep_equal(&arena, leaf_res, k_i));
+        assert!(deep_equal(&arena, stem_res, k_i));
+        assert!(deep_equal(&arena, fork_res, k));
     }
 }

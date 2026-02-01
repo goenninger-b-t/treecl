@@ -34,12 +34,12 @@ TreeCL implements Erlang-style concurrency, where isolated processes communicate
 ```
 
 ### 2. Tree Calculus Core
-The foundation is the canonical **Tree Calculus**, which uses a single operator `△` and three reduction rules to perform all computation.
-- **Identity**: `△ △ y → y`
-- **Constant (K)**: `△ (△ x) y → x`
-- **Substitution (S)**: `△ (△ x z) y → ((x y) (z y))`
+The foundation is the canonical **Tree Calculus**, which uses a single operator `△` and three reduction rules that fire when `△` has three arguments:
+- **K rule**: `△ △ y z → y`
+- **S rule**: `△ (△ x) y z → y z (x z)`
+- **F rule**: `△ (△ w x) y z → z w x`
 
-TreeCL compiles high-level Lisp code (lambdas, variables, applications) into these binary tree structures.
+TreeCL can compile pure Tree Calculus terms (built only from `△` and application) into these binary tree structures.
 
 ### 3. Compiler-Driven REPL
 Unlike traditional interpreters, the TreeCL REPL compile inputs on the fly:
@@ -48,6 +48,10 @@ Unlike traditional interpreters, the TreeCL REPL compile inputs on the fly:
 3.  **Execute**: The `Scheduler` executes the compiled graph as a Process.
 
 This approach enables **seamless concurrency** in the REPL. When a primitive like `spawn` or `receive` is encountered, it triggers a `SysCall`, which pauses the reduction engine and yields control to the Scheduler.
+
+**Compiler modes:**
+- `COMPILE` targets pure Tree Calculus terms only (no non-NIL literals or free symbols).
+- `COMPILE-LISP` allows mixed Lisp terms (primitives and literals) for legacy use.
 
 ### 4. Language Features
 - **ANSI Common Lisp Subset**: `let`, `lambda`, `if`, `progn`, `defun`, `defvar`.

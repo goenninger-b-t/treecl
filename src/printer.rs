@@ -105,11 +105,8 @@ impl<'a> Printer<'a> {
             return Some(":K-COMBINATOR");
         }
 
-        // Check for I = Fork(K, K)
-        if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
-            if self.is_k(*left) && self.is_k(*right) {
-                return Some(":I-COMBINATOR");
-            }
+        if self.is_i(node) {
+            return Some(":I-COMBINATOR");
         }
 
         None
@@ -117,16 +114,37 @@ impl<'a> Printer<'a> {
 
     /// Check if node is K = Fork(Nil, Nil)
     fn is_k(&self, node: NodeId) -> bool {
-        if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
-            matches!(
+        match self.arena.get_unchecked(node) {
+            Node::Stem(inner) => matches!(self.arena.get_unchecked(*inner), Node::Leaf(OpaqueValue::Nil)),
+            Node::Fork(left, right) => matches!(
                 (
                     self.arena.get_unchecked(*left),
                     self.arena.get_unchecked(*right)
                 ),
                 (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil))
-            )
-        } else {
-            false
+            ),
+            _ => false,
+        }
+    }
+
+    fn is_delta(&self, node: NodeId) -> bool {
+        matches!(self.arena.get_unchecked(node), Node::Leaf(OpaqueValue::Nil))
+    }
+
+    /// Check if node is I = 4(44)(44)
+    fn is_i(&self, node: NodeId) -> bool {
+        match self.arena.get_unchecked(node) {
+            Node::Fork(left, right) => {
+                if !self.is_k(*right) {
+                    return false;
+                }
+                match self.arena.get_unchecked(*left) {
+                    Node::Stem(inner) => self.is_k(*inner),
+                    Node::Fork(op, inner) if self.is_delta(*op) => self.is_k(*inner),
+                    _ => false,
+                }
+            }
+            _ => false,
         }
     }
 
@@ -495,11 +513,212 @@ impl<'a> DotPrinter<'a> {
     }
 }
 
-pub fn tree_to_dot(arena: &Arena, symbols: &crate::symbol::SymbolTable, node: NodeId) -> String {
+pub fn tree_to_dot_legacy(
+    arena: &Arena,
+    symbols: &crate::symbol::SymbolTable,
+    node: NodeId,
+) -> String {
     let mut p = DotPrinter::new(arena, symbols);
     p.print(node);
     p.output.push_str("}\n");
     p.output
+}
+
+struct BookTreeNode {
+    label: Option<String>,
+    children: Vec<usize>,
+}
+
+struct BookTreeBuilder<'a> {
+    arena: &'a Arena,
+    symbols: &'a crate::symbol::SymbolTable,
+    nodes: Vec<BookTreeNode>,
+    max_depth: usize,
+}
+
+impl<'a> BookTreeBuilder<'a> {
+    fn new(arena: &'a Arena, symbols: &'a crate::symbol::SymbolTable) -> Self {
+        Self {
+            arena,
+            symbols,
+            nodes: Vec::new(),
+            max_depth: 1000,
+        }
+    }
+
+    fn build(&mut self, node: NodeId) -> usize {
+        let mut active = std::collections::HashSet::new();
+        self.build_inner(node, 0, &mut active)
+    }
+
+    fn build_inner(
+        &mut self,
+        node: NodeId,
+        depth: usize,
+        active: &mut std::collections::HashSet<NodeId>,
+    ) -> usize {
+        if depth > self.max_depth {
+            return self.new_node(Some("...".to_string()));
+        }
+        if active.contains(&node) {
+            return self.new_node(Some("cycle".to_string()));
+        }
+
+        active.insert(node);
+
+        let idx = match self.arena.get_unchecked(node) {
+            Node::Leaf(val) => {
+                let label = self.format_leaf_label(val);
+                self.new_node(label)
+            }
+            Node::Stem(child) => {
+                let idx = self.new_node(None);
+                let child_idx = self.build_inner(*child, depth + 1, active);
+                self.nodes[idx].children.push(child_idx);
+                idx
+            }
+            Node::Fork(left, right) => {
+                let root_idx = self.build_inner(*left, depth + 1, active);
+                let child_idx = self.build_inner(*right, depth + 1, active);
+                self.nodes[root_idx].children.push(child_idx);
+                root_idx
+            }
+        };
+
+        active.remove(&node);
+        idx
+    }
+
+    fn new_node(&mut self, label: Option<String>) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(BookTreeNode {
+            label,
+            children: Vec::new(),
+        });
+        idx
+    }
+
+    fn format_leaf_label(&self, val: &OpaqueValue) -> Option<String> {
+        match val {
+            OpaqueValue::Nil => None,
+            OpaqueValue::Symbol(id) => Some(
+                self.symbols
+                    .get_symbol(crate::symbol::SymbolId(*id))
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| format!("sym:{}", id)),
+            ),
+            OpaqueValue::Integer(i) => Some(i.to_string()),
+            OpaqueValue::BigInt(i) => Some(i.to_string()),
+            OpaqueValue::Float(f) => Some(f.to_string()),
+            OpaqueValue::String(s) => Some(format!("\"{}\"", s)),
+            _ => Some("atom".to_string()),
+        }
+    }
+}
+
+fn dot_escape_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+struct BookDotRenderer<'a> {
+    nodes: &'a [BookTreeNode],
+    output: String,
+}
+
+impl<'a> BookDotRenderer<'a> {
+    fn new(nodes: &'a [BookTreeNode]) -> Self {
+        Self {
+            nodes,
+            output: String::from(
+                "digraph Tree {\n\
+ graph [rankdir=TB, nodesep=0.35, ranksep=0.35, splines=false];\n\
+ node [shape=circle, width=0.12, height=0.12, fixedsize=true, label=\"\", style=filled];\n\
+ edge [arrowhead=none, penwidth=1.4];\n",
+            ),
+        }
+    }
+
+    fn render(mut self, root: usize) -> String {
+        let mut visited = std::collections::HashSet::new();
+        self.emit_subtree(root, None, 0, &mut visited);
+        self.output.push_str("}\n");
+        self.output
+    }
+
+    fn emit_subtree(
+        &mut self,
+        node_idx: usize,
+        incoming_color: Option<&'static str>,
+        depth: usize,
+        visited: &mut std::collections::HashSet<usize>,
+    ) {
+        const ROOT_COLOR: &str = "#222222";
+        const PALETTE: [&str; 8] = [
+            "#1b9e77",
+            "#d95f02",
+            "#7570b3",
+            "#e7298a",
+            "#66a61e",
+            "#e6ab02",
+            "#a6761d",
+            "#666666",
+        ];
+
+        let node_color = incoming_color.unwrap_or(ROOT_COLOR);
+
+        if !visited.insert(node_idx) {
+            return;
+        }
+
+        self.output.push_str(&format!(
+            " n{} [color=\"{}\", fillcolor=\"{}\"];\n",
+            node_idx, node_color, node_color
+        ));
+
+        if let Some(label) = &self.nodes[node_idx].label {
+            let escaped = dot_escape_label(label);
+                self.output.push_str(&format!(
+                    " t{} [shape=triangle, label=\"{}\", style=filled, fillcolor=\"white\", color=\"{}\", fontcolor=\"{}\", fixedsize=false, margin=\"0.08\"];\n",
+                    node_idx, escaped, node_color, node_color
+                ));
+                self.output.push_str(&format!(
+                    " n{} -> t{} [color=\"{}\", penwidth=1.0];\n",
+                    node_idx, node_idx, node_color
+                ));
+            }
+
+        let children = &self.nodes[node_idx].children;
+        let child_count = children.len();
+        for (i, child_idx) in children.iter().enumerate() {
+            let child_color = if child_count <= 1 {
+                node_color
+            } else {
+                PALETTE[(i + depth) % PALETTE.len()]
+            };
+            self.output.push_str(&format!(
+                " n{} -> n{} [color=\"{}\"];\n",
+                node_idx, child_idx, child_color
+            ));
+            self.emit_subtree(*child_idx, Some(child_color), depth + 1, visited);
+        }
+    }
+}
+
+pub fn tree_to_dot(arena: &Arena, symbols: &crate::symbol::SymbolTable, node: NodeId) -> String {
+    let mut builder = BookTreeBuilder::new(arena, symbols);
+    let root = builder.build(node);
+    BookDotRenderer::new(&builder.nodes).render(root)
 }
 
 #[cfg(test)]

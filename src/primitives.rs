@@ -9,6 +9,7 @@ use crate::process::Process;
 use crate::symbol::{PackageId, SymbolId};
 use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
+use crate::tree_calculus;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
@@ -137,9 +138,21 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
 
     // Tools
     globals.register_primitive("COMPILE", cl, prim_compile);
+    globals.register_primitive("COMPILE-LISP", cl, prim_compile_lisp);
     globals.register_primitive("TREE-STRING", cl, prim_tree_string);
     globals.register_primitive("TREE-TO-DOT", cl, prim_tree_to_dot);
     globals.register_primitive("SAVE-TREE-PDF", cl, prim_save_tree_pdf);
+    globals.register_primitive("TREE-TO-PDF", cl, prim_tree_to_pdf);
+
+    // Tree Calculus (pure encoding helpers)
+    globals.register_primitive("TC-ENCODE-NAT", cl, prim_tc_encode_nat);
+    globals.register_primitive("TC-DECODE-NAT", cl, prim_tc_decode_nat);
+    globals.register_primitive("TC-ENCODE-STRING", cl, prim_tc_encode_string);
+    globals.register_primitive("TC-DECODE-STRING", cl, prim_tc_decode_string);
+    globals.register_primitive("TC-SUCC", cl, prim_tc_succ);
+    globals.register_primitive("TC-ADD", cl, prim_tc_add);
+    globals.register_primitive("TC-EQUAL", cl, prim_tc_equal);
+    globals.register_primitive("TC-TRIAGE", cl, prim_tc_triage);
     globals.register_primitive("FUNCALL", cl, prim_funcall);
     globals.register_primitive("EVAL", cl, prim_eval);
     globals.register_primitive("APPLY", cl, prim_apply);
@@ -3827,6 +3840,57 @@ fn prim_compile(
     err_helper("COMPILE: Invalid argument")
 }
 
+fn prim_compile_lisp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        let node = proc.arena.inner.get_unchecked(arg).clone();
+
+        let target_closure = match node {
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                let sym = SymbolId(id);
+                if let Some(func_node) = proc.get_function(sym) {
+                    if let Node::Leaf(OpaqueValue::Closure(idx)) =
+                        proc.arena.inner.get_unchecked(func_node)
+                    {
+                        Some(*idx)
+                    } else {
+                        return err_helper("COMPILE-LISP: Symbol function is not a closure (maybe already compiled or primitive?)");
+                    }
+                } else {
+                    return err_helper("COMPILE-LISP: Symbol has no function definition");
+                }
+            }
+            Node::Leaf(OpaqueValue::Closure(idx)) => Some(idx),
+            _ => {
+                return err_helper("COMPILE-LISP: Argument must be a symbol or closure");
+            }
+        };
+
+        if let Some(idx) = target_closure {
+            let (params, body) = {
+                let closure = &proc.closures[idx as usize];
+                let mut params = Vec::new();
+                for &p in &closure.lambda_list.req {
+                    if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(p) {
+                        params.push(SymbolId(*id));
+                    }
+                }
+                (params, closure.body)
+            };
+
+            match crate::compiler::compile_func_extended(proc, ctx, &params, body) {
+                Ok(compiled_node) => return Ok(compiled_node),
+                Err(e) => return err_helper(&format!("Compilation failed: {}", e)),
+            }
+        }
+    }
+
+    err_helper("COMPILE-LISP: Invalid argument")
+}
+
 fn prim_tree_string(
     proc: &mut crate::process::Process,
     _ctx: &crate::context::GlobalContext,
@@ -3839,6 +3903,172 @@ fn prim_tree_string(
         Err(ControlSignal::Error(
             "TREE-STRING requires 1 argument".to_string(),
         ))
+    }
+}
+
+fn prim_tc_encode_nat(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("TC-ENCODE-NAT requires 1 argument");
+    }
+    let node = proc.arena.inner.get_unchecked(args[0]);
+    let n = match node {
+        Node::Leaf(OpaqueValue::Integer(i)) if *i >= 0 => *i as u64,
+        Node::Leaf(OpaqueValue::BigInt(b)) if b.sign() != num_bigint::Sign::Minus => {
+            b.to_u64().ok_or_else(|| ControlSignal::Error("TC-ENCODE-NAT: too large".to_string()))?
+        }
+        _ => return err_helper("TC-ENCODE-NAT expects a non-negative integer"),
+    };
+    let encoded = tree_calculus::encode_nat(&mut proc.arena.inner, n);
+    Ok(encoded)
+}
+
+fn prim_tc_decode_nat(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("TC-DECODE-NAT requires 1 argument");
+    }
+    let n = tree_calculus::decode_nat(&proc.arena.inner, args[0])
+        .ok_or_else(|| ControlSignal::Error("TC-DECODE-NAT: not a tree-calculus nat".to_string()))?;
+    if n <= i64::MAX as u64 {
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(n as i64))))
+    } else {
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::BigInt(
+            num_bigint::BigInt::from(n),
+        ))))
+    }
+}
+
+fn prim_tc_encode_string(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("TC-ENCODE-STRING requires 1 argument");
+    }
+    let node = proc.arena.inner.get_unchecked(args[0]);
+    let s = match node {
+        Node::Leaf(OpaqueValue::String(val)) => val.clone(),
+        _ => return err_helper("TC-ENCODE-STRING expects a string"),
+    };
+    let encoded = tree_calculus::encode_string(&mut proc.arena.inner, &s);
+    Ok(encoded)
+}
+
+fn prim_tc_decode_string(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("TC-DECODE-STRING requires 1 argument");
+    }
+    let s = tree_calculus::decode_string(&proc.arena.inner, args[0])
+        .ok_or_else(|| ControlSignal::Error("TC-DECODE-STRING: not a TC string".to_string()))?;
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(s))))
+}
+
+fn prim_tc_succ(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("TC-SUCC requires 1 argument");
+    }
+    let n = tree_calculus::decode_nat(&proc.arena.inner, args[0])
+        .ok_or_else(|| ControlSignal::Error("TC-SUCC: not a tree-calculus nat".to_string()))?;
+    let encoded = tree_calculus::encode_nat(&mut proc.arena.inner, n + 1);
+    Ok(encoded)
+}
+
+fn prim_tc_add(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("TC-ADD requires 2 arguments");
+    }
+    let a = tree_calculus::decode_nat(&proc.arena.inner, args[0])
+        .ok_or_else(|| ControlSignal::Error("TC-ADD: first arg not a tree-calculus nat".to_string()))?;
+    let b = tree_calculus::decode_nat(&proc.arena.inner, args[1])
+        .ok_or_else(|| ControlSignal::Error("TC-ADD: second arg not a tree-calculus nat".to_string()))?;
+    let sum = a
+        .checked_add(b)
+        .ok_or_else(|| ControlSignal::Error("TC-ADD: overflow".to_string()))?;
+    let encoded = tree_calculus::encode_nat(&mut proc.arena.inner, sum);
+    Ok(encoded)
+}
+
+fn prim_tc_equal(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("TC-EQUAL requires 2 arguments");
+    }
+    let a = tree_calculus::decode_nat(&proc.arena.inner, args[0])
+        .ok_or_else(|| ControlSignal::Error("TC-EQUAL: first arg not a tree-calculus nat".to_string()))?;
+    let b = tree_calculus::decode_nat(&proc.arena.inner, args[1])
+        .ok_or_else(|| ControlSignal::Error("TC-EQUAL: second arg not a tree-calculus nat".to_string()))?;
+    if a == b {
+        Ok(tree_calculus::k(&mut proc.arena.inner))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_tc_triage(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 4 {
+        return err_helper("TC-TRIAGE requires 4 arguments: f0 f1 f2 z");
+    }
+    let f0 = args[0];
+    let f1 = args[1];
+    let f2 = args[2];
+    let z = args[3];
+
+    let arena = &mut proc.arena.inner;
+    match arena.get_unchecked(z) {
+        Node::Leaf(OpaqueValue::Nil) => Ok(f0),
+        Node::Leaf(_) => err_helper("TC-TRIAGE: non-NIL leaf is not a pure tree"),
+        _ => {
+            if let Some(x) = tc_split_stem(arena, z) {
+                Ok(arena.alloc(Node::Fork(f1, x)))
+            } else if let Some((x, y)) = tc_split_fork(arena, z) {
+                let fx = arena.alloc(Node::Fork(f2, x));
+                Ok(arena.alloc(Node::Fork(fx, y)))
+            } else {
+                err_helper("TC-TRIAGE: not a leaf, stem, or fork")
+            }
+        }
+    }
+}
+
+fn tc_split_stem(arena: &Arena, node: NodeId) -> Option<NodeId> {
+    match arena.get_unchecked(node) {
+        Node::Stem(x) => Some(*x),
+        Node::Fork(op, x) if tree_calculus::is_delta(arena, *op) => Some(*x),
+        _ => None,
+    }
+}
+
+fn tc_split_fork(arena: &Arena, node: NodeId) -> Option<(NodeId, NodeId)> {
+    match arena.get_unchecked(node) {
+        Node::Fork(left, right) => tc_split_stem(arena, *left).map(|x| (x, *right)),
+        _ => None,
     }
 }
 
@@ -4649,6 +4879,75 @@ fn prim_save_tree_pdf(
             .arena
             .inner
             .alloc(Node::Leaf(OpaqueValue::String(filename))))
+    } else {
+        Err(ControlSignal::Error(format!(
+            "dot exited with status: {}",
+            status
+        )))
+    }
+}
+
+fn prim_tree_to_pdf(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "TREE-TO-PDF requires 2 arguments: (dot-filename pdf-filename)".to_string(),
+        ));
+    }
+    let dot_filename_node = args[0];
+    let pdf_filename_node = args[1];
+
+    let dot_filename = match proc.arena.inner.get_unchecked(dot_filename_node) {
+        Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+        _ => {
+            return Err(ControlSignal::Error(
+                "TREE-TO-PDF: first argument must be a string".to_string(),
+            ))
+        }
+    };
+    let pdf_filename = match proc.arena.inner.get_unchecked(pdf_filename_node) {
+        Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+        _ => {
+            return Err(ControlSignal::Error(
+                "TREE-TO-PDF: second argument must be a string".to_string(),
+            ))
+        }
+    };
+
+    let dot_content = std::fs::read_to_string(&dot_filename).map_err(|e| {
+        ControlSignal::Error(format!(
+            "TREE-TO-PDF: failed to read {}: {}",
+            dot_filename, e
+        ))
+    })?;
+
+    use std::io::Write;
+    let mut child = std::process::Command::new("dot")
+        .arg("-Tpdf")
+        .arg("-o")
+        .arg(&pdf_filename)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| ControlSignal::Error(format!("Failed to spawn dot: {}", e)))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(dot_content.as_bytes())
+            .map_err(|e| ControlSignal::Error(format!("Failed to write to dot stdin: {}", e)))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| ControlSignal::Error(format!("Failed to wait for dot: {}", e)))?;
+
+    if status.success() {
+        Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(pdf_filename))))
     } else {
         Err(ControlSignal::Error(format!(
             "dot exited with status: {}",
