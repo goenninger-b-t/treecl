@@ -3,6 +3,7 @@ use crate::context::GlobalContext;
 use crate::process::Process;
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
+use crate::tree_calculus;
 
 // Bracket Expression to handle intermediate compilation state
 #[derive(Debug, Clone)]
@@ -14,11 +15,26 @@ enum BExpr {
 
 impl BExpr {
     fn occurs(&self, sym: SymbolId) -> bool {
-        match self {
+        let mut cache = std::collections::HashMap::new();
+        self.occurs_cached(sym, &mut cache)
+    }
+
+    fn occurs_cached(
+        &self,
+        sym: SymbolId,
+        cache: &mut std::collections::HashMap<(usize, SymbolId), bool>,
+    ) -> bool {
+        let key = (self as *const _ as usize, sym);
+        if let Some(&res) = cache.get(&key) {
+            return res;
+        }
+        let res = match self {
             BExpr::Var(s) => *s == sym,
             BExpr::Const(_) => false,
-            BExpr::App(l, r) => l.occurs(sym) || r.occurs(sym),
-        }
+            BExpr::App(l, r) => l.occurs_cached(sym, cache) || r.occurs_cached(sym, cache),
+        };
+        cache.insert(key, res);
+        res
     }
 }
 
@@ -29,16 +45,35 @@ pub struct Compiler<'a> {
     symbols: &'a RwLock<SymbolTable>,
     primitives: &'a std::collections::HashMap<SymbolId, crate::context::PrimitiveFn>,
     nil_node: NodeId,
+    k_node: NodeId,
+    i_node: NodeId,
+    s_node: NodeId,
+    pure_only: bool,
 }
 
 impl<'a> Compiler<'a> {
     pub fn new(proc: &'a mut Process, ctx: &'a GlobalContext) -> Self {
+        Self::new_with_mode(proc, ctx, true)
+    }
+
+    pub fn new_extended(proc: &'a mut Process, ctx: &'a GlobalContext) -> Self {
+        Self::new_with_mode(proc, ctx, false)
+    }
+
+    fn new_with_mode(proc: &'a mut Process, ctx: &'a GlobalContext, pure_only: bool) -> Self {
         let nil_node = proc.make_nil();
+        let k_node = tree_calculus::k(&mut proc.arena.inner);
+        let i_node = tree_calculus::i(&mut proc.arena.inner);
+        let s_node = tree_calculus::s(&mut proc.arena.inner);
         Self {
             arena: &mut proc.arena.inner,
             symbols: &ctx.symbols,
             primitives: &ctx.primitives,
             nil_node,
+            k_node,
+            i_node,
+            s_node,
+            pure_only,
         }
     }
 
@@ -47,62 +82,72 @@ impl<'a> Compiler<'a> {
     }
 
     fn make_app(&mut self, f: NodeId, a: NodeId) -> NodeId {
-        self.arena.alloc(Node::Fork(f, a))
+        tree_calculus::app(self.arena, f, a)
+    }
+
+    fn is_pure_const(&self, root: NodeId) -> bool {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            match self.arena.get_unchecked(id) {
+                Node::Leaf(val) => {
+                    if !matches!(val, OpaqueValue::Nil) {
+                        return false;
+                    }
+                }
+                Node::Stem(child) => stack.push(*child),
+                Node::Fork(left, right) => {
+                    stack.push(*left);
+                    stack.push(*right);
+                }
+            }
+        }
+        true
     }
 
     fn bexpr_i(&mut self) -> BExpr {
-        // I = △ △
-        // In search.rs: ((△ △) y) -> y
-        let n = self.make_leaf();
-        let nn = self.make_app(n, n);
-        BExpr::Const(nn)
+        BExpr::Const(self.i_node)
     }
 
     fn bexpr_k(&mut self, u: BExpr) -> BExpr {
-        // K u = △ (△ u)
-        // In search.rs: ((△ (△ u)) y) -> u
-        let n = self.make_leaf();
-        let n_node = BExpr::Const(n);
-        // (△ u)
-        let nu = BExpr::App(Box::new(n_node.clone()), Box::new(u));
-        // (△ (△ u))
-        BExpr::App(Box::new(n_node), Box::new(nu))
+        // K u
+        BExpr::App(Box::new(BExpr::Const(self.k_node)), Box::new(u))
     }
 
     fn bexpr_s(&mut self, z: BExpr, w: BExpr) -> BExpr {
-        // S z w = △ (△ z w) = △ ((△ z) w)
-        // In search.rs: △ (△ z w) y -> ((z y) (w y))
-        let n = self.make_leaf();
-        let n_node = BExpr::Const(n);
-
-        // (△ z)
-        let nz = BExpr::App(Box::new(n_node.clone()), Box::new(z));
-        // ((△ z) w)
-        let nzw = BExpr::App(Box::new(nz), Box::new(w));
-        // (△ ((△ z) w))
-        let op = BExpr::App(Box::new(n_node), Box::new(nzw));
-        op
+        // S z w
+        let sz = BExpr::App(Box::new(BExpr::Const(self.s_node)), Box::new(z));
+        BExpr::App(Box::new(sz), Box::new(w))
     }
 
-    fn abstract_var(&mut self, name: SymbolId, e: BExpr) -> BExpr {
-        if !e.occurs(name) {
-            self.bexpr_k(e)
+    fn abstract_var(&mut self, name: SymbolId, e: &BExpr) -> BExpr {
+        let mut occurs_cache = std::collections::HashMap::new();
+        self.abstract_var_cached(name, e, &mut occurs_cache)
+    }
+
+    fn abstract_var_cached(
+        &mut self,
+        name: SymbolId,
+        e: &BExpr,
+        occurs_cache: &mut std::collections::HashMap<(usize, SymbolId), bool>,
+    ) -> BExpr {
+        if !e.occurs_cached(name, occurs_cache) {
+            self.bexpr_k(e.clone())
         } else {
             match e {
-                BExpr::Var(_) => self.bexpr_i(), // Must be the var itself if occurs
+                BExpr::Var(_) => self.bexpr_i(),
                 BExpr::App(l, r) => {
                     // Optimization: eta-reduction \x. f x -> f if x not free in f
-                    if let BExpr::Var(v_sym) = *r {
-                        if v_sym == name && !l.occurs(name) {
-                            return *l;
+                    if let BExpr::Var(v_sym) = **r {
+                        if v_sym == name && !l.occurs_cached(name, occurs_cache) {
+                            return *l.clone();
                         }
                     }
 
-                    let al = self.abstract_var(name, *l);
-                    let ar = self.abstract_var(name, *r);
+                    let al = self.abstract_var_cached(name, l, occurs_cache);
+                    let ar = self.abstract_var_cached(name, r, occurs_cache);
                     self.bexpr_s(al, ar)
                 }
-                BExpr::Const(_) => self.bexpr_k(e), // Should be covered by !occurs
+                BExpr::Const(_) => self.bexpr_k(e.clone()),
             }
         }
     }
@@ -117,44 +162,9 @@ impl<'a> Compiler<'a> {
                         let sym_id = SymbolId(id);
                         if params.contains(&sym_id) {
                             Ok(BExpr::Var(sym_id))
-                        } else if self.primitives.contains_key(&sym_id) {
-                            // Global primitive function: compile as constant (symbol itself)
+                        } else if !self.pure_only && self.primitives.contains_key(&sym_id) {
                             Ok(BExpr::Const(expr))
-                        } else {
-                            // Free variable: resolve to value using SYMBOL-VALUE
-                            // This ensures we get dynamic lookup and errors for unbound variables.
-
-                            // Find SYMBOL-VALUE symbol
-                            // We assume it's in COMMON-LISP (Package 1)
-                            // We construct an application: (SYMBOL-VALUE 'sym)
-                            // 'sym is just the symbol leaf (OpaqueValue::Symbol already)
-
-                            // We need to look up SYMBOL-VALUE symbol ID.
-                            // Since we don't have direct access to ctx.symbol_table by name easily without iter?
-                            // Actually Compiler has &GlobalContext.
-                            // But we need to be careful about borrowing.
-                            // Compiler struct: pub symbols: &'a SymbolTable
-
-                            // We can use a predetermined ID if we knew it, but it's dynamic.
-                            // Safer to treat `SYMBOL-VALUE` as a known primitive wrapper if possible?
-                            // Or just emit a special Node?
-                            // No, we emit BExpr::App.
-
-                            // Let's create a temporary node for SYMBOL-VALUE?
-                            // We can't easily look up mutable from here.
-
-                            // Workaround: We emit a specific primitive call pattern?
-                            // Or we modify BExpr to support "Global Lookup"?
-
-                            // BExpr::Var is for lambda parameters (bound variables via De Bruijn or named params).
-                            // BExpr::Const is for constants.
-
-                            // If we return BExpr::Const(expr), it evaluates to the symbol.
-
-                            // We want (SYMBOL-VALUE sym).
-                            // Let's assume we can resolve "SYMBOL-VALUE" from symbols table.
-                            // Be careful: symbols is `&SymbolTable`.
-
+                        } else if !self.pure_only {
                             if let Some(pkg) = self
                                 .symbols
                                 .read()
@@ -162,41 +172,38 @@ impl<'a> Compiler<'a> {
                                 .get_package(crate::symbol::PackageId(1))
                             {
                                 if let Some(sv_sym) = pkg.find_symbol("SYMBOL-VALUE") {
-                                    // Create nodes for (SYMBOL-VALUE 'sym)
-                                    // We can't create new nodes in `self.arena` easily inside `match node` due to borrow?
-                                    // self.arena is `&mut ProcessArena`.
-                                    // But `node` is a clone of the value, so we are fine on borrow of `expr`.
-                                    // But `self.arena` is borrowed mutably?
-                                    // Wait, `compile_to_bexpr` takes `&mut self`.
-
-                                    // Make leaf for SYMBOL-VALUE
                                     let sv_leaf =
                                         self.arena.alloc(Node::Leaf(OpaqueValue::Symbol(sv_sym.0)));
-
-                                    // Make leaf for Quoted Argument?
-                                    // SYMBOL-VALUE takes a symbol. In TC, (f a) applies f to a.
-                                    // If a is a symbol node, it evaluates to itself initially?
-                                    // Wait, if we just pass `expr` (the symbol node), `SYMBOL-VALUE` will receive `Symbol(id)`.
-                                    // That is what we want.
-
-                                    // (SYMBOL-VALUE sym)
                                     let sv_node = BExpr::Const(sv_leaf);
                                     let arg_node = BExpr::Const(expr);
-
                                     Ok(BExpr::App(Box::new(sv_node), Box::new(arg_node)))
                                 } else {
-                                    // Fallback if SYMBOL-VALUE not found (shouldn't happen)
                                     Ok(BExpr::Const(expr))
                                 }
                             } else {
                                 Ok(BExpr::Const(expr))
                             }
+                        } else {
+                            Err("Compilation is restricted to pure tree calculus terms; free symbols are not allowed".to_string())
                         }
                     }
-                    _ => Ok(BExpr::Const(expr)),
+                    OpaqueValue::Nil => Ok(BExpr::Const(expr)),
+                    _ => {
+                        if self.pure_only {
+                            Err("Compilation is restricted to pure tree calculus terms; non-NIL literals are not allowed".to_string())
+                        } else {
+                            Ok(BExpr::Const(expr))
+                        }
+                    }
                 }
             }
-            Node::Stem(_) => Ok(BExpr::Const(expr)),
+            Node::Stem(_) => {
+                if !self.pure_only || self.is_pure_const(expr) {
+                    Ok(BExpr::Const(expr))
+                } else {
+                    Err("Compilation is restricted to pure tree calculus terms; non-NIL literals are not allowed".to_string())
+                }
+            }
             Node::Fork(_, _) => {
                 // Check for LAMBDA special form
                 let node_copy = self.arena.get_unchecked(expr).clone();
@@ -263,7 +270,7 @@ impl<'a> Compiler<'a> {
                                 let inner_params = &new_params[params.len()..];
 
                                 for &param in inner_params.iter().rev() {
-                                    body_bexpr = self.abstract_var(param, body_bexpr);
+                                    body_bexpr = self.abstract_var(param, &body_bexpr);
                                 }
 
                                 return Ok(body_bexpr);
@@ -308,10 +315,10 @@ impl<'a> Compiler<'a> {
                     } else {
                         Ok(BExpr::Const(self.nil_node))
                     }
-                } else {
-                    // Dotted list -> Treat as data constant?
-                    // Or error? compile only supports standard code lists.
+                } else if !self.pure_only || self.is_pure_const(expr) {
                     Ok(BExpr::Const(expr))
+                } else {
+                    Err("Compilation is restricted to pure tree calculus terms; non-NIL literals are not allowed".to_string())
                 }
             }
         }
@@ -349,7 +356,23 @@ pub fn compile_func(
 
     // Abstract variables in reverse order (inner to outer)
     for &param in params.iter().rev() {
-        bexpr = compiler.abstract_var(param, bexpr);
+        bexpr = compiler.abstract_var(param, &bexpr);
+    }
+
+    compiler.bexpr_to_node(bexpr)
+}
+
+pub fn compile_func_extended(
+    proc: &mut Process,
+    ctx: &GlobalContext,
+    params: &[SymbolId],
+    body: NodeId,
+) -> Result<NodeId, String> {
+    let mut compiler = Compiler::new_extended(proc, ctx);
+    let mut bexpr = compiler.compile_to_bexpr(body, params)?;
+
+    for &param in params.iter().rev() {
+        bexpr = compiler.abstract_var(param, &bexpr);
     }
 
     compiler.bexpr_to_node(bexpr)

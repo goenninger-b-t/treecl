@@ -105,11 +105,8 @@ impl<'a> Printer<'a> {
             return Some(":K-COMBINATOR");
         }
 
-        // Check for I = Fork(K, K)
-        if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
-            if self.is_k(*left) && self.is_k(*right) {
-                return Some(":I-COMBINATOR");
-            }
+        if self.is_i(node) {
+            return Some(":I-COMBINATOR");
         }
 
         None
@@ -117,16 +114,37 @@ impl<'a> Printer<'a> {
 
     /// Check if node is K = Fork(Nil, Nil)
     fn is_k(&self, node: NodeId) -> bool {
-        if let Node::Fork(left, right) = self.arena.get_unchecked(node) {
-            matches!(
+        match self.arena.get_unchecked(node) {
+            Node::Stem(inner) => matches!(self.arena.get_unchecked(*inner), Node::Leaf(OpaqueValue::Nil)),
+            Node::Fork(left, right) => matches!(
                 (
                     self.arena.get_unchecked(*left),
                     self.arena.get_unchecked(*right)
                 ),
                 (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil))
-            )
-        } else {
-            false
+            ),
+            _ => false,
+        }
+    }
+
+    fn is_delta(&self, node: NodeId) -> bool {
+        matches!(self.arena.get_unchecked(node), Node::Leaf(OpaqueValue::Nil))
+    }
+
+    /// Check if node is I = 4(44)(44)
+    fn is_i(&self, node: NodeId) -> bool {
+        match self.arena.get_unchecked(node) {
+            Node::Fork(left, right) => {
+                if !self.is_k(*right) {
+                    return false;
+                }
+                match self.arena.get_unchecked(*left) {
+                    Node::Stem(inner) => self.is_k(*inner),
+                    Node::Fork(op, inner) if self.is_delta(*op) => self.is_k(*inner),
+                    _ => false,
+                }
+            }
+            _ => false,
         }
     }
 

@@ -24,6 +24,7 @@ pub struct Arena {
     nodes: Vec<Entry>,
     free_head: Option<u32>,
     allocs_since_gc: usize,
+    epoch: u64,
 }
 
 impl Arena {
@@ -32,6 +33,7 @@ impl Arena {
             nodes: Vec::with_capacity(1024),
             free_head: None,
             allocs_since_gc: 0,
+            epoch: 0,
         }
     }
 
@@ -63,6 +65,7 @@ impl Arena {
             // Ensure slot is occupied? Or force?
             // Safe to force.
             self.nodes[idx] = Entry::Occupied(node);
+            self.epoch = self.epoch.wrapping_add(1);
         } else {
              panic!("Arena overwrite out of bounds");
         }
@@ -98,6 +101,9 @@ impl Arena {
                      freed_count += 1;
                 }
             }
+        }
+        if freed_count > 0 {
+            self.epoch = self.epoch.wrapping_add(1);
         }
         freed_count
     }
@@ -137,6 +143,11 @@ impl Arena {
             free_slots: free_count,
             allocs_since_gc: self.allocs_since_gc,
         }
+    }
+
+    /// Mutation epoch, increments on overwrite/sweep to invalidate caches.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 

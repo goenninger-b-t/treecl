@@ -27,12 +27,28 @@ Source: tree_book.pdf (Barry Jay, "Tree Calculus")
   - I = 4 (4 4) (4 4)
   - D = 4 (4 4) (4 4 4)
   - d{x} is shorthand for 4 (4 x) in derivations.
+- Natural numbers (Chapter 3.7):
+  - Represent n as K^n 4 (zero is 4; successor is K).
+  - isZero = d{K 4 I}(d{K K}4).
+  - predecessor = d{K 2 I}(d{K4}4).
 - Fundamental queries exist for structural inspection:
   - isLeaf, isStem, isFork can be defined using a generalized "query" that
     distinguishes leaf/stem/fork.
+  - query {is0,is1,is2} = d{K is1}(d{K 2 I}(d{K 5 is2}(d{K 3 is0}4))).
   - A "triage" combinator packages these tests to select among three functions
     based on whether its argument is a leaf, stem, or fork. This is used by
     programs like size and equality.
+- Alternate boolean-style queries (Chapter 5):
+  - isStem2 = lambda* z. 4 z 4 (K 2 4)
+    - Maps leaves and forks to a leaf (false), and a stem 4x to a fork
+      4 (K 2 4) (x (K 2 4)).
+  - isFork2 = lambda* z. 4 z (K K) (K (K 4))
+    - Maps forks to 4 and maps leaves/stems to forks.
+- Triage combinator (Chapter 5):
+  - triage_comb = lambda* f0. lambda* f1. lambda* f2. lambda* z.
+    isStem2 z (4 z f0 f2) (4 (z 4) 4 (lambda* x. K (f1 x)))
+  - Semantics: triage{f0,f1,f2} 4 = f0; triage{f0,f1,f2} (4 x) = f1 x;
+    triage{f0,f1,f2} (4 x y) = f2 x y.
 - Evaluation strategies are defined within tree calculus:
   - Branch-first: evaluate branches before evaluating the root.
   - Root evaluation: evaluate only enough to determine leaf/stem/fork (factorable
