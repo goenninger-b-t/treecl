@@ -102,6 +102,8 @@ impl Default for Environment {
 pub struct Closure {
     /// Parsed lambda list info
     pub lambda_list: ParsedLambdaList,
+    /// Destructuring lambda list for macros (if applicable)
+    pub destructuring: Option<DestructuringLambdaList>,
     /// Body expression (NodeId)
     pub body: NodeId,
     /// Captured environment
@@ -126,6 +128,50 @@ pub struct ParsedLambdaList {
     pub aux: Vec<(SymbolId, NodeId)>,
     /// &allow-other-keys present
     pub allow_other_keys: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DestructuringLambdaList {
+    pattern: DListPattern,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DListPattern {
+    req: Vec<DPattern>,
+    opt: Vec<DOptSpec>,
+    rest: Option<Box<DPattern>>,
+    key: Vec<DKeySpec>,
+    aux: Vec<DAuxSpec>,
+    allow_other_keys: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DOptSpec {
+    pattern: DPattern,
+    init: Option<NodeId>,
+    supplied: Option<SymbolId>,
+}
+
+#[derive(Debug, Clone)]
+struct DKeySpec {
+    key: SymbolId,
+    pattern: DPattern,
+    init: Option<NodeId>,
+    supplied: Option<SymbolId>,
+}
+
+#[derive(Debug, Clone)]
+struct DAuxSpec {
+    sym: SymbolId,
+    init: Option<NodeId>,
+}
+
+#[derive(Debug, Clone)]
+enum DPattern {
+    Var(SymbolId),
+    Wildcard,
+    Literal(NodeId),
+    List(DListPattern),
 }
 
 /// Control flow signals for non-local exits
@@ -215,6 +261,15 @@ enum LambdaListMode {
     Req,
     Opt,
     Rest,
+    Key,
+    Aux,
+}
+
+enum DListMode {
+    Req,
+    Opt,
+    Rest,
+    PostRest,
     Key,
     Aux,
 }
@@ -429,6 +484,293 @@ impl<'a> Interpreter<'a> {
         }
 
         Ok(parsed)
+    }
+
+    pub fn parse_destructuring_lambda_list(
+        &mut self,
+        list_node: NodeId,
+    ) -> Result<DestructuringLambdaList, String> {
+        let pattern = self.parse_dlist_pattern(list_node)?;
+        Ok(DestructuringLambdaList { pattern })
+    }
+
+    fn parse_dlist_pattern(&mut self, list_node: NodeId) -> Result<DListPattern, String> {
+        let (items, tail) = self.list_items_with_tail(list_node);
+        let mut has_keyword = false;
+        for item in &items {
+            if let Some(sym) = self.node_to_symbol(*item) {
+                if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym) {
+                    if matches!(
+                        name,
+                        "&OPTIONAL" | "&REST" | "&BODY" | "&KEY" | "&AUX" | "&ALLOW-OTHER-KEYS"
+                    ) {
+                        has_keyword = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if has_keyword && !self.is_nil(tail) {
+            return Err("Improper destructuring lambda list".into());
+        }
+
+        let mut pattern = DListPattern::default();
+        if !has_keyword {
+            for item in items {
+                pattern.req.push(self.parse_dpattern(item)?);
+            }
+            if !self.is_nil(tail) {
+                pattern.rest = Some(Box::new(self.parse_dpattern(tail)?));
+            }
+            return Ok(pattern);
+        }
+
+        let mut mode = DListMode::Req;
+        for item in items {
+            if let Some(sym) = self.node_to_symbol(item) {
+                if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym) {
+                    match name {
+                        "&OPTIONAL" => {
+                            mode = DListMode::Opt;
+                            continue;
+                        }
+                        "&REST" | "&BODY" => {
+                            mode = DListMode::Rest;
+                            continue;
+                        }
+                        "&KEY" => {
+                            mode = DListMode::Key;
+                            continue;
+                        }
+                        "&AUX" => {
+                            mode = DListMode::Aux;
+                            continue;
+                        }
+                        "&ALLOW-OTHER-KEYS" => {
+                            if !matches!(mode, DListMode::Key) {
+                                return Err("&ALLOW-OTHER-KEYS must follow &KEY".into());
+                            }
+                            pattern.allow_other_keys = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            match mode {
+                DListMode::Req => pattern.req.push(self.parse_dpattern(item)?),
+                DListMode::Opt => pattern.opt.push(self.parse_opt_spec(item)?),
+                DListMode::Rest => {
+                    if pattern.rest.is_some() {
+                        return Err("Multiple &rest arguments".into());
+                    }
+                    pattern.rest = Some(Box::new(self.parse_dpattern(item)?));
+                    mode = DListMode::PostRest;
+                }
+                DListMode::PostRest => {
+                    return Err("Only &key or &aux may follow &rest".into());
+                }
+                DListMode::Key => pattern.key.push(self.parse_key_spec(item)?),
+                DListMode::Aux => pattern.aux.push(self.parse_aux_spec(item)?),
+            }
+        }
+
+        Ok(pattern)
+    }
+
+    fn parse_dpattern(&mut self, node: NodeId) -> Result<DPattern, String> {
+        if self.is_nil(node) {
+            return Ok(DPattern::Literal(node));
+        }
+        if let Some(lit) = self.quoted_literal_pattern(node) {
+            return Ok(DPattern::Literal(lit));
+        }
+        if let Some(sym) = self.node_to_symbol(node) {
+            if self.is_wildcard_symbol(sym) {
+                return Ok(DPattern::Wildcard);
+            }
+            if self.is_keyword_symbol(sym) {
+                return Ok(DPattern::Literal(node));
+            }
+            return Ok(DPattern::Var(sym));
+        }
+        match self.process.arena.get_unchecked(node) {
+            Node::Fork(_, _) => Ok(DPattern::List(self.parse_dlist_pattern(node)?)),
+            _ => Ok(DPattern::Literal(node)),
+        }
+    }
+
+    fn parse_opt_spec(&mut self, node: NodeId) -> Result<DOptSpec, String> {
+        if self.quoted_literal_pattern(node).is_some() {
+            return Ok(DOptSpec {
+                pattern: self.parse_dpattern(node)?,
+                init: None,
+                supplied: None,
+            });
+        }
+        if matches!(self.process.arena.get_unchecked(node), Node::Fork(_, _)) {
+            let (parts, tail) = self.list_items_with_tail(node);
+            if !self.is_nil(tail) {
+                return Err("Improper &optional spec".into());
+            }
+            if parts.is_empty() {
+                return Err("Empty &optional spec".into());
+            }
+            let pattern = self.parse_dpattern(parts[0])?;
+            let init = parts.get(1).copied();
+            let supplied = if parts.len() > 2 {
+                self.node_to_symbol(parts[2])
+            } else {
+                None
+            };
+            if parts.len() > 3 {
+                return Err("Too many elements in &optional spec".into());
+            }
+            return Ok(DOptSpec {
+                pattern,
+                init,
+                supplied,
+            });
+        }
+
+        Ok(DOptSpec {
+            pattern: self.parse_dpattern(node)?,
+            init: None,
+            supplied: None,
+        })
+    }
+
+    fn parse_key_spec(&mut self, node: NodeId) -> Result<DKeySpec, String> {
+        if !matches!(self.process.arena.get_unchecked(node), Node::Fork(_, _)) {
+            let key_sym = self
+                .node_to_symbol(node)
+                .ok_or("Key parameter must be symbol")?;
+            return Ok(DKeySpec {
+                key: key_sym,
+                pattern: self.parse_dpattern(node)?,
+                init: None,
+                supplied: None,
+            });
+        }
+
+        let (parts, tail) = self.list_items_with_tail(node);
+        if !self.is_nil(tail) {
+            return Err("Improper &key spec".into());
+        }
+        if parts.is_empty() {
+            return Err("Empty &key spec".into());
+        }
+
+        let spec = parts[0];
+        let (key_sym, var_node) = if let Some(sym) = self.node_to_symbol(spec) {
+            (sym, spec)
+        } else if matches!(self.process.arena.get_unchecked(spec), Node::Fork(_, _)) {
+            let (spec_parts, spec_tail) = self.list_items_with_tail(spec);
+            if !self.is_nil(spec_tail) || spec_parts.len() != 2 {
+                return Err("Key spec must be (key var)".into());
+            }
+            let key_sym = self
+                .node_to_symbol(spec_parts[0])
+                .ok_or("Key name must be symbol")?;
+            (key_sym, spec_parts[1])
+        } else {
+            return Err("Key spec must be symbol or (key var)".into());
+        };
+
+        let init = parts.get(1).copied();
+        let supplied = if parts.len() > 2 {
+            self.node_to_symbol(parts[2])
+        } else {
+            None
+        };
+        if parts.len() > 3 {
+            return Err("Too many elements in &key spec".into());
+        }
+
+        Ok(DKeySpec {
+            key: key_sym,
+            pattern: self.parse_dpattern(var_node)?,
+            init,
+            supplied,
+        })
+    }
+
+    fn parse_aux_spec(&mut self, node: NodeId) -> Result<DAuxSpec, String> {
+        if !matches!(self.process.arena.get_unchecked(node), Node::Fork(_, _)) {
+            let sym = self
+                .node_to_symbol(node)
+                .ok_or("Aux var must be symbol")?;
+            return Ok(DAuxSpec { sym, init: None });
+        }
+
+        let (parts, tail) = self.list_items_with_tail(node);
+        if !self.is_nil(tail) {
+            return Err("Improper &aux spec".into());
+        }
+        if parts.is_empty() {
+            return Err("Empty &aux spec".into());
+        }
+        let sym = self
+            .node_to_symbol(parts[0])
+            .ok_or("Aux var must be symbol")?;
+        let init = parts.get(1).copied();
+        if parts.len() > 2 {
+            return Err("Too many elements in &aux spec".into());
+        }
+        Ok(DAuxSpec { sym, init })
+    }
+
+    fn list_items_with_tail(&self, list: NodeId) -> (Vec<NodeId>, NodeId) {
+        let mut items = Vec::new();
+        let mut current = list;
+        loop {
+            match self.process.arena.get_unchecked(current) {
+                Node::Fork(head, tail) => {
+                    items.push(*head);
+                    current = *tail;
+                }
+                _ => break,
+            }
+        }
+        (items, current)
+    }
+
+    fn quoted_literal_pattern(&self, node: NodeId) -> Option<NodeId> {
+        let Node::Fork(head, tail) = self.process.arena.get_unchecked(node) else {
+            return None;
+        };
+        let Node::Leaf(OpaqueValue::Symbol(sym)) = self.process.arena.get_unchecked(*head) else {
+            return None;
+        };
+        if SymbolId(*sym) != self.globals.special_forms.quote {
+            return None;
+        }
+        match self.process.arena.get_unchecked(*tail) {
+            Node::Fork(arg, rest) if self.is_nil(*rest) => Some(*arg),
+            _ => None,
+        }
+    }
+
+    fn is_keyword_symbol(&self, sym: SymbolId) -> bool {
+        self.globals
+            .symbols
+            .read()
+            .unwrap()
+            .get_symbol(sym)
+            .map(|s| s.is_keyword())
+            .unwrap_or(false)
+    }
+
+    fn is_wildcard_symbol(&self, sym: SymbolId) -> bool {
+        self.globals
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(sym)
+            .map(|name| name == "_")
+            .unwrap_or(false)
     }
 
     /// Fully evaluate a node (interleaving Tree Calculus and Primitives)
@@ -826,15 +1168,20 @@ impl<'a> Interpreter<'a> {
             self.process.make_nil()
         };
 
-        // Parse lambda list
+        // Parse lambda list (both plain + destructuring for macros)
         let parsed_lambda_list = match self.parse_lambda_list(lambda_list_node) {
             Ok(l) => l,
+            Err(e) => return Err(ControlSignal::Error(e)),
+        };
+        let destructuring = match self.parse_destructuring_lambda_list(lambda_list_node) {
+            Ok(d) => d,
             Err(e) => return Err(ControlSignal::Error(e)),
         };
 
         // Create Closure
         let closure = crate::eval::Closure {
             lambda_list: parsed_lambda_list,
+            destructuring: Some(destructuring),
             body: body_node,
             env: crate::eval::Environment::new(),
         };
@@ -1056,6 +1403,7 @@ impl<'a> Interpreter<'a> {
         // Create Closure
         let closure = crate::eval::Closure {
             lambda_list: parsed_lambda_list,
+            destructuring: None,
             body: body_node,
             env: crate::eval::Environment::new(),
         };
@@ -1151,6 +1499,7 @@ impl<'a> Interpreter<'a> {
 
                         let closure = Closure {
                             lambda_list,
+                            destructuring: None,
                             body: body_expr,
                             env: captured_env,
                         };
@@ -1839,6 +2188,7 @@ impl<'a> Interpreter<'a> {
             // Create Closure capturing CURRENT environment
             crate::eval::Closure {
                 lambda_list: parsed_lambda_list,
+                destructuring: None,
                 body: body_node,
                 env: {
                     env.clone() // Capture application env
@@ -2023,6 +2373,244 @@ impl<'a> Interpreter<'a> {
         }
 
         Ok(new_env)
+    }
+
+    fn bind_destructuring_lambda_list(
+        &mut self,
+        pattern: &DestructuringLambdaList,
+        args: NodeId,
+        env: &mut Environment,
+    ) -> Result<(), ControlSignal> {
+        let mut bindings = HashMap::new();
+        let mut shape = crate::pattern::ShapeClassifier::new();
+        self.match_dlist_pattern(&pattern.pattern, args, env, &mut bindings, &mut shape)
+    }
+
+    fn match_dlist_pattern(
+        &mut self,
+        pattern: &DListPattern,
+        value: NodeId,
+        env: &mut Environment,
+        bindings: &mut HashMap<SymbolId, NodeId>,
+        shape: &mut crate::pattern::ShapeClassifier,
+    ) -> Result<(), ControlSignal> {
+        let mut current = value;
+
+        for req in &pattern.req {
+            let (head, tail) = self
+                .next_list_cell(current, shape)?
+                .ok_or_else(|| ControlSignal::Error("Too few arguments".into()))?;
+            self.match_dpattern(req, head, env, bindings, shape)?;
+            current = tail;
+        }
+
+        for opt in &pattern.opt {
+            if let Some((head, tail)) = self.next_list_cell(current, shape)? {
+                self.match_dpattern(&opt.pattern, head, env, bindings, shape)?;
+                if let Some(sup) = opt.supplied {
+                    let t_node = self.process.make_t(&self.globals);
+                    self.bind_symbol(env, bindings, sup, t_node)?;
+                }
+                current = tail;
+            } else {
+                let val = if let Some(init) = opt.init {
+                    self.eval(init, env)?
+                } else {
+                    self.process.make_nil()
+                };
+                self.match_dpattern(&opt.pattern, val, env, bindings, shape)?;
+                if let Some(sup) = opt.supplied {
+                    let nil_node = self.process.make_nil();
+                    self.bind_symbol(env, bindings, sup, nil_node)?;
+                }
+            }
+        }
+
+        let rest_list = current;
+
+        if let Some(rest_pat) = &pattern.rest {
+            self.match_dpattern(rest_pat, rest_list, env, bindings, shape)?;
+        } else if pattern.key.is_empty() && !self.is_nil(rest_list) {
+            return Err(ControlSignal::Error("Too many arguments".into()));
+        }
+
+        if !pattern.key.is_empty() || pattern.allow_other_keys {
+            let (pairs, odd) = self.collect_key_pairs(rest_list, shape)?;
+            if odd && !pattern.allow_other_keys {
+                return Err(ControlSignal::Error(
+                    "Odd number of keyword arguments".into(),
+                ));
+            }
+
+            if !pattern.allow_other_keys {
+                for (key_node, _) in &pairs {
+                    let key_sym = self
+                        .node_to_symbol(*key_node)
+                        .ok_or_else(|| ControlSignal::Error("Keyword must be a symbol".into()))?;
+                    let mut recognized = false;
+                    for spec in &pattern.key {
+                        if self.key_matches(spec.key, key_sym) {
+                            recognized = true;
+                            break;
+                        }
+                    }
+                    if !recognized {
+                        return Err(ControlSignal::Error("Unknown keyword argument".into()));
+                    }
+                }
+            }
+
+            for spec in &pattern.key {
+                let mut found_val = None;
+                for (key_node, val) in &pairs {
+                    if let Some(key_sym) = self.node_to_symbol(*key_node) {
+                        if self.key_matches(spec.key, key_sym) {
+                            found_val = Some(*val);
+                            break;
+                        }
+                    } else {
+                        return Err(ControlSignal::Error(
+                            "Keyword arguments must be symbols".into(),
+                        ));
+                    }
+                }
+
+                if let Some(val) = found_val {
+                    self.match_dpattern(&spec.pattern, val, env, bindings, shape)?;
+                    if let Some(sup) = spec.supplied {
+                        let t_node = self.process.make_t(&self.globals);
+                        self.bind_symbol(env, bindings, sup, t_node)?;
+                    }
+                } else {
+                    let val = if let Some(init) = spec.init {
+                        self.eval(init, env)?
+                    } else {
+                        self.process.make_nil()
+                    };
+                    self.match_dpattern(&spec.pattern, val, env, bindings, shape)?;
+                    if let Some(sup) = spec.supplied {
+                        let nil_node = self.process.make_nil();
+                        self.bind_symbol(env, bindings, sup, nil_node)?;
+                    }
+                }
+            }
+        }
+
+        for aux in &pattern.aux {
+            let val = if let Some(init) = aux.init {
+                self.eval(init, env)?
+            } else {
+                self.process.make_nil()
+            };
+            self.bind_symbol(env, bindings, aux.sym, val)?;
+        }
+
+        Ok(())
+    }
+
+    fn match_dpattern(
+        &mut self,
+        pattern: &DPattern,
+        value: NodeId,
+        env: &mut Environment,
+        bindings: &mut HashMap<SymbolId, NodeId>,
+        shape: &mut crate::pattern::ShapeClassifier,
+    ) -> Result<(), ControlSignal> {
+        match pattern {
+            DPattern::Wildcard => Ok(()),
+            DPattern::Var(sym) => self.bind_symbol(env, bindings, *sym, value),
+            DPattern::Literal(lit) => {
+                if crate::pattern::literal_equal(
+                    &self.process.arena.inner,
+                    &self.process.arrays,
+                    &self.process.hashtables,
+                    *lit,
+                    value,
+                ) {
+                    Ok(())
+                } else {
+                    Err(ControlSignal::Error("Pattern mismatch".into()))
+                }
+            }
+            DPattern::List(list) => self.match_dlist_pattern(list, value, env, bindings, shape),
+        }
+    }
+
+    fn bind_symbol(
+        &mut self,
+        env: &mut Environment,
+        bindings: &mut HashMap<SymbolId, NodeId>,
+        sym: SymbolId,
+        value: NodeId,
+    ) -> Result<(), ControlSignal> {
+        if let Some(bound) = bindings.get(&sym) {
+            if crate::pattern::literal_equal(
+                &self.process.arena.inner,
+                &self.process.arrays,
+                &self.process.hashtables,
+                *bound,
+                value,
+            ) {
+                return Ok(());
+            }
+            return Err(ControlSignal::Error("Pattern mismatch".into()));
+        }
+        bindings.insert(sym, value);
+        env.bind(sym, value);
+        Ok(())
+    }
+
+    fn next_list_cell(
+        &self,
+        list: NodeId,
+        shape: &mut crate::pattern::ShapeClassifier,
+    ) -> Result<Option<(NodeId, NodeId)>, ControlSignal> {
+        match shape.classify(&self.process.arena.inner, list) {
+            crate::pattern::Shape::Leaf => {
+                if self.is_nil(list) {
+                    Ok(None)
+                } else {
+                    Err(ControlSignal::Error("Expected list".into()))
+                }
+            }
+            crate::pattern::Shape::Fork => match self.process.arena.inner.get_unchecked(list) {
+                Node::Fork(head, tail) => Ok(Some((*head, *tail))),
+                _ => Err(ControlSignal::Error("Expected list".into())),
+            },
+            crate::pattern::Shape::Stem => Err(ControlSignal::Error("Expected list".into())),
+        }
+    }
+
+    fn collect_key_pairs(
+        &mut self,
+        list: NodeId,
+        shape: &mut crate::pattern::ShapeClassifier,
+    ) -> Result<(Vec<(NodeId, NodeId)>, bool), ControlSignal> {
+        let mut pairs = Vec::new();
+        let mut current = list;
+        let nil_node = self.process.make_nil();
+        loop {
+            match self.next_list_cell(current, shape)? {
+                Some((key, rest)) => match self.next_list_cell(rest, shape)? {
+                    Some((val, tail)) => {
+                        pairs.push((key, val));
+                        current = tail;
+                    }
+                    None => {
+                        pairs.push((key, nil_node));
+                        return Ok((pairs, true));
+                    }
+                },
+                None => return Ok((pairs, false)),
+            }
+        }
+    }
+
+    fn key_matches(&self, expected: SymbolId, actual: SymbolId) -> bool {
+        let symbols = self.globals.symbols.read().unwrap();
+        let expected_name = symbols.symbol_name(expected).unwrap_or("");
+        let actual_name = symbols.symbol_name(actual).unwrap_or("");
+        expected_name.eq_ignore_ascii_case(actual_name)
     }
 
     fn looks_like_method_list(&self, node: NodeId) -> bool {
@@ -2470,6 +3058,7 @@ impl<'a> Interpreter<'a> {
                 lambda_list.rest = Some(args_sym);
                 let closure = Closure {
                     lambda_list,
+                    destructuring: None,
                     body: body_node,
                     env: Environment::new(),
                 };
@@ -2619,6 +3208,7 @@ impl<'a> Interpreter<'a> {
 
         let closure = Closure {
             lambda_list,
+            destructuring: None,
             body: body_node,
             env: Environment::new(),
         };
@@ -2679,6 +3269,7 @@ impl<'a> Interpreter<'a> {
 
         let closure = Closure {
             lambda_list,
+            destructuring: None,
             body: body_node,
             env: Environment::new(),
         };
@@ -3018,6 +3609,7 @@ impl<'a> Interpreter<'a> {
             // Create closure
             let closure = Closure {
                 lambda_list: parsed_lambda_list,
+                destructuring: None,
                 body: body_node,
                 env: env.clone(),
             };
@@ -3126,6 +3718,7 @@ impl<'a> Interpreter<'a> {
                 // Create closure
                 let closure = Closure {
                     lambda_list: parsed_lambda_list,
+                    destructuring: None,
                     body: block_form,
                     env: env.clone(),
                 };
@@ -3789,43 +4382,44 @@ impl<'a> Interpreter<'a> {
         // Create environment from closure's captured environment
         let mut new_env = crate::eval::Environment::with_parent(closure.env.clone());
 
-        // Bind arguments UNEVALUATED
-        // Bind arguments UNEVALUATED using ParsedLambdaList
-        let mut current_arg = args;
+        // Bind arguments UNEVALUATED using destructuring lambda list when available.
+        if let Some(destructuring) = &closure.destructuring {
+            self.bind_destructuring_lambda_list(destructuring, args, &mut new_env)?;
+        } else {
+            let mut current_arg = args;
 
-        // 1. Required
-        for &param in &closure.lambda_list.req {
-            match self.process.arena.inner.get_unchecked(current_arg).clone() {
-                Node::Fork(arg_expr, rest) => {
-                    self.bind_pattern(&mut new_env, param, arg_expr, true)?;
-                    current_arg = rest;
-                }
-                _ => {
-                    // Macro missing required arg?
-                    // Bind nil or error?
-                    let nil_node = self.process.make_nil();
-                    self.bind_pattern(&mut new_env, param, nil_node, true)?;
+            // 1. Required
+            for &param in &closure.lambda_list.req {
+                match self.process.arena.inner.get_unchecked(current_arg).clone() {
+                    Node::Fork(arg_expr, rest) => {
+                        self.bind_pattern(&mut new_env, param, arg_expr, true)?;
+                        current_arg = rest;
+                    }
+                    _ => {
+                        let nil_node = self.process.make_nil();
+                        self.bind_pattern(&mut new_env, param, nil_node, true)?;
+                    }
                 }
             }
-        }
 
-        // 2. Optional
-        for (param, _init, _sup) in &closure.lambda_list.opt {
-            match self.process.arena.inner.get_unchecked(current_arg).clone() {
-                Node::Fork(arg_expr, rest) => {
-                    self.bind_pattern(&mut new_env, *param, arg_expr, true)?;
-                    current_arg = rest;
-                }
-                _ => {
-                    let nil_node = self.process.make_nil();
-                    self.bind_pattern(&mut new_env, *param, nil_node, true)?;
+            // 2. Optional
+            for (param, _init, _sup) in &closure.lambda_list.opt {
+                match self.process.arena.inner.get_unchecked(current_arg).clone() {
+                    Node::Fork(arg_expr, rest) => {
+                        self.bind_pattern(&mut new_env, *param, arg_expr, true)?;
+                        current_arg = rest;
+                    }
+                    _ => {
+                        let nil_node = self.process.make_nil();
+                        self.bind_pattern(&mut new_env, *param, nil_node, true)?;
+                    }
                 }
             }
-        }
 
-        // 3. Rest
-        if let Some(rest_sym) = closure.lambda_list.rest {
-            new_env.bind(rest_sym, current_arg);
+            // 3. Rest
+            if let Some(rest_sym) = closure.lambda_list.rest {
+                new_env.bind(rest_sym, current_arg);
+            }
         }
 
         // Evaluate body - this produces the expansion
@@ -3897,10 +4491,15 @@ impl<'a> Interpreter<'a> {
                         Ok(l) => l,
                         Err(e) => return Err(ControlSignal::Error(e)),
                     };
+                    let destructuring = match self.parse_destructuring_lambda_list(params) {
+                        Ok(d) => d,
+                        Err(e) => return Err(ControlSignal::Error(e)),
+                    };
 
                     // Create closure
                     let closure = Closure {
                         lambda_list: parsed_lambda_list,
+                        destructuring: Some(destructuring),
                         body,
                         env: env.clone(),
                     };
@@ -4146,6 +4745,7 @@ impl<'a> Interpreter<'a> {
                     lambda_list.req = params_nodes;
                     let closure = Closure {
                         lambda_list,
+                        destructuring: None,
                         body: body,
                         env: env.clone(),
                     };
