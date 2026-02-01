@@ -445,6 +445,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
     match arena.get_unchecked(id) {
         Node::Leaf(val) => match val {
             OpaqueValue::Nil => "nil".to_string(),
+            OpaqueValue::Unbound => "#<unbound>".to_string(),
             OpaqueValue::Integer(n) => n.to_string(),
             OpaqueValue::Float(f) => format!("{:.6}", f),
             OpaqueValue::String(s) => format!("{:?}", s),
@@ -465,6 +466,10 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::CallMethod(id) => format!("#<call-method:{}>", id),
             OpaqueValue::MethodWrapper(a, b) => format!("#<method-wrapper:{}:{}>", a, b),
             OpaqueValue::Method(id) => format!("#<method:{}>", id),
+            OpaqueValue::SlotDefinition(class_id, slot_idx, direct) => {
+                let tag = if *direct { ":direct" } else { "" };
+                format!("#<slot-definition:{}:{}{}>", class_id, slot_idx, tag)
+            }
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!(

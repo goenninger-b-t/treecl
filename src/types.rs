@@ -17,6 +17,7 @@ pub struct HashHandle(pub u32);
 #[derive(Clone, Debug, PartialEq)] // Removed Copy because StringHandle/VectorHandle might imply ownership semantics later, but for now they are indices.
 pub enum OpaqueValue {
     Nil,
+    Unbound,
     Integer(i64),
     Float(f64),
     String(String),             // String content
@@ -37,6 +38,7 @@ pub enum OpaqueValue {
     CallMethod(u32),            // Handle to Call-Method state (CLOS)
     MethodWrapper(u32, u32),    // (ClosureIndex, NextMethodIndex)
     Method(u32),                // Handle to Method (CLOS)
+    SlotDefinition(u32, u32, bool), // (ClassId, SlotIndex, Direct?)
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)

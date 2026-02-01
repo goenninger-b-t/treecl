@@ -4,7 +4,7 @@
 
 use crate::arena::{Arena, Node};
 use crate::context::PrimitiveFn;
-use crate::eval::{ControlSignal, EvalResult, Interpreter};
+use crate::eval::{Closure, ControlSignal, Environment, EvalResult, Interpreter, ParsedLambdaList};
 use crate::process::Process;
 use crate::symbol::{PackageId, SymbolId};
 use crate::syscall::SysCall;
@@ -108,8 +108,38 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("CLASS-OF", cl, prim_class_of);
     globals.register_primitive("SLOT-VALUE", cl, prim_slot_value);
     globals.register_primitive("SET-SLOT-VALUE", cl, prim_set_slot_value);
+    globals.register_primitive("SLOT-BOUNDP", cl, prim_slot_boundp);
+    globals.register_primitive("SLOT-EXISTS-P", cl, prim_slot_exists_p);
+    globals.register_primitive("SLOT-MAKUNBOUND", cl, prim_slot_makunbound);
+    globals.register_primitive("SLOT-VALUE-USING-CLASS", cl, prim_slot_value_using_class);
+    globals.register_primitive(
+        "SET-SLOT-VALUE-USING-CLASS",
+        cl,
+        prim_set_slot_value_using_class,
+    );
+    globals.register_primitive("SLOT-BOUNDP-USING-CLASS", cl, prim_slot_boundp_using_class);
+    globals.register_primitive(
+        "SLOT-MAKUNBOUND-USING-CLASS",
+        cl,
+        prim_slot_makunbound_using_class,
+    );
+    globals.register_primitive(
+        "SLOT-EXISTS-P-USING-CLASS",
+        cl,
+        prim_slot_exists_p_using_class,
+    );
     globals.register_primitive("ENSURE-CLASS", cl, prim_ensure_class);
+    globals.register_primitive(
+        "ENSURE-CLASS-USING-CLASS",
+        cl,
+        prim_ensure_class_using_class,
+    );
     globals.register_primitive("ENSURE-GENERIC-FUNCTION", cl, prim_ensure_generic_function);
+    globals.register_primitive(
+        "ENSURE-GENERIC-FUNCTION-USING-CLASS",
+        cl,
+        prim_ensure_generic_function_using_class,
+    );
     globals.register_primitive("ENSURE-METHOD", cl, prim_ensure_method);
     globals.register_primitive(
         "REGISTER-METHOD-COMBINATION",
@@ -117,7 +147,83 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
         prim_register_method_combination,
     );
     globals.register_primitive("METHOD-QUALIFIERS", cl, prim_method_qualifiers);
+    globals.register_primitive("METHOD-SPECIALIZERS", cl, prim_method_specializers);
+    globals.register_primitive("METHOD-LAMBDA-LIST", cl, prim_method_lambda_list);
+    globals.register_primitive("METHOD-GENERIC-FUNCTION", cl, prim_method_generic_function);
+    globals.register_primitive("METHOD-BODY", cl, prim_method_body);
     globals.register_primitive("SYS-MAKE-METHOD", cl, prim_sys_make_method);
+    globals.register_primitive("CLASS-NAME", cl, prim_class_name);
+    globals.register_primitive(
+        "CLASS-DIRECT-SUPERCLASSES",
+        cl,
+        prim_class_direct_superclasses,
+    );
+    globals.register_primitive(
+        "CLASS-DIRECT-SUBCLASSES",
+        cl,
+        prim_class_direct_subclasses,
+    );
+    globals.register_primitive("CLASS-DIRECT-SLOTS", cl, prim_class_direct_slots);
+    globals.register_primitive("CLASS-SLOTS", cl, prim_class_slots);
+    globals.register_primitive("CLASS-PRECEDENCE-LIST", cl, prim_class_precedence_list);
+    globals.register_primitive("CLASS-FINALIZED-P", cl, prim_class_finalized_p);
+    globals.register_primitive("CLASS-PROTOTYPE", cl, prim_class_prototype);
+    globals.register_primitive("FINALIZE-INHERITANCE", cl, prim_finalize_inheritance);
+    globals.register_primitive(
+        "COMPUTE-CLASS-PRECEDENCE-LIST",
+        cl,
+        prim_compute_class_precedence_list,
+    );
+    globals.register_primitive("COMPUTE-SLOTS", cl, prim_compute_slots);
+    globals.register_primitive(
+        "COMPUTE-EFFECTIVE-SLOT-DEFINITION",
+        cl,
+        prim_compute_effective_slot_definition,
+    );
+    globals.register_primitive(
+        "GENERIC-FUNCTION-NAME",
+        cl,
+        prim_generic_function_name,
+    );
+    globals.register_primitive(
+        "GENERIC-FUNCTION-LAMBDA-LIST",
+        cl,
+        prim_generic_function_lambda_list,
+    );
+    globals.register_primitive(
+        "GENERIC-FUNCTION-METHODS",
+        cl,
+        prim_generic_function_methods,
+    );
+    globals.register_primitive(
+        "GENERIC-FUNCTION-METHOD-COMBINATION",
+        cl,
+        prim_generic_function_method_combination,
+    );
+    globals.register_primitive("SLOT-DEFINITION-NAME", cl, prim_slot_definition_name);
+    globals.register_primitive("SLOT-DEFINITION-INITFORM", cl, prim_slot_definition_initform);
+    globals.register_primitive(
+        "SLOT-DEFINITION-INITFUNCTION",
+        cl,
+        prim_slot_definition_initfunction,
+    );
+    globals.register_primitive("SLOT-DEFINITION-INITARGS", cl, prim_slot_definition_initargs);
+    globals.register_primitive("SLOT-DEFINITION-READERS", cl, prim_slot_definition_readers);
+    globals.register_primitive("SLOT-DEFINITION-WRITERS", cl, prim_slot_definition_writers);
+    globals.register_primitive(
+        "SLOT-DEFINITION-ALLOCATION",
+        cl,
+        prim_slot_definition_allocation,
+    );
+    globals.register_primitive("SLOT-DEFINITION-TYPE", cl, prim_slot_definition_type);
+    globals.register_primitive("SLOT-DEFINITION-LOCATION", cl, prim_slot_definition_location);
+    globals.register_primitive("COMPUTE-APPLICABLE-METHODS", cl, prim_compute_applicable_methods);
+    globals.register_primitive(
+        "COMPUTE-APPLICABLE-METHODS-USING-CLASSES",
+        cl,
+        prim_compute_applicable_methods_using_classes,
+    );
+    globals.register_primitive("FIND-METHOD", cl, prim_find_method);
 
     // Error handling
     globals.register_primitive("ERROR", cl, prim_error);
@@ -2472,8 +2578,11 @@ fn prim_allocate_instance(
 
         if let Some(id) = class_id {
             // Create instance (all slots nil)
-            let nil_val = proc.make_nil();
-            if let Some(inst_idx) = proc.mop.make_instance(id, nil_val) {
+            let unbound = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Unbound));
+            if let Some(inst_idx) = proc.mop.make_instance(id, unbound) {
                 let inst_node = proc
                     .arena
                     .inner
@@ -2526,29 +2635,54 @@ fn prim_shared_initialize(
     )?;
 
     // Get slots
-    let slots_info: Vec<(usize, Option<crate::symbol::SymbolId>, Option<NodeId>)> =
-        if let Some(slots) = proc.mop.get_class_slots(class_id.0) {
-            slots
-                .iter()
-                .map(|s| (s.index, s.initarg, s.initform))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-    for (idx, initarg, initform) in slots_info {
-        let mut initialized = false;
-        if let Some(key) = initarg {
-            if let Some(&val) = initargs_map.get(&key) {
-                proc.mop.set_slot_value(inst_idx, idx, val);
-                initialized = true;
+    if let Some(class) = proc.mop.get_class(class_id) {
+        let slots = class.slots.clone();
+        for slot in slots {
+            let mut initialized = false;
+            if let Some(key) = slot.initarg {
+                if let Some(&val) = initargs_map.get(&key) {
+                    match slot.allocation {
+                        crate::clos::SlotAllocation::Instance => {
+                            proc.mop.set_slot_value(inst_idx, slot.index, val);
+                        }
+                        crate::clos::SlotAllocation::Class => {
+                            if let Some(class) = proc.mop.get_class_mut(class_id) {
+                                if let Some(s) = class
+                                    .slots
+                                    .iter_mut()
+                                    .find(|s| s.name == slot.name)
+                                {
+                                    s.class_value = Some(val);
+                                }
+                            }
+                        }
+                    }
+                    initialized = true;
+                }
             }
-        }
 
-        if !initialized {
-            if let Some(form) = initform {
-                // NOTE: We treat initform as a literal node for now.
-                proc.mop.set_slot_value(inst_idx, idx, form);
+            if !initialized {
+                if let Some(form) = slot.initform {
+                    match slot.allocation {
+                        crate::clos::SlotAllocation::Instance => {
+                            // NOTE: We treat initform as a literal node for now.
+                            proc.mop.set_slot_value(inst_idx, slot.index, form);
+                        }
+                        crate::clos::SlotAllocation::Class => {
+                            if let Some(class) = proc.mop.get_class_mut(class_id) {
+                                if let Some(s) = class
+                                    .slots
+                                    .iter_mut()
+                                    .find(|s| s.name == slot.name)
+                                {
+                                    if s.class_value.is_none() {
+                                        s.class_value = Some(form);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2624,12 +2758,42 @@ fn prim_slot_value(
         let slot_sym = node_to_symbol(proc, slot_name);
 
         if let (Some(idx), Some(sym)) = (inst_idx, slot_sym) {
-            // Find slot index in class
+            // Find slot definition in class
             if let Some(inst) = proc.mop.get_instance(idx) {
                 if let Some(class) = proc.mop.get_class(inst.class) {
-                    // Find slot definition
-                    if let Some(pos) = class.slots.iter().position(|s| s.name == sym) {
-                        return Ok(proc.mop.slot_value(idx, pos).unwrap_or(proc.make_nil()));
+                    if let Some(slot) = class.slots.iter().find(|s| s.name == sym) {
+                        match slot.allocation {
+                            crate::clos::SlotAllocation::Instance => {
+                                if let Some(val) = proc.mop.slot_value(idx, slot.index) {
+                                    if matches!(
+                                        proc.arena.inner.get_unchecked(val),
+                                        Node::Leaf(OpaqueValue::Unbound)
+                                    ) {
+                                        return Err(crate::eval::ControlSignal::Error(
+                                            "Unbound slot".to_string(),
+                                        ));
+                                    }
+                                    return Ok(val);
+                                }
+                            }
+                            crate::clos::SlotAllocation::Class => {
+                                if let Some(val) = slot.class_value {
+                                    if matches!(
+                                        proc.arena.inner.get_unchecked(val),
+                                        Node::Leaf(OpaqueValue::Unbound)
+                                    ) {
+                                        return Err(crate::eval::ControlSignal::Error(
+                                            "Unbound slot".to_string(),
+                                        ));
+                                    }
+                                    return Ok(val);
+                                } else {
+                                    return Err(crate::eval::ControlSignal::Error(
+                                        "Unbound slot".to_string(),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2664,13 +2828,27 @@ fn prim_set_slot_value(
         let slot_sym = node_to_symbol(proc, slot_name);
 
         if let (Some(idx), Some(sym)) = (inst_idx, slot_sym) {
-            // Find slot index in class
             if let Some(inst) = proc.mop.get_instance(idx) {
                 if let Some(class) = proc.mop.get_class(inst.class) {
-                    // Find slot definition
-                    if let Some(pos) = class.slots.iter().position(|s| s.name == sym) {
-                        proc.mop.set_slot_value(idx, pos, new_val);
-                        return Ok(new_val);
+                    if let Some(slot) = class.slots.iter().find(|s| s.name == sym) {
+                        match slot.allocation {
+                            crate::clos::SlotAllocation::Instance => {
+                                proc.mop.set_slot_value(idx, slot.index, new_val);
+                                return Ok(new_val);
+                            }
+                            crate::clos::SlotAllocation::Class => {
+                                if let Some(class_mut) = proc.mop.get_class_mut(inst.class) {
+                                    if let Some(s) = class_mut
+                                        .slots
+                                        .iter_mut()
+                                        .find(|s| s.name == sym)
+                                    {
+                                        s.class_value = Some(new_val);
+                                        return Ok(new_val);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2689,6 +2867,69 @@ fn list_to_vec(proc: &Process, list: NodeId) -> Vec<NodeId> {
         curr = tail;
     }
     vec
+}
+
+fn class_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::ClassId> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Class(id)) => Some(crate::clos::ClassId(*id)),
+        Node::Leaf(OpaqueValue::Symbol(id)) => proc.mop.find_class(SymbolId(*id)),
+        Node::Leaf(OpaqueValue::Instance(id)) => proc
+            .mop
+            .get_instance(*id as usize)
+            .map(|i| i.class),
+        _ => None,
+    }
+}
+
+fn generic_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::GenericId> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Generic(id)) => Some(crate::clos::GenericId(*id)),
+        Node::Leaf(OpaqueValue::Symbol(id)) => proc.mop.find_generic(SymbolId(*id)),
+        _ => None,
+    }
+}
+
+fn method_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::MethodId> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Method(id)) => Some(crate::clos::MethodId(*id)),
+        _ => None,
+    }
+}
+
+fn slot_def_from_node(
+    proc: &Process,
+    node: NodeId,
+) -> Option<(crate::clos::ClassId, usize, bool)> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::SlotDefinition(class_id, slot_idx, direct)) => {
+            Some((crate::clos::ClassId(*class_id), *slot_idx as usize, *direct))
+        }
+        _ => None,
+    }
+}
+
+fn make_class_list(proc: &mut Process, class_ids: &[crate::clos::ClassId]) -> NodeId {
+    let mut nodes = Vec::with_capacity(class_ids.len());
+    for cid in class_ids {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Class(cid.0))),
+        );
+    }
+    proc.make_list(&nodes)
+}
+
+fn make_symbol_list(proc: &mut Process, symbols: &[SymbolId]) -> NodeId {
+    let mut nodes = Vec::with_capacity(symbols.len());
+    for sym in symbols {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))),
+        );
+    }
+    proc.make_list(&nodes)
 }
 
 fn parse_keywords_list(proc: &Process, args: &[NodeId]) -> HashMap<SymbolId, NodeId> {
@@ -2737,13 +2978,17 @@ fn parse_slot_def(
     let keyword_pkg = syms.get_package(crate::symbol::PackageId(0));
 
     let k_initform = keyword_pkg.and_then(|p| p.find_external("INITFORM"));
+    let k_initfunction = keyword_pkg.and_then(|p| p.find_external("INITFUNCTION"));
     let k_initarg = keyword_pkg.and_then(|p| p.find_external("INITARG"));
     let k_reader = keyword_pkg.and_then(|p| p.find_external("READER"));
     let k_writer = keyword_pkg.and_then(|p| p.find_external("WRITER"));
     let k_accessor = keyword_pkg.and_then(|p| p.find_external("ACCESSOR"));
+    let k_allocation = keyword_pkg.and_then(|p| p.find_external("ALLOCATION"));
+    let k_type = keyword_pkg.and_then(|p| p.find_external("TYPE"));
     drop(syms);
 
     let initform = k_initform.and_then(|k| props.get(&k)).copied();
+    let initfunction = k_initfunction.and_then(|k| props.get(&k)).copied();
     let initarg = k_initarg
         .and_then(|k| props.get(&k))
         .and_then(|&n| node_to_symbol(proc, n));
@@ -2774,14 +3019,190 @@ fn parse_slot_def(
         }
     }
 
+    let allocation = if let Some(k) = k_allocation {
+        if let Some(&alloc_node) = props.get(&k) {
+            if let Some(sym) = node_to_symbol(proc, alloc_node) {
+                let name = ctx
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(sym)
+                    .unwrap_or("")
+                    .to_string();
+                if name == "CLASS" {
+                    crate::clos::SlotAllocation::Class
+                } else {
+                    crate::clos::SlotAllocation::Instance
+                }
+            } else {
+                crate::clos::SlotAllocation::Instance
+            }
+        } else {
+            crate::clos::SlotAllocation::Instance
+        }
+    } else {
+        crate::clos::SlotAllocation::Instance
+    };
+
+    let slot_type = k_type.and_then(|k| props.get(&k)).copied();
+
     Ok(SlotDefinition {
         name,
         initform,
+        initfunction,
         initarg,
         readers,
         writers,
+        allocation,
+        slot_type,
+        class_value: None,
         index,
     })
+}
+
+fn define_slot_accessors(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    class_id: crate::clos::ClassId,
+    slots: &[crate::clos::SlotDefinition],
+) -> Result<(), ControlSignal> {
+    let cl_pkg = crate::symbol::PackageId(1);
+    let mut syms = ctx.symbols.write().unwrap();
+    let slot_value_sym = syms.intern_in("SLOT-VALUE", cl_pkg);
+    let set_slot_value_sym = syms.intern_in("SET-SLOT-VALUE", cl_pkg);
+    let quote_sym = syms.intern_in("QUOTE", cl_pkg);
+    let obj_sym = syms.intern_in("OBJ", cl_pkg);
+    let val_sym = syms.intern_in("VALUE", cl_pkg);
+    let slot_accessor_sym = syms.intern_in("SLOT-ACCESSOR", cl_pkg);
+    syms.export_symbol(slot_value_sym);
+    syms.export_symbol(set_slot_value_sym);
+    syms.export_symbol(quote_sym);
+    syms.export_symbol(obj_sym);
+    syms.export_symbol(val_sym);
+    syms.export_symbol(slot_accessor_sym);
+    drop(syms);
+
+    let slot_value_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(slot_value_sym.0)));
+    let set_slot_value_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(set_slot_value_sym.0)));
+    let quote_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(quote_sym.0)));
+    let obj_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(obj_sym.0)));
+    let val_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(val_sym.0)));
+
+    let accessor_indicator_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(slot_accessor_sym.0)));
+
+    for slot in slots {
+        let slot_sym_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(slot.name.0)));
+        let quoted_slot = proc.make_list(&[quote_node, slot_sym_node]);
+
+        // Readers
+        for &reader in &slot.readers {
+            let gf_id = proc.mop.define_generic(reader, vec![obj_sym]);
+            let gf_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Generic(gf_id.0)));
+            proc.set_function(reader, gf_node);
+
+            let body = proc.make_list(&[slot_value_node, obj_node, quoted_slot]);
+            let mut lambda_list = ParsedLambdaList::default();
+            lambda_list.req = vec![obj_node];
+            let closure = Closure {
+                lambda_list,
+                destructuring: None,
+                body,
+                env: Environment::new(),
+            };
+            let closure_idx = proc.closures.len();
+            proc.closures.push(closure);
+            let closure_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
+
+            proc.mop.add_method(
+                gf_id,
+                vec![class_id],
+                Vec::new(),
+                vec![obj_sym],
+                closure_node,
+            );
+        }
+
+        // Writers (skip if name is also a reader; those are treated as accessors)
+        for &writer in &slot.writers {
+            if slot.readers.contains(&writer) {
+                let sym_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(writer.0)));
+                let _ = prim_put(
+                    proc,
+                    ctx,
+                    &[sym_node, accessor_indicator_node, slot_sym_node],
+                );
+                continue;
+            }
+
+            let gf_id = proc.mop.define_generic(writer, vec![val_sym, obj_sym]);
+            let gf_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Generic(gf_id.0)));
+            proc.set_function(writer, gf_node);
+
+            let body = proc.make_list(&[
+                set_slot_value_node,
+                obj_node,
+                quoted_slot,
+                val_node,
+            ]);
+            let mut lambda_list = ParsedLambdaList::default();
+            lambda_list.req = vec![val_node, obj_node];
+            let closure = Closure {
+                lambda_list,
+                destructuring: None,
+                body,
+                env: Environment::new(),
+            };
+            let closure_idx = proc.closures.len();
+            proc.closures.push(closure);
+            let closure_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
+
+            proc.mop.add_method(
+                gf_id,
+                vec![proc.mop.t_class, class_id],
+                Vec::new(),
+                vec![val_sym, obj_sym],
+                closure_node,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn prim_ensure_class(
@@ -2852,7 +3273,10 @@ fn prim_ensure_class(
         }
     }
 
-    let class_id = proc.mop.define_class(name, supers, slots);
+    let class_id = proc.mop.define_class(name, supers, slots.clone());
+
+    // Define slot accessors for direct slots.
+    let _ = define_slot_accessors(proc, ctx, class_id, &slots);
     Ok(proc
         .arena
         .inner
@@ -3026,8 +3450,11 @@ fn prim_sys_allocate_instance(
         )));
     };
 
-    let nil = proc.make_nil();
-    if let Some(inst_idx) = proc.mop.make_instance(class_id, nil) {
+    let unbound = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    if let Some(inst_idx) = proc.mop.make_instance(class_id, unbound) {
         Ok(proc
             .arena
             .inner
@@ -3077,6 +3504,7 @@ fn prim_ensure_method(
     let kw_specializers = keyword_pkg.and_then(|p| p.find_external("SPECIALIZERS"));
     let kw_qualifiers = keyword_pkg.and_then(|p| p.find_external("QUALIFIERS"));
     let kw_body = keyword_pkg.and_then(|p| p.find_external("BODY"));
+    let kw_lambda_list = keyword_pkg.and_then(|p| p.find_external("LAMBDA-LIST"));
     drop(syms);
 
     let mut specializers = Vec::new();
@@ -3116,7 +3544,20 @@ fn prim_ensure_method(
         }
     }
 
-    let method_id = proc.mop.add_method(gf_id, specializers, qualifiers, body);
+    let mut lambda_list = Vec::new();
+    if let Some(k) = kw_lambda_list {
+        if let Some(&ll_node) = kwargs.get(&k) {
+            for head in list_to_vec(proc, ll_node) {
+                if let Some(sym) = node_to_symbol(proc, head) {
+                    lambda_list.push(sym);
+                }
+            }
+        }
+    }
+
+    let method_id = proc
+        .mop
+        .add_method(gf_id, specializers, qualifiers, lambda_list, body);
     Ok(proc
         .arena
         .inner
@@ -3256,6 +3697,1332 @@ fn prim_method_qualifiers(
     }
 
     Ok(proc.make_list(&nodes))
+}
+
+fn prim_class_name(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-NAME requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(class.name.0))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_direct_superclasses(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-DIRECT-SUPERCLASSES requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let supers = class.supers.clone();
+            return Ok(make_class_list(proc, &supers));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_direct_subclasses(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-DIRECT-SUBCLASSES requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(subs) = proc.mop.get_class_direct_subclasses(class_id) {
+            let subs = subs.to_vec();
+            return Ok(make_class_list(proc, &subs));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_direct_slots(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-DIRECT-SLOTS requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(slots) = proc.mop.get_class_direct_slots(class_id) {
+            let mut nodes = Vec::with_capacity(slots.len());
+            for (idx, _slot) in slots.iter().enumerate() {
+                nodes.push(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::SlotDefinition(
+                    class_id.0,
+                    idx as u32,
+                    true,
+                ))));
+            }
+            return Ok(proc.make_list(&nodes));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_slots(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-SLOTS requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(slots) = proc.mop.get_class(class_id) {
+            let mut nodes = Vec::with_capacity(slots.slots.len());
+            for (idx, _slot) in slots.slots.iter().enumerate() {
+                nodes.push(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::SlotDefinition(
+                    class_id.0,
+                    idx as u32,
+                    false,
+                ))));
+            }
+            return Ok(proc.make_list(&nodes));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_precedence_list(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-PRECEDENCE-LIST requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let cpl = class.cpl.clone();
+            return Ok(make_class_list(proc, &cpl));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_finalized_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-FINALIZED-P requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            return Ok(if class.finalized {
+                proc.make_t(ctx)
+            } else {
+                proc.make_nil()
+            });
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_class_prototype(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "CLASS-PROTOTYPE requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        let unbound = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Unbound));
+        if let Some(inst_idx) = proc.mop.make_instance(class_id, unbound) {
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_generic_function_name(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "GENERIC-FUNCTION-NAME requires one argument".to_string(),
+        ));
+    }
+    if let Some(gid) = generic_id_from_node(proc, args[0]) {
+        if let Some(gf) = proc.mop.get_generic(gid) {
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(gf.name.0))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_generic_function_lambda_list(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "GENERIC-FUNCTION-LAMBDA-LIST requires one argument".to_string(),
+        ));
+    }
+    if let Some(gid) = generic_id_from_node(proc, args[0]) {
+        if let Some(gf) = proc.mop.get_generic(gid) {
+            let ll = gf.lambda_list.clone();
+            return Ok(make_symbol_list(proc, &ll));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_generic_function_methods(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "GENERIC-FUNCTION-METHODS requires one argument".to_string(),
+        ));
+    }
+    if let Some(gid) = generic_id_from_node(proc, args[0]) {
+        if let Some(methods) = proc.mop.get_generic_methods(gid.0) {
+            let mut nodes = Vec::with_capacity(methods.len());
+            for mid in methods {
+                nodes.push(
+                    proc.arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Method(mid.0))),
+                );
+            }
+            return Ok(proc.make_list(&nodes));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_generic_function_method_combination(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "GENERIC-FUNCTION-METHOD-COMBINATION requires one argument".to_string(),
+        ));
+    }
+    if let Some(gid) = generic_id_from_node(proc, args[0]) {
+        if let Some(gf) = proc.mop.get_generic(gid) {
+            let sym_id = match &gf.method_combination {
+                crate::clos::MethodCombination::Standard => {
+                    ctx.symbols
+                        .write()
+                        .unwrap()
+                        .intern_in("STANDARD", PackageId(1))
+                }
+                crate::clos::MethodCombination::Operator { name, .. } => *name,
+                crate::clos::MethodCombination::UserLong { name, .. } => *name,
+            };
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_method_specializers(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "METHOD-SPECIALIZERS requires one argument".to_string(),
+        ));
+    }
+    if let Some(mid) = method_id_from_node(proc, args[0]) {
+        if let Some(specs) = proc.mop.get_method_specializers(mid) {
+            let specs = specs.to_vec();
+            return Ok(make_class_list(proc, &specs));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_method_lambda_list(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "METHOD-LAMBDA-LIST requires one argument".to_string(),
+        ));
+    }
+    if let Some(mid) = method_id_from_node(proc, args[0]) {
+        if let Some(ll) = proc.mop.get_method_lambda_list(mid) {
+            let ll = ll.to_vec();
+            return Ok(make_symbol_list(proc, &ll));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_method_generic_function(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "METHOD-GENERIC-FUNCTION requires one argument".to_string(),
+        ));
+    }
+    if let Some(mid) = method_id_from_node(proc, args[0]) {
+        if let Some(gid) = proc.mop.get_method_generic(mid) {
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Generic(gid.0))));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_method_body(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "METHOD-BODY requires one argument".to_string(),
+        ));
+    }
+    if let Some(mid) = method_id_from_node(proc, args[0]) {
+        if let Some(m) = proc.mop.get_method(mid) {
+            return Ok(m.body);
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_name(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-NAME requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                return Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(s.name.0))));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_initform(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-INITFORM requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                return Ok(s.initform.unwrap_or(proc.make_nil()));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_initfunction(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-INITFUNCTION requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                return Ok(s.initfunction.unwrap_or(proc.make_nil()));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_initargs(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-INITARGS requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                if let Some(initarg) = s.initarg {
+                    let node = proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Symbol(initarg.0)));
+                    return Ok(proc.make_list(&[node]));
+                }
+                return Ok(proc.make_nil());
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_readers(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-READERS requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                let readers = s.readers.clone();
+                return Ok(make_symbol_list(proc, &readers));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_writers(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-WRITERS requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                let writers = s.writers.clone();
+                return Ok(make_symbol_list(proc, &writers));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_allocation(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-ALLOCATION requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                let name = match s.allocation {
+                    crate::clos::SlotAllocation::Instance => "INSTANCE",
+                    crate::clos::SlotAllocation::Class => "CLASS",
+                };
+                let sym = ctx
+                    .symbols
+                    .write()
+                    .unwrap()
+                    .intern_in(name, PackageId(0));
+                return Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_type(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-TYPE requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                return Ok(s.slot_type.unwrap_or(proc.make_nil()));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_definition_location(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SLOT-DEFINITION-LOCATION requires one argument".to_string(),
+        ));
+    }
+    if let Some((class_id, idx, direct)) = slot_def_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let slot = if direct {
+                class.direct_slots.get(idx)
+            } else {
+                class.slots.get(idx)
+            };
+            if let Some(s) = slot {
+                if s.allocation == crate::clos::SlotAllocation::Instance
+                    && s.index != usize::MAX
+                {
+                    return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(
+                        s.index as i64,
+                    ))));
+                }
+                return Ok(proc.make_nil());
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_boundp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return Err(ControlSignal::Error(
+            "SLOT-BOUNDP requires instance and slot-name".to_string(),
+        ));
+    }
+    let instance = args[0];
+    let slot_name = args[1];
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(instance)
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SLOT-BOUNDP first arg must be instance".to_string(),
+        ));
+    };
+
+    let slot_sym = node_to_symbol(proc, slot_name)
+        .ok_or(ControlSignal::Error("SLOT-BOUNDP slot-name must be symbol".to_string()))?;
+
+    if let Some(inst) = proc.mop.get_instance(inst_idx) {
+        if let Some(class) = proc.mop.get_class(inst.class) {
+            if let Some(slot) = class.slots.iter().find(|s| s.name == slot_sym) {
+                let bound = match slot.allocation {
+                    crate::clos::SlotAllocation::Instance => {
+                        if let Some(val) = proc.mop.slot_value(inst_idx, slot.index) {
+                            !matches!(
+                                proc.arena.inner.get_unchecked(val),
+                                Node::Leaf(OpaqueValue::Unbound)
+                            )
+                        } else {
+                            false
+                        }
+                    }
+                    crate::clos::SlotAllocation::Class => slot.class_value.is_some(),
+                };
+                return Ok(if bound { proc.make_t(ctx) } else { proc.make_nil() });
+            }
+        }
+    }
+
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_exists_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return Err(ControlSignal::Error(
+            "SLOT-EXISTS-P requires instance and slot-name".to_string(),
+        ));
+    }
+    let instance = args[0];
+    let slot_name = args[1];
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(instance)
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SLOT-EXISTS-P first arg must be instance".to_string(),
+        ));
+    };
+
+    let slot_sym = node_to_symbol(proc, slot_name)
+        .ok_or(ControlSignal::Error("SLOT-EXISTS-P slot-name must be symbol".to_string()))?;
+
+    if let Some(inst) = proc.mop.get_instance(inst_idx) {
+        if let Some(class) = proc.mop.get_class(inst.class) {
+            if class.slots.iter().any(|s| s.name == slot_sym) {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_makunbound(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return Err(ControlSignal::Error(
+            "SLOT-MAKUNBOUND requires instance and slot-name".to_string(),
+        ));
+    }
+    let instance = args[0];
+    let slot_name = args[1];
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(instance)
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SLOT-MAKUNBOUND first arg must be instance".to_string(),
+        ));
+    };
+
+    let slot_sym = node_to_symbol(proc, slot_name)
+        .ok_or(ControlSignal::Error("SLOT-MAKUNBOUND slot-name must be symbol".to_string()))?;
+
+    if let Some(inst) = proc.mop.get_instance(inst_idx) {
+        if let Some(class) = proc.mop.get_class(inst.class) {
+            if let Some(slot) = class.slots.iter().find(|s| s.name == slot_sym) {
+                match slot.allocation {
+                    crate::clos::SlotAllocation::Instance => {
+                        let unbound = proc
+                            .arena
+                            .inner
+                            .alloc(Node::Leaf(OpaqueValue::Unbound));
+                        proc.mop.set_slot_value(inst_idx, slot.index, unbound);
+                    }
+                    crate::clos::SlotAllocation::Class => {
+                        if let Some(class_mut) = proc.mop.get_class_mut(inst.class) {
+                            if let Some(s) = class_mut
+                                .slots
+                                .iter_mut()
+                                .find(|s| s.name == slot_sym)
+                            {
+                                s.class_value = None;
+                            }
+                        }
+                    }
+                }
+                return Ok(instance);
+            }
+        }
+    }
+
+    Err(ControlSignal::Error("Invalid slot".to_string()))
+}
+
+fn prim_slot_value_using_class(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return Err(ControlSignal::Error(
+            "SLOT-VALUE-USING-CLASS requires class, instance, slot".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "SLOT-VALUE-USING-CLASS requires a class".to_string(),
+    ))?;
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(args[1])
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SLOT-VALUE-USING-CLASS requires an instance".to_string(),
+        ));
+    };
+
+    let (slot_class_id, slot_idx, direct) =
+        slot_def_from_node(proc, args[2]).unwrap_or((class_id, 0, false));
+
+    let target_class = if slot_def_from_node(proc, args[2]).is_some() {
+        slot_class_id
+    } else {
+        class_id
+    };
+
+    let slot_def = if let Some(class) = proc.mop.get_class(target_class) {
+        if slot_def_from_node(proc, args[2]).is_some() {
+            if direct {
+                class.direct_slots.get(slot_idx)
+            } else {
+                class.slots.get(slot_idx)
+            }
+        } else if let Some(sym) = node_to_symbol(proc, args[2]) {
+            class.slots.iter().find(|s| s.name == sym)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some(slot) = slot_def {
+        match slot.allocation {
+            crate::clos::SlotAllocation::Instance => {
+                if let Some(val) = proc.mop.slot_value(inst_idx, slot.index) {
+                    if matches!(
+                        proc.arena.inner.get_unchecked(val),
+                        Node::Leaf(OpaqueValue::Unbound)
+                    ) {
+                        return Err(ControlSignal::Error("Unbound slot".to_string()));
+                    }
+                    return Ok(val);
+                }
+            }
+            crate::clos::SlotAllocation::Class => {
+                if let Some(val) = slot.class_value {
+                    return Ok(val);
+                }
+                return Err(ControlSignal::Error("Unbound slot".to_string()));
+            }
+        }
+    }
+
+    Err(ControlSignal::Error("Invalid slot".to_string()))
+}
+
+fn prim_set_slot_value_using_class(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 4 {
+        return Err(ControlSignal::Error(
+            "SET-SLOT-VALUE-USING-CLASS requires class, instance, slot, value".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "SET-SLOT-VALUE-USING-CLASS requires a class".to_string(),
+    ))?;
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(args[1])
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SET-SLOT-VALUE-USING-CLASS requires an instance".to_string(),
+        ));
+    };
+
+    let value = args[3];
+
+    let (slot_class_id, slot_idx, direct) =
+        slot_def_from_node(proc, args[2]).unwrap_or((class_id, 0, false));
+    let target_class = if slot_def_from_node(proc, args[2]).is_some() {
+        slot_class_id
+    } else {
+        class_id
+    };
+
+    let slot_info = if let Some(class) = proc.mop.get_class(target_class) {
+        if slot_def_from_node(proc, args[2]).is_some() {
+            if direct {
+                class.direct_slots.get(slot_idx).map(|s| (s.name, s.allocation, s.index))
+            } else {
+                class.slots.get(slot_idx).map(|s| (s.name, s.allocation, s.index))
+            }
+        } else if let Some(sym) = node_to_symbol(proc, args[2]) {
+            class
+                .slots
+                .iter()
+                .find(|s| s.name == sym)
+                .map(|s| (s.name, s.allocation, s.index))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((slot_name, allocation, index)) = slot_info {
+        match allocation {
+            crate::clos::SlotAllocation::Instance => {
+                proc.mop.set_slot_value(inst_idx, index, value);
+                return Ok(value);
+            }
+            crate::clos::SlotAllocation::Class => {
+                if let Some(class_mut) = proc.mop.get_class_mut(target_class) {
+                    if let Some(s) = class_mut
+                        .slots
+                        .iter_mut()
+                        .find(|s| s.name == slot_name)
+                    {
+                        s.class_value = Some(value);
+                        return Ok(value);
+                    }
+                }
+            }
+        }
+    }
+
+    Err(ControlSignal::Error("Invalid slot".to_string()))
+}
+
+fn prim_slot_boundp_using_class(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return Err(ControlSignal::Error(
+            "SLOT-BOUNDP-USING-CLASS requires class, instance, slot".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "SLOT-BOUNDP-USING-CLASS requires a class".to_string(),
+    ))?;
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(args[1])
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SLOT-BOUNDP-USING-CLASS requires an instance".to_string(),
+        ));
+    };
+
+    let slot_sym = if let Some(sym) = node_to_symbol(proc, args[2]) {
+        sym
+    } else if let Some((slot_class_id, slot_idx, direct)) = slot_def_from_node(proc, args[2]) {
+        if let Some(class) = proc.mop.get_class(slot_class_id) {
+            let slot = if direct {
+                class.direct_slots.get(slot_idx)
+            } else {
+                class.slots.get(slot_idx)
+            };
+            if let Some(s) = slot {
+                s.name
+            } else {
+                return Ok(proc.make_nil());
+            }
+        } else {
+            return Ok(proc.make_nil());
+        }
+    } else {
+        return Ok(proc.make_nil());
+    };
+
+    if let Some(class) = proc.mop.get_class(class_id) {
+        if let Some(slot) = class.slots.iter().find(|s| s.name == slot_sym) {
+            let bound = match slot.allocation {
+                crate::clos::SlotAllocation::Instance => {
+                    if let Some(val) = proc.mop.slot_value(inst_idx, slot.index) {
+                        !matches!(
+                            proc.arena.inner.get_unchecked(val),
+                            Node::Leaf(OpaqueValue::Unbound)
+                        )
+                    } else {
+                        false
+                    }
+                }
+                crate::clos::SlotAllocation::Class => slot.class_value.is_some(),
+            };
+            return Ok(if bound { proc.make_t(ctx) } else { proc.make_nil() });
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_makunbound_using_class(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return Err(ControlSignal::Error(
+            "SLOT-MAKUNBOUND-USING-CLASS requires class, instance, slot".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "SLOT-MAKUNBOUND-USING-CLASS requires a class".to_string(),
+    ))?;
+
+    let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        proc.arena.inner.get_unchecked(args[1])
+    {
+        *idx as usize
+    } else {
+        return Err(ControlSignal::Error(
+            "SLOT-MAKUNBOUND-USING-CLASS requires an instance".to_string(),
+        ));
+    };
+
+    let slot_sym = if let Some(sym) = node_to_symbol(proc, args[2]) {
+        sym
+    } else if let Some((slot_class_id, slot_idx, direct)) = slot_def_from_node(proc, args[2]) {
+        if let Some(class) = proc.mop.get_class(slot_class_id) {
+            let slot = if direct {
+                class.direct_slots.get(slot_idx)
+            } else {
+                class.slots.get(slot_idx)
+            };
+            if let Some(s) = slot {
+                s.name
+            } else {
+                return Ok(proc.make_nil());
+            }
+        } else {
+            return Ok(proc.make_nil());
+        }
+    } else {
+        return Ok(proc.make_nil());
+    };
+
+    if let Some(class) = proc.mop.get_class(class_id) {
+        if let Some(slot) = class.slots.iter().find(|s| s.name == slot_sym) {
+            match slot.allocation {
+                crate::clos::SlotAllocation::Instance => {
+                    let unbound = proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Unbound));
+                    proc.mop.set_slot_value(inst_idx, slot.index, unbound);
+                }
+                crate::clos::SlotAllocation::Class => {
+                    if let Some(class_mut) = proc.mop.get_class_mut(class_id) {
+                        if let Some(s) = class_mut
+                            .slots
+                            .iter_mut()
+                            .find(|s| s.name == slot_sym)
+                        {
+                            s.class_value = None;
+                        }
+                    }
+                }
+            }
+            return Ok(args[1]);
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_slot_exists_p_using_class(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return Err(ControlSignal::Error(
+            "SLOT-EXISTS-P-USING-CLASS requires class, instance, slot".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "SLOT-EXISTS-P-USING-CLASS requires a class".to_string(),
+    ))?;
+
+    let slot_sym = if let Some(sym) = node_to_symbol(proc, args[2]) {
+        sym
+    } else if let Some((slot_class_id, slot_idx, direct)) = slot_def_from_node(proc, args[2]) {
+        if let Some(class) = proc.mop.get_class(slot_class_id) {
+            let slot = if direct {
+                class.direct_slots.get(slot_idx)
+            } else {
+                class.slots.get(slot_idx)
+            };
+            if let Some(s) = slot {
+                s.name
+            } else {
+                return Ok(proc.make_nil());
+            }
+        } else {
+            return Ok(proc.make_nil());
+        }
+    } else {
+        return Ok(proc.make_nil());
+    };
+
+    if let Some(class) = proc.mop.get_class(class_id) {
+        if class.slots.iter().any(|s| s.name == slot_sym) {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_compute_applicable_methods(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return Err(ControlSignal::Error(
+            "COMPUTE-APPLICABLE-METHODS requires at least one argument".to_string(),
+        ));
+    }
+    let gf = args[0];
+    let gid = generic_id_from_node(proc, gf).ok_or(ControlSignal::Error(
+        "COMPUTE-APPLICABLE-METHODS requires a generic function".to_string(),
+    ))?;
+    let arg_classes: Vec<_> = args[1..]
+        .iter()
+        .map(|&a| match proc.arena.inner.get_unchecked(a) {
+            Node::Leaf(OpaqueValue::Instance(id)) => proc
+                .mop
+                .get_instance(*id as usize)
+                .map(|i| i.class)
+                .unwrap_or(proc.mop.t_class),
+            Node::Leaf(OpaqueValue::Class(id)) => crate::clos::ClassId(*id),
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                proc.mop.find_class(SymbolId(*id)).unwrap_or(proc.mop.t_class)
+            }
+            Node::Leaf(OpaqueValue::Integer(_)) => proc.mop.integer_class,
+            _ => proc.mop.t_class,
+        })
+        .collect();
+
+    let methods = proc.mop.compute_applicable_methods(gid, &arg_classes);
+    let mut nodes = Vec::with_capacity(methods.len());
+    for mid in methods {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Method(mid.0))),
+        );
+    }
+    Ok(proc.make_list(&nodes))
+}
+
+fn prim_compute_applicable_methods_using_classes(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return Err(ControlSignal::Error(
+            "COMPUTE-APPLICABLE-METHODS-USING-CLASSES requires generic function and class list"
+                .to_string(),
+        ));
+    }
+    let gid = generic_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "COMPUTE-APPLICABLE-METHODS-USING-CLASSES requires a generic function".to_string(),
+    ))?;
+    let mut class_ids = Vec::new();
+    for head in list_to_vec(proc, args[1]) {
+        if let Some(cid) = class_id_from_node(proc, head) {
+            class_ids.push(cid);
+        }
+    }
+    let methods = proc.mop.compute_applicable_methods(gid, &class_ids);
+    let mut nodes = Vec::with_capacity(methods.len());
+    for mid in methods {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Method(mid.0))),
+        );
+    }
+    Ok(proc.make_list(&nodes))
+}
+
+fn prim_find_method(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return Err(ControlSignal::Error(
+            "FIND-METHOD requires generic function, qualifiers, specializers".to_string(),
+        ));
+    }
+    let gid = generic_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "FIND-METHOD requires a generic function".to_string(),
+    ))?;
+
+    let qualifiers: Vec<SymbolId> = list_to_vec(proc, args[1])
+        .iter()
+        .filter_map(|&n| node_to_symbol(proc, n))
+        .collect();
+
+    let specializers: Vec<crate::clos::ClassId> = list_to_vec(proc, args[2])
+        .iter()
+        .filter_map(|&n| class_id_from_node(proc, n))
+        .collect();
+
+    if let Some(gf) = proc.mop.get_generic(gid) {
+        for mid in &gf.methods {
+            if let Some(method) = proc.mop.get_method(*mid) {
+                if method.qualifiers == qualifiers && method.specializers == specializers {
+                    return Ok(proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Method(mid.0))));
+                }
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_ensure_class_using_class(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "ENSURE-CLASS-USING-CLASS requires class and name".to_string(),
+        ));
+    }
+    // Ignore first arg (class metaobject) and delegate.
+    prim_ensure_class(proc, ctx, &args[1..])
+}
+
+fn prim_ensure_generic_function_using_class(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "ENSURE-GENERIC-FUNCTION-USING-CLASS requires class and name".to_string(),
+        ));
+    }
+    prim_ensure_generic_function(proc, ctx, &args[1..])
+}
+
+fn prim_finalize_inheritance(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "FINALIZE-INHERITANCE requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class_mut(class_id) {
+            class.finalized = true;
+        }
+        return Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Class(class_id.0))));
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_compute_class_precedence_list(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "COMPUTE-CLASS-PRECEDENCE-LIST requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let cpl = class.cpl.clone();
+            return Ok(make_class_list(proc, &cpl));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_compute_slots(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "COMPUTE-SLOTS requires one argument".to_string(),
+        ));
+    }
+    if let Some(class_id) = class_id_from_node(proc, args[0]) {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            let mut nodes = Vec::with_capacity(class.slots.len());
+            for (idx, _slot) in class.slots.iter().enumerate() {
+                nodes.push(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::SlotDefinition(
+                    class_id.0,
+                    idx as u32,
+                    false,
+                ))));
+            }
+            return Ok(proc.make_list(&nodes));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_compute_effective_slot_definition(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "COMPUTE-EFFECTIVE-SLOT-DEFINITION requires class and slot-name".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or(ControlSignal::Error(
+        "COMPUTE-EFFECTIVE-SLOT-DEFINITION requires a class".to_string(),
+    ))?;
+    let slot_sym = node_to_symbol(proc, args[1]).ok_or(ControlSignal::Error(
+        "COMPUTE-EFFECTIVE-SLOT-DEFINITION requires a slot name".to_string(),
+    ))?;
+
+    if let Some(class) = proc.mop.get_class(class_id) {
+        if let Some((idx, _slot)) = class
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.name == slot_sym)
+        {
+            return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::SlotDefinition(
+                class_id.0,
+                idx as u32,
+                false,
+            ))));
+        }
+    }
+    Ok(proc.make_nil())
 }
 
 fn prim_sys_make_method(

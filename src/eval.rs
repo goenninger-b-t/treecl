@@ -2827,6 +2827,11 @@ impl<'a> Interpreter<'a> {
                 return self.apply_function(func, args, env);
             }
 
+            // Check if symbol has a function binding
+            if let Some(func) = self.process.get_function(sym_id) {
+                return self.apply_function(func, args, env);
+            }
+
             // Check if symbol is a primitive
             if let Some(&prim_fn) = self.globals.primitives.get(&sym_id) {
                 // Evaluate arguments
@@ -2839,11 +2844,6 @@ impl<'a> Interpreter<'a> {
                     current = rest;
                 }
                 return prim_fn(self.process, self.globals, &evaluated_args);
-            }
-
-            // Check if symbol has a function binding
-            if let Some(func) = self.process.get_function(sym_id) {
-                return self.apply_function(func, args, env);
             }
 
             // Check if symbol has a value binding
@@ -4662,9 +4662,13 @@ impl<'a> Interpreter<'a> {
                                 slots.push(crate::clos::SlotDefinition {
                                     name: slot_name,
                                     initform: None,
+                                    initfunction: None,
                                     initarg: None, // parsing :initarg etc skipped for brevity
                                     readers: Vec::new(),
                                     writers: Vec::new(),
+                                    allocation: crate::clos::SlotAllocation::Instance,
+                                    slot_type: None,
+                                    class_value: None,
                                     index: slots.len(),
                                 });
                             }
@@ -4763,7 +4767,7 @@ impl<'a> Interpreter<'a> {
                     // Add method
                     self.process
                         .mop
-                        .add_method(gf_id, specializers, Vec::new(), closure_node);
+                        .add_method(gf_id, specializers, Vec::new(), params.clone(), closure_node);
 
                     // Bind generic function to symbol function cell if not already
                     let gf_val = self

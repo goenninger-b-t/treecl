@@ -142,18 +142,27 @@
             (let ((expander (get op 'setf-expander)))
               (if expander
                   (funcall expander place environment)
-                  (let ((expansion-result (macroexpand-1 place environment)))
-                    (let ((expansion (car expansion-result))
-                          (expanded-p (cadr expansion-result)))
-                       (if expanded-p
-                           (get-setf-expansion expansion environment)
-                           (let ((temps (mapcar (lambda (x) (gensym)) args))
-                                 (store (gensym "STORE")))
-                             (list temps
-                                    args
-                                    (list store)
-                                    (append (list 'funcall (list 'function (list 'setf op)) store) temps)
-                                    (cons op temps))))))))) 
+                  (let ((slot (get op 'slot-accessor)))
+                    (if slot
+                        (let ((temps (mapcar (lambda (x) (gensym)) args))
+                              (store (gensym "STORE")))
+                          (list temps
+                                args
+                                (list store)
+                                (list 'set-slot-value (car temps) (list 'quote slot) store)
+                                (cons op temps)))
+                        (let ((expansion-result (macroexpand-1 place environment)))
+                          (let ((expansion (car expansion-result))
+                                (expanded-p (cadr expansion-result)))
+                             (if expanded-p
+                                 (get-setf-expansion expansion environment)
+                                 (let ((temps (mapcar (lambda (x) (gensym)) args))
+                                       (store (gensym "STORE")))
+                                   (list temps
+                                          args
+                                          (list store)
+                                          (append (list 'funcall (list 'function (list 'setf op)) store) temps)
+                                          (cons op temps))))))))))) 
            (error "Invalid place"))))
 
 (defmacro defsetf (access-fn &rest rest)

@@ -25,12 +25,24 @@ pub struct Class {
     pub name: SymbolId,
     /// Direct superclasses
     pub supers: Vec<ClassId>,
+    /// Direct slot definitions
+    pub direct_slots: Vec<SlotDefinition>,
     /// Direct slots (slot-name -> slot-definition)
     pub slots: Vec<SlotDefinition>,
     /// Class precedence list (computed)
     pub cpl: Vec<ClassId>,
     /// Number of instance slots
     pub instance_size: usize,
+    /// Direct subclasses
+    pub direct_subclasses: Vec<ClassId>,
+    /// Whether class is finalized
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAllocation {
+    Instance,
+    Class,
 }
 
 /// A slot definition
@@ -38,9 +50,13 @@ pub struct Class {
 pub struct SlotDefinition {
     pub name: SymbolId,
     pub initform: Option<NodeId>,
+    pub initfunction: Option<NodeId>,
     pub initarg: Option<SymbolId>,
     pub readers: Vec<SymbolId>,
     pub writers: Vec<SymbolId>,
+    pub allocation: SlotAllocation,
+    pub slot_type: Option<NodeId>,
+    pub class_value: Option<NodeId>,
     pub index: usize,
 }
 
@@ -60,8 +76,12 @@ pub struct Method {
     pub specializers: Vec<ClassId>,
     /// Method qualifiers (:before, :after, :around, or primary)
     pub qualifiers: Vec<SymbolId>,
+    /// Method lambda list (symbols)
+    pub lambda_list: Vec<SymbolId>,
     /// Method body as a closure index or NodeId
     pub body: NodeId,
+    /// Generic function this method is attached to
+    pub generic: Option<GenericId>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,9 +200,12 @@ impl MetaObjectProtocol {
         mop.classes.push(Class {
             name: t_name,
             supers: Vec::new(),
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
         });
         mop.class_names.insert(t_name, ClassId(0));
 
@@ -192,9 +215,12 @@ impl MetaObjectProtocol {
         mop.classes.push(Class {
             name: so_name,
             supers: vec![ClassId(0)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(1), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
         });
         mop.class_names.insert(so_name, ClassId(1));
 
@@ -204,9 +230,12 @@ impl MetaObjectProtocol {
         mop.classes.push(Class {
             name: sc_name,
             supers: vec![ClassId(1)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(2), ClassId(1), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
         });
         mop.class_names.insert(sc_name, ClassId(2));
 
@@ -216,9 +245,12 @@ impl MetaObjectProtocol {
         mop.classes.push(Class {
             name: sym_name,
             supers: vec![ClassId(0)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(3), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
         });
         mop.class_names.insert(sym_name, ClassId(3));
 
@@ -228,11 +260,28 @@ impl MetaObjectProtocol {
         mop.classes.push(Class {
             name: int_name,
             supers: vec![ClassId(0)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(4), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
         });
         mop.class_names.insert(int_name, ClassId(4));
+
+        // Populate direct subclasses for bootstrap classes.
+        let class_count = mop.classes.len();
+        for id in 0..class_count {
+            let supers = mop.classes[id].supers.clone();
+            for super_id in supers {
+                if let Some(cls) = mop.classes.get_mut(super_id.0 as usize) {
+                    let cid = ClassId(id as u32);
+                    if !cls.direct_subclasses.contains(&cid) {
+                        cls.direct_subclasses.push(cid);
+                    }
+                }
+            }
+        }
 
         mop
     }
@@ -244,17 +293,20 @@ impl MetaObjectProtocol {
         supers: Vec<ClassId>,
         slots: Vec<SlotDefinition>,
     ) -> ClassId {
-        let id = if let Some(&existing_id) = self.class_names.get(&name) {
-            existing_id
-        } else {
-            ClassId(self.classes.len() as u32)
-        };
+        let existing_id = self.class_names.get(&name).copied();
+        let id = existing_id.unwrap_or_else(|| ClassId(self.classes.len() as u32));
 
         let supers = if supers.is_empty() {
             vec![self.standard_object]
         } else {
             supers
         };
+        let supers_clone = supers.clone();
+
+        // Track old supers for subclass list maintenance.
+        let old_supers = existing_id
+            .and_then(|eid| self.classes.get(eid.0 as usize).map(|c| c.supers.clone()))
+            .unwrap_or_default();
 
         // Compute CPL independent of mutation
         // Simplistic linearization: class + supers linearized
@@ -278,8 +330,7 @@ impl MetaObjectProtocol {
         }
 
         // Compute effective slots
-        // Start with direct slots
-        let mut effective_slots = Vec::new();
+        let mut effective_slots: Vec<SlotDefinition> = Vec::new();
 
         // 1. Collect inherited slots from supers
         // Since supers already have effective slots (if this is sequential), we can use them.
@@ -295,7 +346,11 @@ impl MetaObjectProtocol {
             if let Some(super_class) = self.classes.get(super_id.0 as usize) {
                 for slot in &super_class.slots {
                     if !seen_slots.contains(&slot.name) {
-                        effective_slots.push(slot.clone());
+                        let mut inherited = slot.clone();
+                        if inherited.allocation == SlotAllocation::Class {
+                            inherited.class_value = None;
+                        }
+                        effective_slots.push(inherited);
                         seen_slots.insert(slot.name);
                     }
                 }
@@ -303,7 +358,7 @@ impl MetaObjectProtocol {
         }
 
         // 2. Add/Merge direct slots
-        for direct_slot in slots {
+        for direct_slot in slots.clone() {
             // Check if we shadow a slot
             if let Some(pos) = effective_slots
                 .iter()
@@ -321,29 +376,65 @@ impl MetaObjectProtocol {
         }
 
         // 3. Re-index
-        for (i, slot) in effective_slots.iter_mut().enumerate() {
-            slot.index = i;
+        let mut instance_index = 0;
+        for slot in effective_slots.iter_mut() {
+            if slot.allocation == SlotAllocation::Instance {
+                slot.index = instance_index;
+                instance_index += 1;
+            } else {
+                slot.index = usize::MAX;
+            }
+            if slot.allocation == SlotAllocation::Class && slot.class_value.is_none() {
+                slot.class_value = slot.initform;
+            }
         }
 
-        let instance_size = effective_slots.len();
+        let instance_size = instance_index;
 
         // For now, let's just create/overwrite.
         let class_def = Class {
             name,
-            supers,
+            supers: supers.clone(),
+            direct_slots: slots,
             slots: effective_slots,
             cpl,
             instance_size,
+            direct_subclasses: Vec::new(),
+            finalized: true,
         };
 
-        if let Some(&existing_id) = self.class_names.get(&name) {
+        if let Some(existing_id) = existing_id {
+            // Preserve existing direct subclasses list when redefining.
+            let direct_subclasses = self.classes[existing_id.0 as usize]
+                .direct_subclasses
+                .clone();
+            let mut class_def = class_def;
+            class_def.direct_subclasses = direct_subclasses;
             self.classes[existing_id.0 as usize] = class_def;
-            existing_id
         } else {
             self.classes.push(class_def);
             self.class_names.insert(name, id);
-            id
         }
+
+        // Update direct subclass links on supers.
+        // Remove from old supers no longer referenced.
+        for old_super in old_supers.iter() {
+            if !supers.contains(old_super) {
+                if let Some(cls) = self.classes.get_mut(old_super.0 as usize) {
+                    cls.direct_subclasses.retain(|c| *c != id);
+                }
+            }
+        }
+        // Add to new supers.
+        for new_super in supers_clone.iter() {
+            if let Some(cls) = self.classes.get_mut(new_super.0 as usize) {
+                if !cls.direct_subclasses.contains(&id) {
+                    cls.direct_subclasses.push(id);
+                }
+            }
+        }
+
+        id
     }
 
     /// Find class by name
@@ -356,10 +447,31 @@ impl MetaObjectProtocol {
         self.classes.get(id.0 as usize)
     }
 
+    /// Get mutable class by ID
+    pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
+        self.classes.get_mut(id.0 as usize)
+    }
+
+    pub fn get_class_direct_slots(&self, id: ClassId) -> Option<&[SlotDefinition]> {
+        self.classes
+            .get(id.0 as usize)
+            .map(|c| c.direct_slots.as_slice())
+    }
+
+    pub fn get_class_direct_subclasses(&self, id: ClassId) -> Option<&[ClassId]> {
+        self.classes
+            .get(id.0 as usize)
+            .map(|c| c.direct_subclasses.as_slice())
+    }
+
     /// Create an instance of a class
-    pub fn make_instance(&mut self, class_id: ClassId, nil_node: NodeId) -> Option<usize> {
+    pub fn make_instance(
+        &mut self,
+        class_id: ClassId,
+        default_slot_value: NodeId,
+    ) -> Option<usize> {
         let class = self.classes.get(class_id.0 as usize)?;
-        let slots = vec![nil_node; class.instance_size];
+        let slots = vec![default_slot_value; class.instance_size];
 
         let idx = self.instances.len();
         self.instances.push(Instance {
@@ -461,6 +573,7 @@ impl MetaObjectProtocol {
         generic_id: GenericId,
         specializers: Vec<ClassId>,
         qualifiers: Vec<SymbolId>,
+        lambda_list: Vec<SymbolId>,
         body: NodeId,
     ) -> MethodId {
         let method_id = MethodId(self.methods.len() as u32);
@@ -468,10 +581,31 @@ impl MetaObjectProtocol {
         self.methods.push(Method {
             specializers,
             qualifiers,
+            lambda_list,
             body,
+            generic: Some(generic_id),
         });
 
+        let new_specs = self.methods[method_id.0 as usize].specializers.clone();
+        let new_quals = self.methods[method_id.0 as usize].qualifiers.clone();
+
+        let existing_pos = self
+            .generics
+            .get(generic_id.0 as usize)
+            .and_then(|gf| {
+                gf.methods.iter().position(|mid| {
+                    if let Some(m) = self.methods.get(mid.0 as usize) {
+                        m.specializers == new_specs && m.qualifiers == new_quals
+                    } else {
+                        false
+                    }
+                })
+            });
+
         if let Some(gf) = self.generics.get_mut(generic_id.0 as usize) {
+            if let Some(pos) = existing_pos {
+                gf.methods.remove(pos);
+            }
             gf.methods.push(method_id);
         }
 
@@ -489,7 +623,9 @@ impl MetaObjectProtocol {
         self.methods.push(Method {
             specializers,
             qualifiers,
+            lambda_list: Vec::new(),
             body,
+            generic: None,
         });
         method_id
     }
@@ -501,6 +637,22 @@ impl MetaObjectProtocol {
 
     pub fn get_method_qualifiers(&self, id: MethodId) -> Option<&[SymbolId]> {
         self.methods.get(id.0 as usize).map(|m| m.qualifiers.as_slice())
+    }
+
+    pub fn get_method_specializers(&self, id: MethodId) -> Option<&[ClassId]> {
+        self.methods
+            .get(id.0 as usize)
+            .map(|m| m.specializers.as_slice())
+    }
+
+    pub fn get_method_lambda_list(&self, id: MethodId) -> Option<&[SymbolId]> {
+        self.methods
+            .get(id.0 as usize)
+            .map(|m| m.lambda_list.as_slice())
+    }
+
+    pub fn get_method_generic(&self, id: MethodId) -> Option<GenericId> {
+        self.methods.get(id.0 as usize).and_then(|m| m.generic)
     }
 
     pub fn get_wrapper(&self, kind: WrapperKind, id: MethodId) -> Option<MethodId> {
@@ -617,6 +769,15 @@ impl MetaObjectProtocol {
                 if let Some(initform) = slot.initform {
                     roots.push(initform);
                 }
+                if let Some(initfn) = slot.initfunction {
+                    roots.push(initfn);
+                }
+                if let Some(slot_type) = slot.slot_type {
+                    roots.push(slot_type);
+                }
+                if let Some(class_val) = slot.class_value {
+                    roots.push(class_val);
+                }
             }
         }
 
@@ -683,17 +844,25 @@ mod tests {
                 SlotDefinition {
                     name: x_name,
                     initform: None,
+                    initfunction: None,
                     initarg: None,
                     readers: Vec::new(),
                     writers: Vec::new(),
+                    allocation: SlotAllocation::Instance,
+                    slot_type: None,
+                    class_value: None,
                     index: 0,
                 },
                 SlotDefinition {
                     name: y_name,
                     initform: None,
+                    initfunction: None,
                     initarg: None,
                     readers: Vec::new(),
                     writers: Vec::new(),
+                    allocation: SlotAllocation::Instance,
+                    slot_type: None,
+                    class_value: None,
                     index: 1,
                 },
             ],
@@ -718,9 +887,13 @@ mod tests {
             vec![SlotDefinition {
                 name: x_name,
                 initform: None,
+                initfunction: None,
                 initarg: None,
                 readers: Vec::new(),
                 writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
                 index: 0,
             }],
         );
@@ -747,9 +920,13 @@ mod tests {
             vec![SlotDefinition {
                 name: x_name,
                 initform: None,
+                initfunction: None,
                 initarg: None,
                 readers: Vec::new(),
                 writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
                 index: 0,
             }],
         );
