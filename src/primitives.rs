@@ -2489,7 +2489,7 @@ fn prim_allocate_instance(
 
 fn prim_shared_initialize(
     proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
+    _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     // (shared-initialize instance slot-names &rest initargs)
@@ -2607,15 +2607,12 @@ fn prim_slot_value(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    let mut inst_idx = None;
-    let mut slot_sym = None;
-
     if args.len() >= 2 {
         let instance = args[0];
         let slot_name = args[1];
 
         // Extract instance index
-        inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
+        let inst_idx = if let Node::Leaf(OpaqueValue::Instance(idx)) =
             proc.arena.inner.get_unchecked(instance)
         {
             Some(*idx as usize)
@@ -2624,7 +2621,7 @@ fn prim_slot_value(
         };
 
         // Extract slot name symbol
-        slot_sym = node_to_symbol(proc, slot_name);
+        let slot_sym = node_to_symbol(proc, slot_name);
 
         if let (Some(idx), Some(sym)) = (inst_idx, slot_sym) {
             // Find slot index in class

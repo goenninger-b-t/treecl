@@ -68,6 +68,12 @@ pub fn numeral(arena: &mut Arena, n: usize) -> NodeId {
     node
 }
 
+pub fn successor(arena: &mut Arena, n: NodeId) -> NodeId {
+    // successor n = K n
+    let k_node = k(arena);
+    app(arena, k_node, n)
+}
+
 pub fn encode_nat(arena: &mut Arena, n: u64) -> NodeId {
     numeral(arena, n as usize)
 }
@@ -102,6 +108,27 @@ fn is_k(arena: &Arena, node: NodeId) -> bool {
         Node::Fork(left, right) => is_delta(arena, *left) && is_delta(arena, *right),
         _ => false,
     }
+}
+
+pub fn is_zero(arena: &mut Arena) -> NodeId {
+    // Numerals are leaves for zero and forks for n>0, so is_leaf acts as is_zero.
+    is_leaf(arena)
+}
+
+pub fn predecessor(arena: &mut Arena) -> NodeId {
+    // predecessor via triage: leaf -> 0, stem -> 0, fork -> right branch
+    let k_node = k(arena);
+    let i_node = i(arena);
+    let zero = delta(arena);
+    let triage = triage_comb(arena);
+
+    let f0 = zero; // leaf -> 0
+    let f1 = app(arena, k_node, zero); // stem -> 0
+    let f2 = app(arena, k_node, i_node); // fork -> second branch
+
+    let triage_f0 = app(arena, triage, f0);
+    let triage_f0_f1 = app(arena, triage_f0, f1);
+    app(arena, triage_f0_f1, f2)
 }
 
 pub fn encode_list(arena: &mut Arena, elems: &[NodeId]) -> NodeId {
@@ -413,6 +440,50 @@ mod tests {
         let encoded = encode_string(&mut arena, s);
         let decoded = decode_string(&arena, encoded);
         assert_eq!(decoded.as_deref(), Some(s));
+    }
+
+    #[test]
+    fn test_is_zero_selects_branch() {
+        let mut arena = Arena::new();
+        let mut ctx = EvalContext::default();
+        ctx.max_steps = 100_000;
+
+        let is_zero_node = is_zero(&mut arena);
+        let a = numeral(&mut arena, 2);
+        let b = numeral(&mut arena, 3);
+
+        let zero = numeral(&mut arena, 0);
+        let one = numeral(&mut arena, 1);
+
+        let zero_step1 = apply(&mut arena, is_zero_node, zero);
+        let zero_step2 = apply(&mut arena, zero_step1, a);
+        let zero_term = apply(&mut arena, zero_step2, b);
+
+        let one_step1 = apply(&mut arena, is_zero_node, one);
+        let one_step2 = apply(&mut arena, one_step1, a);
+        let one_term = apply(&mut arena, one_step2, b);
+
+        let zero_res = reduce(&mut arena, zero_term, &mut ctx);
+        let one_res = reduce(&mut arena, one_term, &mut ctx);
+
+        assert!(deep_equal(&arena, zero_res, a));
+        assert!(deep_equal(&arena, one_res, b));
+    }
+
+    #[test]
+    fn test_predecessor_decrements() {
+        let mut arena = Arena::new();
+        let mut ctx = EvalContext::default();
+        ctx.max_steps = 100_000;
+
+        let pred_node = predecessor(&mut arena);
+        for n in 1u64..5 {
+            let num = numeral(&mut arena, n as usize);
+            let term = apply(&mut arena, pred_node, num);
+            let res = reduce(&mut arena, term, &mut ctx);
+            let decoded = decode_nat(&arena, res);
+            assert_eq!(decoded, Some(n - 1));
+        }
     }
 
     #[test]

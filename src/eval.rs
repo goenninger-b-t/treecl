@@ -254,46 +254,49 @@ impl<'a> Interpreter<'a> {
                 pattern
             )));
         }
-        {
-            // Destructuring + pattern matching
-            if self.is_nil(value) {
-                if let Node::Fork(p_head, p_tail) =
-                    self.process.arena.inner.get_unchecked(pattern).clone()
-                {
-                    // Preserve legacy behavior: bind NIL to all vars when the value is NIL.
-                    let nil_node = self.process.make_nil();
-                    self.bind_pattern(env, p_head, nil_node, true)?;
-                    let nil_node = self.process.make_nil();
-                    self.bind_pattern(env, p_tail, nil_node, true)?;
-                    return Ok(());
-                }
-                if self.is_nil(pattern) {
-                    return Ok(());
-                }
+        // Destructuring + pattern matching (Erlang-style)
+        let quote_sym = self.globals.special_forms.quote;
+        let symbols = self.globals.symbols.read().unwrap();
+        if let Some(bindings) = crate::pattern::match_pattern(
+            &self.process.arena.inner,
+            &self.process.arrays,
+            &self.process.hashtables,
+            &symbols,
+            quote_sym,
+            pattern,
+            value,
+        ) {
+            for (sym, val) in bindings {
+                env.bind(sym, val);
             }
+            return Ok(());
+        }
 
-            let quote_sym = self.globals.special_forms.quote;
-            let symbols = self.globals.symbols.read().unwrap();
-            if let Some(bindings) = crate::pattern::match_pattern(
-                &self.process.arena.inner,
-                &self.process.arrays,
-                &self.process.hashtables,
-                &symbols,
-                quote_sym,
-                pattern,
-                value,
-            ) {
-                for (sym, val) in bindings {
-                    env.bind(sym, val);
-                }
+        // Legacy destructuring fallback (handles short lists by binding NILs).
+        if let Node::Fork(p_head, p_tail) = self.process.arena.inner.get_unchecked(pattern).clone()
+        {
+            if let Node::Fork(v_head, v_tail) =
+                self.process.arena.inner.get_unchecked(value).clone()
+            {
+                self.bind_pattern(env, p_head, v_head, true)?;
+                self.bind_pattern(env, p_tail, v_tail, true)?;
                 return Ok(());
             }
-
-            Err(ControlSignal::Error(format!(
-                "Pattern mismatch: pattern {:?} value {:?}",
-                pattern, value
-            )))
+            if self.is_nil(value) {
+                let nil_node = self.process.make_nil();
+                self.bind_pattern(env, p_head, nil_node, true)?;
+                let nil_node = self.process.make_nil();
+                self.bind_pattern(env, p_tail, nil_node, true)?;
+                return Ok(());
+            }
+        } else if self.is_nil(pattern) {
+            return Ok(());
         }
+
+        Err(ControlSignal::Error(format!(
+            "Pattern mismatch: pattern {:?} value {:?}",
+            pattern, value
+        )))
     }
 
     pub fn parse_lambda_list(&mut self, list_node: NodeId) -> Result<ParsedLambdaList, String> {
@@ -3638,9 +3641,7 @@ impl<'a> Interpreter<'a> {
                         self.process.status = crate::process::Status::Failed(msg);
                         return root;
                     }
-                    Err(e) => {
-                        return root; // Fallback on error (keep stuck state)
-                    }
+                    Err(_) => return root, // Fallback on error (keep stuck state)
                 }
             }
         }
@@ -4529,7 +4530,7 @@ mod tests {
 
     #[test]
     fn test_setq_protected_symbol() {
-        let (mut proc, mut globals) = setup_env();
+        let (mut proc, globals) = setup_env();
 
         // Ensure we are in CL-USER (Package 2)
         globals
@@ -4569,7 +4570,7 @@ mod tests {
 
     #[test]
     fn test_setq_unprotected_symbol() {
-        let (mut proc, mut globals) = setup_env();
+        let (mut proc, globals) = setup_env();
         globals
             .symbols
             .write()
@@ -4594,7 +4595,7 @@ mod tests {
 
     #[test]
     fn test_undefined_variable_error() {
-        let (mut proc, mut globals) = setup_env();
+        let (mut proc, globals) = setup_env();
         globals
             .symbols
             .write()
@@ -4629,7 +4630,7 @@ mod tests {
 
     #[test]
     fn test_let_star_manual() {
-        let (mut proc, mut globals) = setup_env();
+        let (mut proc, globals) = setup_env();
         globals
             .symbols
             .write()

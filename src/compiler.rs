@@ -14,6 +14,7 @@ enum BExpr {
 }
 
 impl BExpr {
+    #[allow(dead_code)]
     fn occurs(&self, sym: SymbolId) -> bool {
         let mut cache = std::collections::HashMap::new();
         self.occurs_cached(sym, &mut cache)
@@ -77,6 +78,7 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn make_leaf(&mut self) -> NodeId {
         self.nil_node
     }
