@@ -140,6 +140,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("TREE-STRING", cl, prim_tree_string);
     globals.register_primitive("TREE-TO-DOT", cl, prim_tree_to_dot);
     globals.register_primitive("SAVE-TREE-PDF", cl, prim_save_tree_pdf);
+    globals.register_primitive("TREE-TO-PDF", cl, prim_tree_to_pdf);
     globals.register_primitive("FUNCALL", cl, prim_funcall);
     globals.register_primitive("EVAL", cl, prim_eval);
     globals.register_primitive("APPLY", cl, prim_apply);
@@ -4649,6 +4650,75 @@ fn prim_save_tree_pdf(
             .arena
             .inner
             .alloc(Node::Leaf(OpaqueValue::String(filename))))
+    } else {
+        Err(ControlSignal::Error(format!(
+            "dot exited with status: {}",
+            status
+        )))
+    }
+}
+
+fn prim_tree_to_pdf(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "TREE-TO-PDF requires 2 arguments: (dot-filename pdf-filename)".to_string(),
+        ));
+    }
+    let dot_filename_node = args[0];
+    let pdf_filename_node = args[1];
+
+    let dot_filename = match proc.arena.inner.get_unchecked(dot_filename_node) {
+        Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+        _ => {
+            return Err(ControlSignal::Error(
+                "TREE-TO-PDF: first argument must be a string".to_string(),
+            ))
+        }
+    };
+    let pdf_filename = match proc.arena.inner.get_unchecked(pdf_filename_node) {
+        Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+        _ => {
+            return Err(ControlSignal::Error(
+                "TREE-TO-PDF: second argument must be a string".to_string(),
+            ))
+        }
+    };
+
+    let dot_content = std::fs::read_to_string(&dot_filename).map_err(|e| {
+        ControlSignal::Error(format!(
+            "TREE-TO-PDF: failed to read {}: {}",
+            dot_filename, e
+        ))
+    })?;
+
+    use std::io::Write;
+    let mut child = std::process::Command::new("dot")
+        .arg("-Tpdf")
+        .arg("-o")
+        .arg(&pdf_filename)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| ControlSignal::Error(format!("Failed to spawn dot: {}", e)))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(dot_content.as_bytes())
+            .map_err(|e| ControlSignal::Error(format!("Failed to write to dot stdin: {}", e)))?;
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| ControlSignal::Error(format!("Failed to wait for dot: {}", e)))?;
+
+    if status.success() {
+        Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(pdf_filename))))
     } else {
         Err(ControlSignal::Error(format!(
             "dot exited with status: {}",

@@ -1,0 +1,12 @@
+digraph Tree {
+    graph [rankdir = TB; nodesep = 0.35; ranksep = 0.35; splines = false;];
+    node [shape = circle; width = 0.12; height = 0.12; fixedsize = true; label = ""; style = filled;];
+    edge [arrowhead = none; penwidth = 1.4;];
+    n0 [color = "#222222";fillcolor = "#222222";];
+    t0 [shape = triangle;label = "FROP";style = filled;fillcolor = "white";color = "#222222";fontcolor = "#222222";];
+    n0 -> t0 [color = "#590ee4ff"; penwidth = 1.0;];
+    n0 -> n1 [color = "#e70f0f";];
+    n1 [color = "#222222";fillcolor = "#222222";];
+    t1 [shape = triangle;label = "1";style = filled;fillcolor = "white";color = "#222222";fontcolor = "#222222";];
+    n1 -> t1 [color = "#8beb16ff"; penwidth = 1.0;];
+}
