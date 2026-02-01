@@ -10,6 +10,7 @@ pub mod clos;
 pub mod conditions;
 pub mod eval;
 pub mod hashtables;
+pub mod pattern;
 pub mod primitives;
 pub mod printer;
 pub mod reader;

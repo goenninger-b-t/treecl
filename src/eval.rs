@@ -244,47 +244,54 @@ impl<'a> Interpreter<'a> {
         value: NodeId,
         allow_destructuring: bool,
     ) -> Result<(), ControlSignal> {
-        if let Some(sym) = self.node_to_symbol(pattern) {
-            env.bind(sym, value);
-            Ok(())
-        } else if allow_destructuring {
-            // Destructuring bind
-            if let Node::Fork(p_head, p_tail) =
-                self.process.arena.inner.get_unchecked(pattern).clone()
-            {
-                if let Node::Fork(v_head, v_tail) =
-                    self.process.arena.inner.get_unchecked(value).clone()
+        if !allow_destructuring {
+            if let Some(sym) = self.node_to_symbol(pattern) {
+                env.bind(sym, value);
+                return Ok(());
+            }
+            return Err(ControlSignal::Error(format!(
+                "Function argument must be a symbol: {:?}",
+                pattern
+            )));
+        }
+        {
+            // Destructuring + pattern matching
+            if self.is_nil(value) {
+                if let Node::Fork(p_head, p_tail) =
+                    self.process.arena.inner.get_unchecked(pattern).clone()
                 {
-                    self.bind_pattern(env, p_head, v_head, true)?;
-                    self.bind_pattern(env, p_tail, v_tail, true)?;
-                    Ok(())
-                } else if self.is_nil(value) {
-                    // Bind against nil: nil for all vars
+                    // Preserve legacy behavior: bind NIL to all vars when the value is NIL.
                     let nil_node = self.process.make_nil();
                     self.bind_pattern(env, p_head, nil_node, true)?;
                     let nil_node = self.process.make_nil();
                     self.bind_pattern(env, p_tail, nil_node, true)?;
-                    Ok(())
-                } else {
-                    Err(ControlSignal::Error(format!(
-                        "Destructuring mismatch: pattern {:?} value {:?}",
-                        pattern, value
-                    )))
+                    return Ok(());
                 }
-            } else {
                 if self.is_nil(pattern) {
-                    Ok(()) // Ignore nil pattern
-                } else {
-                    Err(ControlSignal::Error(format!(
-                        "Invalid destructuring pattern: {:?}",
-                        pattern
-                    )))
+                    return Ok(());
                 }
             }
-        } else {
+
+            let quote_sym = self.globals.special_forms.quote;
+            let symbols = self.globals.symbols.read().unwrap();
+            if let Some(bindings) = crate::pattern::match_pattern(
+                &self.process.arena.inner,
+                &self.process.arrays,
+                &self.process.hashtables,
+                &symbols,
+                quote_sym,
+                pattern,
+                value,
+            ) {
+                for (sym, val) in bindings {
+                    env.bind(sym, val);
+                }
+                return Ok(());
+            }
+
             Err(ControlSignal::Error(format!(
-                "Function argument must be a symbol: {:?}",
-                pattern
+                "Pattern mismatch: pattern {:?} value {:?}",
+                pattern, value
             )))
         }
     }
@@ -1911,14 +1918,14 @@ impl<'a> Interpreter<'a> {
             if arg_idx >= args.len() {
                 return Err(ControlSignal::Error("Too few arguments".into()));
             }
-            self.bind_pattern(&mut new_env, param, args[arg_idx], false)?;
+            self.bind_pattern(&mut new_env, param, args[arg_idx], true)?;
             arg_idx += 1;
         }
 
         // 2. Optional
         for (var, init, sup) in &closure.lambda_list.opt {
             if arg_idx < args.len() {
-                self.bind_pattern(&mut new_env, *var, args[arg_idx], false)?;
+                self.bind_pattern(&mut new_env, *var, args[arg_idx], true)?;
                 if let Some(s) = sup {
                     let t_node = self.process.make_t(&self.globals);
                     new_env.bind(*s, t_node);
@@ -1926,7 +1933,7 @@ impl<'a> Interpreter<'a> {
                 arg_idx += 1;
             } else {
                 let val = self.eval(*init, &new_env)?;
-                self.bind_pattern(&mut new_env, *var, val, false)?;
+                self.bind_pattern(&mut new_env, *var, val, true)?;
                 if let Some(s) = sup {
                     new_env.bind(*s, self.process.make_nil());
                 }
@@ -1991,14 +1998,14 @@ impl<'a> Interpreter<'a> {
                 }
 
                 if let Some(val) = found_val {
-                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    self.bind_pattern(&mut new_env, *var, val, true)?;
                     if let Some(s) = sup {
                         let t_node = self.process.make_t(&self.globals);
                         new_env.bind(*s, t_node);
                     }
                 } else {
                     let val = self.eval(*init, &new_env)?;
-                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    self.bind_pattern(&mut new_env, *var, val, true)?;
                     if let Some(s) = sup {
                         new_env.bind(*s, self.process.make_nil());
                     }
@@ -3653,7 +3660,7 @@ impl<'a> Interpreter<'a> {
                 self.process.arena.inner.get_unchecked(current_arg).clone()
             {
                 let val = self.eval(arg_expr, env)?;
-                self.bind_pattern(&mut new_env, param, val, false)?;
+                self.bind_pattern(&mut new_env, param, val, true)?;
                 current_arg = rest;
             } else {
                 return Err(ControlSignal::Error(format!(
@@ -3669,7 +3676,7 @@ impl<'a> Interpreter<'a> {
                 self.process.arena.inner.get_unchecked(current_arg).clone()
             {
                 let val = self.eval(arg_expr, env)?;
-                self.bind_pattern(&mut new_env, *var, val, false)?;
+                self.bind_pattern(&mut new_env, *var, val, true)?;
                 if let Some(s) = sup {
                     let t_val = self.process.make_t(&self.globals);
                     new_env.bind(*s, t_val);
@@ -3677,7 +3684,7 @@ impl<'a> Interpreter<'a> {
                 current_arg = rest;
             } else {
                 let val = self.eval(init.clone(), &new_env)?;
-                self.bind_pattern(&mut new_env, *var, val, false)?;
+                self.bind_pattern(&mut new_env, *var, val, true)?;
                 if let Some(s) = sup {
                     new_env.bind(*s, self.process.make_nil());
                 }
@@ -3743,14 +3750,14 @@ impl<'a> Interpreter<'a> {
                 }
 
                 if let Some(val) = found_val {
-                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    self.bind_pattern(&mut new_env, *var, val, true)?;
                     if let Some(s) = sup {
                         let t_val = self.process.make_t(&self.globals);
                         new_env.bind(*s, t_val);
                     }
                 } else {
                     let val = self.eval(*init, &new_env)?;
-                    self.bind_pattern(&mut new_env, *var, val, false)?;
+                    self.bind_pattern(&mut new_env, *var, val, true)?;
                     if let Some(s) = sup {
                         new_env.bind(*s, self.process.make_nil());
                     }

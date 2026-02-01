@@ -3,6 +3,7 @@ use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
 use crossbeam_deque::{Injector, Stealer, Worker};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::iter;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -277,6 +278,64 @@ fn os_thread_id() -> u64 {
     digits.parse::<u64>().unwrap_or(0)
 }
 
+fn match_receive_pattern(
+    proc: &Process,
+    pattern: Option<NodeId>,
+    value: NodeId,
+    symbols: &crate::symbol::SymbolTable,
+    globals: &crate::context::GlobalContext,
+) -> Option<HashMap<crate::symbol::SymbolId, NodeId>> {
+    let pat = match pattern {
+        Some(pat) => pat,
+        None => return Some(HashMap::new()),
+    };
+
+    let bindings = crate::pattern::match_pattern(
+        &proc.arena.inner,
+        &proc.arrays,
+        &proc.hashtables,
+        symbols,
+        globals.special_forms.quote,
+        pat,
+        value,
+    )?;
+
+    if let Some(env) = &proc.current_env {
+        for (sym, val) in &bindings {
+            if let Some(existing) = env.lookup(*sym) {
+                if !crate::pattern::literal_equal(
+                    &proc.arena.inner,
+                    &proc.arrays,
+                    &proc.hashtables,
+                    existing,
+                    *val,
+                ) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(bindings)
+}
+
+fn apply_pattern_bindings(
+    proc: &mut Process,
+    bindings: HashMap<crate::symbol::SymbolId, NodeId>,
+) {
+    if bindings.is_empty() {
+        return;
+    }
+    let env = proc
+        .current_env
+        .get_or_insert_with(crate::eval::Environment::new);
+    for (sym, val) in bindings {
+        if env.lookup(sym).is_none() {
+            env.bind(sym, val);
+        }
+    }
+}
+
 fn handle_syscall(
     sched: &SchedulerHandle,
     pid: Pid,
@@ -390,13 +449,20 @@ fn handle_syscall(
                     );
 
                     // Delivery logic
+                    let symbols = globals.symbols.read().unwrap();
                     let mut wake = false;
-                    if let Status::Waiting(_pat) = target_proc.status {
-                        // Check pattern
-                        wake = true; // Simplify
+                    let mut bindings = HashMap::new();
+                    if let Status::Waiting(pat) = &target_proc.status {
+                        if let Some(found) =
+                            match_receive_pattern(&target_proc, *pat, copied, &symbols, globals)
+                        {
+                            wake = true;
+                            bindings = found;
+                        }
                     }
 
                     if wake {
+                        apply_pattern_bindings(&mut target_proc, bindings);
                         if let Some(redex) = target_proc.pending_redex.take() {
                             let result_node = target_proc.arena.inner.get_unchecked(copied).clone();
                             target_proc.arena.inner.overwrite(redex, result_node);
@@ -442,22 +508,20 @@ fn handle_syscall(
             }
         }
         SysCall::Receive { pattern } => {
-            let mut found = None;
+            let symbols = globals.symbols.read().unwrap();
+            let mut found: Option<(usize, HashMap<crate::symbol::SymbolId, NodeId>)> = None;
             for (i, msg) in proc.mailbox.iter().enumerate() {
-                let matches = if let Some(pat) = pattern {
-                    crate::arena::deep_equal(&proc.arena.inner, pat, msg.payload)
-                } else {
-                    true
-                };
-
-                if matches {
-                    found = Some(i);
+                if let Some(bindings) =
+                    match_receive_pattern(&proc, pattern, msg.payload, &symbols, globals)
+                {
+                    found = Some((i, bindings));
                     break;
                 }
             }
 
-            if let Some(i) = found {
+            if let Some((i, bindings)) = found {
                 let msg = proc.mailbox.remove(i).unwrap();
+                apply_pattern_bindings(&mut proc, bindings);
                 // Resume execution with message payload
                 // We need to pass the payload to the waiting redex
                 if let Some(redex) = proc.pending_redex.take() {

@@ -268,6 +268,11 @@ impl Process {
             self.mark_node(msg.payload, &mut marked);
         }
 
+        // Waiting receive pattern
+        if let Status::Waiting(Some(pat)) = &self.status {
+            self.mark_node(*pat, &mut marked);
+        }
+
         // Dictionary (Symbol Values/Functions)
         for binding in self.dictionary.values() {
             if let Some(val) = binding.value {
