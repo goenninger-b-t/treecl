@@ -2922,6 +2922,29 @@ impl<'a> Interpreter<'a> {
         args: Vec<NodeId>,
         _env: &Environment,
     ) -> Result<bool, ControlSignal> {
+        if self.is_fast_make_instance_target(gid) {
+            let ok = match self.process.fast_make_instance_ok {
+                Some(val) => val,
+                None => {
+                    let val = self.can_fast_make_instance();
+                    self.process.fast_make_instance_ok = Some(val);
+                    val
+                }
+            };
+            if ok {
+                return self.fast_make_instance(args);
+            }
+        }
+
+        if !self.process.mop.generic_uses_eql_specializers(gid) {
+            let arg_classes: Vec<_> = args.iter().map(|&v| self.arg_class_id(v)).collect();
+            if let Some(effective_fn) =
+                self.process.mop.get_cached_effective_method(gid, &arg_classes)
+            {
+                return self.step_apply(effective_fn, args, _env.clone());
+            }
+        }
+
         if self.is_internal_mop_generic(gid) {
             return self.apply_generic_function_raw(gid, args, _env);
         }
@@ -2940,6 +2963,195 @@ impl<'a> Interpreter<'a> {
 
         // Apply the discriminating function to evaluated arguments.
         self.step_apply(df, args, _env.clone())
+    }
+
+    fn arg_class_id(&self, node: NodeId) -> crate::clos::ClassId {
+        match self.process.arena.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Instance(id)) => self
+                .process
+                .mop
+                .get_instance(*id as usize)
+                .map(|i| i.class)
+                .unwrap_or(self.process.mop.standard_object),
+            Node::Leaf(OpaqueValue::Class(_)) => self.process.mop.standard_class,
+            Node::Leaf(OpaqueValue::Symbol(_)) => self.process.mop.symbol_class,
+            Node::Leaf(OpaqueValue::Integer(_)) => self.process.mop.integer_class,
+            Node::Leaf(OpaqueValue::Generic(_)) => self.process.mop.standard_generic_function,
+            Node::Leaf(OpaqueValue::Method(_)) => self.process.mop.standard_method,
+            Node::Leaf(OpaqueValue::SlotDefinition(_, _, direct)) => {
+                if *direct {
+                    self.process.mop.standard_direct_slot_definition
+                } else {
+                    self.process.mop.standard_effective_slot_definition
+                }
+            }
+            Node::Leaf(OpaqueValue::EqlSpecializer(_)) => self.process.mop.eql_specializer_class,
+            _ => self.process.mop.t_class,
+        }
+    }
+
+    fn is_fast_make_instance_target(&self, gid: crate::clos::GenericId) -> bool {
+        let gf = match self.process.mop.get_generic(gid) {
+            Some(gf) => gf,
+            None => return false,
+        };
+        let name = match gf.name {
+            crate::clos::GenericName::Symbol(sym) => {
+                let syms = self.globals.symbols.read().unwrap();
+                syms.symbol_name(sym)
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+            }
+            crate::clos::GenericName::Setf(_) => return false,
+        };
+        name == "MAKE-INSTANCE"
+    }
+
+    fn can_fast_make_instance(&mut self) -> bool {
+        let make_sym = self
+            .lookup_symbol_any("MAKE-INSTANCE")
+            .unwrap_or_else(|| self.ensure_cl_symbol("MAKE-INSTANCE"));
+        let alloc_sym = self
+            .lookup_symbol_any("ALLOCATE-INSTANCE")
+            .unwrap_or_else(|| self.ensure_cl_symbol("ALLOCATE-INSTANCE"));
+        let init_sym = self
+            .lookup_symbol_any("INITIALIZE-INSTANCE")
+            .unwrap_or_else(|| self.ensure_cl_symbol("INITIALIZE-INSTANCE"));
+        let shared_sym = self
+            .lookup_symbol_any("SHARED-INITIALIZE")
+            .unwrap_or_else(|| self.ensure_cl_symbol("SHARED-INITIALIZE"));
+
+        let make_gid = match self.process.mop.find_generic(make_sym) {
+            Some(id) => id,
+            None => return false,
+        };
+
+        let make_gf = match self.process.mop.get_generic(make_gid) {
+            Some(gf) => gf,
+            None => return false,
+        };
+
+        if make_gf.methods.len() != 2 {
+            return false;
+        }
+
+        let mut has_standard = false;
+        let mut has_symbol = false;
+        for mid in &make_gf.methods {
+            let method = match self.process.mop.get_method(*mid) {
+                Some(m) => m,
+                None => return false,
+            };
+            if !method.qualifiers.is_empty() || method.specializers.len() != 1 {
+                return false;
+            }
+            match method.specializers[0] {
+                crate::clos::Specializer::Class(cid)
+                    if cid == self.process.mop.standard_class =>
+                {
+                    has_standard = true;
+                }
+                crate::clos::Specializer::Class(cid) if cid == self.process.mop.symbol_class => {
+                    has_symbol = true;
+                }
+                _ => return false,
+            }
+        }
+        if !(has_standard && has_symbol) {
+            return false;
+        }
+
+        if !self.generic_is_simple(alloc_sym, self.process.mop.standard_class) {
+            return false;
+        }
+        if !self.generic_is_simple(init_sym, self.process.mop.standard_object) {
+            return false;
+        }
+        if !self.generic_is_simple(shared_sym, self.process.mop.standard_object) {
+            return false;
+        }
+
+        true
+    }
+
+    fn generic_is_simple(
+        &self,
+        name: SymbolId,
+        class_id: crate::clos::ClassId,
+    ) -> bool {
+        let gid = match self.process.mop.find_generic(name) {
+            Some(id) => id,
+            None => return false,
+        };
+        let gf = match self.process.mop.get_generic(gid) {
+            Some(gf) => gf,
+            None => return false,
+        };
+        if gf.methods.len() != 1 {
+            return false;
+        }
+        let method = match self.process.mop.get_method(gf.methods[0]) {
+            Some(m) => m,
+            None => return false,
+        };
+        if !method.qualifiers.is_empty() || method.specializers.is_empty() {
+            return false;
+        }
+        for (idx, spec) in method.specializers.iter().enumerate() {
+            match spec {
+                crate::clos::Specializer::Class(cid) if idx == 0 && *cid == class_id => {}
+                crate::clos::Specializer::Class(cid)
+                    if idx > 0 && *cid == self.process.mop.t_class => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn fast_make_instance(&mut self, args: Vec<NodeId>) -> Result<bool, ControlSignal> {
+        if args.is_empty() {
+            return Err(ControlSignal::Error(
+                "MAKE-INSTANCE requires class".to_string(),
+            ));
+        }
+
+        let class_node = args[0];
+        let class_id = match self.process.arena.get_unchecked(class_node) {
+            Node::Leaf(OpaqueValue::Class(id)) => Some(crate::clos::ClassId(*id)),
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                self.process.mop.find_class(SymbolId(*id))
+            }
+            _ => None,
+        }
+        .ok_or_else(|| ControlSignal::Error("MAKE-INSTANCE: invalid class".to_string()))?;
+
+        let unbound = self.process.make_unbound();
+        let inst_idx = self
+            .process
+            .mop
+            .make_instance(class_id, unbound)
+            .ok_or_else(|| ControlSignal::Error("Failed to allocate instance".to_string()))?;
+        let instance_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Instance(inst_idx as u32)));
+
+        let mut shared_args = Vec::with_capacity(args.len() + 1);
+        shared_args.push(instance_node);
+        shared_args.push(self.process.make_t(self.globals));
+        if args.len() > 1 {
+            shared_args.extend_from_slice(&args[1..]);
+        }
+        let _ = crate::primitives::prim_shared_initialize(
+            self.process,
+            self.globals,
+            &shared_args,
+        )?;
+
+        self.process.program = instance_node;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
     }
 
     /// Apply Generic Function (raw dispatch, no MOP indirection)
@@ -3330,6 +3542,17 @@ impl<'a> Interpreter<'a> {
         let sym = syms.intern_in(name, crate::symbol::PackageId(1));
         syms.export_symbol(sym);
         sym
+    }
+
+    fn lookup_symbol_any(&self, name: &str) -> Option<SymbolId> {
+        let syms = self.globals.symbols.read().unwrap();
+        let name_upper = name.to_ascii_uppercase();
+        syms.get_package(crate::symbol::PackageId(2))
+            .and_then(|p| p.find_symbol(&name_upper))
+            .or_else(|| {
+                syms.get_package(crate::symbol::PackageId(1))
+                    .and_then(|p| p.find_symbol(&name_upper))
+            })
     }
 
     fn sym_node(&mut self, sym: SymbolId) -> NodeId {

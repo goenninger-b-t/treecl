@@ -111,3 +111,4 @@ MOP implementation status (TreeCL)
 - Added funcallable instances: `funcallable-standard-class`/`funcallable-standard-object`, `set-funcallable-instance-function` (generic + funcallable instances), and `funcallable-standard-instance-access`.
 - Added introspection extras: `class-direct-methods`, `class-direct-generic-functions`, `specializer-direct-methods`, and `specializer-direct-generic-functions`.
 - Accessor/setf completeness is now covered by Task 10 in `TASKS.md` (done).
+- Process-level caching: NIL/T/UNBOUND nodes are cached per process arena (`make_nil`, `make_t`, `make_unbound`) to reduce allocations and stabilize identity for NIL/T; instance allocation reuses the cached UNBOUND node.

@@ -118,6 +118,12 @@ pub struct Process {
 
     /// Process-Local Memory
     pub arena: ProcessArena,
+    /// Cached NIL node in this process arena
+    pub nil_node: NodeId,
+    /// Cached T node in this process arena
+    pub t_node: NodeId,
+    /// Cached Unbound node in this process arena
+    pub unbound_node: NodeId,
 
     /// Program Counter (Pointer to current root of reduction)
     pub program: NodeId,
@@ -144,6 +150,7 @@ pub struct Process {
     pub functions: HashMap<SymbolId, usize>,
     /// SETF Functions (SymbolId -> Function Node)
     pub setf_functions: HashMap<SymbolId, NodeId>,
+    pub fast_make_instance_ok: Option<bool>,
 
     /// Condition System State
     pub conditions: crate::conditions::ConditionSystem,
@@ -194,7 +201,12 @@ pub struct Process {
 
 impl Process {
     pub fn new(pid: Pid, program: NodeId, globals: &crate::context::GlobalContext) -> Self {
-        let arena = ProcessArena::new();
+        let mut arena = ProcessArena::new();
+        let nil_node = arena.inner.alloc(Node::Leaf(OpaqueValue::Nil));
+        let t_node = arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(globals.t_sym.0)));
+        let unbound_node = arena.inner.alloc(Node::Leaf(OpaqueValue::Unbound));
 
         // Initialize streams (Stdio)
         let streams = crate::streams::StreamManager::new();
@@ -219,6 +231,9 @@ impl Process {
             debugger_thread_id: None,
             debugger_thread_name: None,
             arena,
+            nil_node,
+            t_node,
+            unbound_node,
             program,
             mailbox: VecDeque::new(),
             dictionary,
@@ -227,6 +242,7 @@ impl Process {
             macros: HashMap::new(), // Initialize macros
             functions: HashMap::new(),
             setf_functions: HashMap::new(),
+            fast_make_instance_ok: None,
             conditions,
             arrays,
             readtable,
@@ -262,6 +278,9 @@ impl Process {
         let mut marked = HashSet::new();
 
         // 1. Mark Roots
+        self.mark_node(self.nil_node, &mut marked);
+        self.mark_node(self.t_node, &mut marked);
+        self.mark_node(self.unbound_node, &mut marked);
 
         // Program Counter
         self.mark_node(self.program, &mut marked);
@@ -471,15 +490,18 @@ impl Process {
     }
 
     /// Make a NIL node
-    pub fn make_nil(&mut self) -> NodeId {
-        self.arena.inner.alloc(Node::Leaf(OpaqueValue::Nil))
+    pub fn make_nil(&self) -> NodeId {
+        self.nil_node
     }
 
     /// Make a T node
-    pub fn make_t(&mut self, globals: &crate::context::GlobalContext) -> NodeId {
-        self.arena
-            .inner
-            .alloc(Node::Leaf(OpaqueValue::Symbol(globals.t_sym.0)))
+    pub fn make_t(&self, _globals: &crate::context::GlobalContext) -> NodeId {
+        self.t_node
+    }
+
+    /// Make an Unbound node
+    pub fn make_unbound(&self) -> NodeId {
+        self.unbound_node
     }
 
     /// Make an Integer node

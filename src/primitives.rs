@@ -2804,10 +2804,7 @@ fn prim_allocate_instance(
 
         if let Some(id) = class_id {
             // Create instance (all slots nil)
-            let unbound = proc
-                .arena
-                .inner
-                .alloc(Node::Leaf(OpaqueValue::Unbound));
+            let unbound = proc.make_unbound();
             if let Some(inst_idx) = proc.mop.make_instance(id, unbound) {
                 let inst_node = proc
                     .arena
@@ -2822,7 +2819,7 @@ fn prim_allocate_instance(
     ))
 }
 
-fn prim_shared_initialize(
+pub(crate) fn prim_shared_initialize(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
@@ -2847,6 +2844,18 @@ fn prim_shared_initialize(
             ));
         };
 
+    let class_id = proc.mop.get_instance(inst_idx).map(|i| i.class).ok_or(
+        crate::eval::ControlSignal::Error("Instance lost class?".into()),
+    )?;
+
+    if initargs.is_empty() {
+        if let Some(class) = proc.mop.get_class(class_id) {
+            if class.slots.is_empty() && class.default_initargs.is_empty() {
+                return Ok(instance);
+            }
+        }
+    }
+
     // Calculate slots info
     // We need to do this properly.
     // Initargs is a list of keys and values.
@@ -2854,11 +2863,11 @@ fn prim_shared_initialize(
     // Parse initargs to map? No, repeated keys allowed?
     // "The first value ... is used."
     // So scan.
-    let mut initargs_map = parse_keywords_list(proc, initargs);
-
-    let class_id = proc.mop.get_instance(inst_idx).map(|i| i.class).ok_or(
-        crate::eval::ControlSignal::Error("Instance lost class?".into()),
-    )?;
+    let mut initargs_map = if initargs.is_empty() {
+        HashMap::new()
+    } else {
+        parse_keywords_list(proc, initargs)
+    };
 
     // Determine slot-names behavior
     let t_sym = ctx
@@ -3835,10 +3844,7 @@ fn ensure_class_metaobject(
     if let Some(idx) = proc.mop.get_class_meta_instance(class_id) {
         return Ok(idx);
     }
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     let meta_id = proc
         .mop
         .get_class(class_id)
@@ -3860,10 +3866,7 @@ fn ensure_generic_metaobject(
     if let Some(idx) = proc.mop.get_generic_meta_instance(generic_id) {
         return Ok(idx);
     }
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     let inst_idx = proc
         .mop
         .make_instance(proc.mop.standard_generic_function, unbound)
@@ -3880,10 +3883,7 @@ fn ensure_method_metaobject(
     if let Some(idx) = proc.mop.get_method_meta_instance(method_id) {
         return Ok(idx);
     }
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     let inst_idx = proc
         .mop
         .make_instance(proc.mop.standard_method, unbound)
@@ -3905,10 +3905,7 @@ fn ensure_slot_def_metaobject(
     {
         return Ok(idx);
     }
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     let class = if direct {
         proc.mop.standard_direct_slot_definition
     } else {
@@ -4606,10 +4603,7 @@ fn update_instances_for_redefined_class(
     class_id: crate::clos::ClassId,
     old_slots: &[crate::clos::SlotDefinition],
 ) {
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     let mut old_map: HashMap<SymbolId, usize> = HashMap::new();
     for slot in old_slots {
         if slot.allocation == crate::clos::SlotAllocation::Instance {
@@ -5280,10 +5274,7 @@ fn prim_sys_allocate_instance(
         )));
     };
 
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     if let Some(inst_idx) = proc.mop.make_instance(class_id, unbound) {
         Ok(proc
             .arena
@@ -5390,6 +5381,8 @@ fn prim_ensure_method(
     let method_id = proc
         .mop
         .add_method(gf_id, specializers, qualifiers, lambda_list, body);
+
+    proc.fast_make_instance_ok = None;
 
     if let Some(name) = gf_name {
         let gf_node = proc
@@ -5810,10 +5803,7 @@ fn prim_class_prototype(
         ));
     }
     if let Some(class_id) = class_id_from_node(proc, args[0]) {
-        let unbound = proc
-            .arena
-            .inner
-            .alloc(Node::Leaf(OpaqueValue::Unbound));
+        let unbound = proc.make_unbound();
         if let Some(inst_idx) = proc.mop.make_instance(class_id, unbound) {
             return Ok(proc
                 .arena
@@ -5992,6 +5982,19 @@ fn prim_sys_dispatch_generic(
     let args_list = args[1];
     let arg_vals = list_to_vec(proc, args_list);
 
+    let uses_eql = proc.mop.generic_uses_eql_specializers(gid);
+    let arg_classes: Vec<_> = if uses_eql {
+        Vec::new()
+    } else {
+        arg_vals.iter().map(|&v| arg_class_id(proc, v)).collect()
+    };
+
+    if !uses_eql {
+        if let Some(effective_fn) = proc.mop.get_cached_effective_method(gid, &arg_classes) {
+            return call_function_node(proc, ctx, effective_fn, &arg_vals);
+        }
+    }
+
     let methods = proc
         .mop
         .compute_applicable_methods(gid, &arg_vals, &proc.arena.inner);
@@ -6007,21 +6010,6 @@ fn prim_sys_dispatch_generic(
             gf_name, gid, arg_vals
         )));
     }
-
-    let uses_eql = proc.mop.generic_uses_eql_specializers(gid);
-    let arg_classes: Vec<_> = if uses_eql {
-        Vec::new()
-    } else {
-        arg_vals.iter().map(|&v| arg_class_id(proc, v)).collect()
-    };
-
-    let cache_hit = if uses_eql {
-        false
-    } else {
-        proc.mop
-            .get_cached_effective_method(gid, &arg_classes)
-            .is_some()
-    };
 
     let method_nodes: Vec<NodeId> = methods
         .iter()
@@ -6083,7 +6071,7 @@ fn prim_sys_dispatch_generic(
     proc.pending_redex = saved_pending;
     proc.next_method_states = saved_next_methods;
 
-    if !cache_hit && !uses_eql {
+    if !uses_eql {
         let effective_method = call_mop_function(
             proc,
             ctx,
@@ -6580,10 +6568,7 @@ fn prim_slot_makunbound(
             if let Some(slot) = class.slots.iter().find(|s| s.name == slot_sym) {
                 match slot.allocation {
                     crate::clos::SlotAllocation::Instance => {
-                        let unbound = proc
-                            .arena
-                            .inner
-                            .alloc(Node::Leaf(OpaqueValue::Unbound));
+                        let unbound = proc.make_unbound();
                         proc.mop.set_slot_value(inst_idx, slot.index, unbound);
                     }
                     crate::clos::SlotAllocation::Class => {
@@ -6890,10 +6875,7 @@ fn prim_slot_makunbound_using_class(
     if let Some(slot) = slot_def {
         match slot.allocation {
             crate::clos::SlotAllocation::Instance => {
-                let unbound = proc
-                    .arena
-                    .inner
-                    .alloc(Node::Leaf(OpaqueValue::Unbound));
+                let unbound = proc.make_unbound();
                 proc.mop.set_slot_value(inst_idx, slot.index, unbound);
             }
             crate::clos::SlotAllocation::Class => {
@@ -7446,10 +7428,7 @@ fn prim_change_class(
     }
 
     let initargs_map = parse_keywords_list(proc, initargs);
-    let unbound = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Unbound));
+    let unbound = proc.make_unbound();
     let mut new_values = vec![unbound; new_instance_size];
 
     for slot in &new_class_slots {

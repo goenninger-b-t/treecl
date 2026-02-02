@@ -603,7 +603,9 @@
   (sys-allocate-instance class))
 
 (defmethod initialize-instance ((instance standard-object) &rest initargs)
-  (apply #'shared-initialize instance t initargs))
+  (if (null initargs)
+      (shared-initialize instance t)
+      (apply #'shared-initialize instance t initargs)))
 
 (defmethod shared-initialize ((instance standard-object) slot-names &rest initargs)
   (apply #'sys-shared-initialize-prim instance slot-names initargs))
@@ -711,12 +713,18 @@
 (setf *use-make-method-lambda* t)
 
 (defmethod make-instance ((class standard-class) &rest initargs)
-  (let ((instance (apply #'allocate-instance class initargs)))
-    (apply #'initialize-instance instance initargs)
-    instance))
+  (if (null initargs)
+      (let ((instance (allocate-instance class)))
+        (initialize-instance instance)
+        instance)
+      (let ((instance (apply #'allocate-instance class initargs)))
+        (apply #'initialize-instance instance initargs)
+        instance)))
 
 (defmethod make-instance ((class symbol) &rest initargs)
-  (apply #'make-instance (find-class class) initargs))
+  (if (null initargs)
+      (make-instance (find-class class))
+      (apply #'make-instance (find-class class) initargs)))
 
 (defclass point () (x y))
 
