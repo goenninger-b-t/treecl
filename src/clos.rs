@@ -196,6 +196,37 @@ pub struct MetaObjectProtocol {
     instances: Vec<Instance>,
     /// Interned EQL specializers
     eql_specializers: Vec<EqlSpecializer>,
+    /// Dependents tracked for classes
+    class_dependents: HashMap<ClassId, Vec<NodeId>>,
+    /// Dependents tracked for generic functions
+    generic_dependents: HashMap<GenericId, Vec<NodeId>>,
+}
+
+fn nodes_eq(arena: &Arena, a: NodeId, b: NodeId) -> bool {
+    if a == b {
+        return true;
+    }
+    match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+        (Node::Leaf(OpaqueValue::Symbol(id1)), Node::Leaf(OpaqueValue::Symbol(id2))) => id1 == id2,
+        (Node::Leaf(OpaqueValue::Class(id1)), Node::Leaf(OpaqueValue::Class(id2))) => id1 == id2,
+        (Node::Leaf(OpaqueValue::Instance(id1)), Node::Leaf(OpaqueValue::Instance(id2))) => {
+            id1 == id2
+        }
+        (Node::Leaf(OpaqueValue::Generic(id1)), Node::Leaf(OpaqueValue::Generic(id2))) => {
+            id1 == id2
+        }
+        (Node::Leaf(OpaqueValue::Method(id1)), Node::Leaf(OpaqueValue::Method(id2))) => id1 == id2,
+        (
+            Node::Leaf(OpaqueValue::SlotDefinition(c1, s1, d1)),
+            Node::Leaf(OpaqueValue::SlotDefinition(c2, s2, d2)),
+        ) => c1 == c2 && s1 == s2 && d1 == d2,
+        (
+            Node::Leaf(OpaqueValue::EqlSpecializer(id1)),
+            Node::Leaf(OpaqueValue::EqlSpecializer(id2)),
+        ) => id1 == id2,
+        (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil)) => true,
+        _ => false,
+    }
 }
 
 impl MetaObjectProtocol {
@@ -242,6 +273,8 @@ impl MetaObjectProtocol {
             method_combinations: HashMap::new(),
             instances: Vec::new(),
             eql_specializers: Vec::new(),
+            class_dependents: HashMap::new(),
+            generic_dependents: HashMap::new(),
         };
 
         // Bootstrap the class hierarchy
@@ -860,6 +893,96 @@ impl MetaObjectProtocol {
     ) {
         self.slot_def_meta_instances
             .insert((class_id, slot_idx, direct), inst);
+    }
+
+    pub fn class_id_for_meta_instance(&self, inst_idx: usize) -> Option<ClassId> {
+        self.class_meta_instances
+            .iter()
+            .find(|(_, &idx)| idx == inst_idx)
+            .map(|(cid, _)| *cid)
+    }
+
+    pub fn generic_id_for_meta_instance(&self, inst_idx: usize) -> Option<GenericId> {
+        self.generic_meta_instances
+            .iter()
+            .find(|(_, &idx)| idx == inst_idx)
+            .map(|(gid, _)| *gid)
+    }
+
+    pub fn add_class_dependent(
+        &mut self,
+        class_id: ClassId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = self
+            .class_dependents
+            .entry(class_id)
+            .or_insert_with(Vec::new);
+        if deps.iter().any(|d| nodes_eq(arena, *d, dependent)) {
+            return false;
+        }
+        deps.push(dependent);
+        true
+    }
+
+    pub fn remove_class_dependent(
+        &mut self,
+        class_id: ClassId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = match self.class_dependents.get_mut(&class_id) {
+            Some(deps) => deps,
+            None => return false,
+        };
+        let before = deps.len();
+        deps.retain(|d| !nodes_eq(arena, *d, dependent));
+        before != deps.len()
+    }
+
+    pub fn class_dependents(&self, class_id: ClassId) -> Option<&[NodeId]> {
+        self.class_dependents
+            .get(&class_id)
+            .map(|deps| deps.as_slice())
+    }
+
+    pub fn add_generic_dependent(
+        &mut self,
+        generic_id: GenericId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = self
+            .generic_dependents
+            .entry(generic_id)
+            .or_insert_with(Vec::new);
+        if deps.iter().any(|d| nodes_eq(arena, *d, dependent)) {
+            return false;
+        }
+        deps.push(dependent);
+        true
+    }
+
+    pub fn remove_generic_dependent(
+        &mut self,
+        generic_id: GenericId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = match self.generic_dependents.get_mut(&generic_id) {
+            Some(deps) => deps,
+            None => return false,
+        };
+        let before = deps.len();
+        deps.retain(|d| !nodes_eq(arena, *d, dependent));
+        before != deps.len()
+    }
+
+    pub fn generic_dependents(&self, generic_id: GenericId) -> Option<&[NodeId]> {
+        self.generic_dependents
+            .get(&generic_id)
+            .map(|deps| deps.as_slice())
     }
 
     pub fn add_standalone_slot_def(&mut self, slot: SlotDefinition) -> u32 {
@@ -1587,6 +1710,14 @@ impl MetaObjectProtocol {
         // Trace interned EQL specializers
         for spec in &self.eql_specializers {
             roots.push(spec.object);
+        }
+
+        // Trace dependents stored on classes/generics
+        for deps in self.class_dependents.values() {
+            roots.extend(deps.iter().copied());
+        }
+        for deps in self.generic_dependents.values() {
+            roots.extend(deps.iter().copied());
         }
 
         // Trace Instances (slot values) - REMOVED

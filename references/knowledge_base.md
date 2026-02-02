@@ -106,4 +106,5 @@ MOP implementation status (TreeCL)
 - Generic function invocation now applies cached discriminating functions (from `compute-discriminating-function`) instead of always raw dispatch.
 - Primitives that call `apply_values` now preserve process state (program/mode/continuation stack/pending redex/next-method state) to avoid clobbering ongoing evaluation.
 - Added EQL specializer support: `eql-specializer` class, `intern-eql-specializer`, `eql-specializer-object`, EQL-aware method applicability/specificity, and dispatch that ignores caching when EQL specializers are present.
-- Open tasks tracked in `TASKS.md` cover dependents, funcallable instances, extra introspection, and accessor completeness.
+- Added dependents protocol support: `add-dependent`, `remove-dependent`, `map-dependents`, and `update-dependent` generics backed by MOP storage, with update notifications on class/generic redefinition and method addition.
+- Open tasks tracked in `TASKS.md` cover funcallable instances, extra introspection, and accessor completeness.

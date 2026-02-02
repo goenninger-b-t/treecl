@@ -598,6 +598,10 @@
 (defgeneric method-function (method))
 (defgeneric make-method-lambda (gf method lambda-expression env))
 (defgeneric generic-function-argument-precedence-order (gf))
+(defgeneric add-dependent (metaobject dependent))
+(defgeneric remove-dependent (metaobject dependent))
+(defgeneric map-dependents (metaobject function))
+(defgeneric update-dependent (metaobject dependent &rest initargs))
 
 (defun ensure-class (name &rest initargs)
   (apply #'ensure-class-using-class (find-class name) name initargs))
@@ -668,6 +672,30 @@
 
 (defmethod generic-function-argument-precedence-order ((gf standard-generic-function))
   (sys-generic-function-argument-precedence-order gf))
+
+(defmethod add-dependent ((metaobject standard-class) dependent)
+  (sys-add-dependent metaobject dependent))
+
+(defmethod add-dependent ((metaobject standard-generic-function) dependent)
+  (sys-add-dependent metaobject dependent))
+
+(defmethod remove-dependent ((metaobject standard-class) dependent)
+  (sys-remove-dependent metaobject dependent))
+
+(defmethod remove-dependent ((metaobject standard-generic-function) dependent)
+  (sys-remove-dependent metaobject dependent))
+
+(defmethod map-dependents ((metaobject standard-class) function)
+  (sys-map-dependents metaobject function))
+
+(defmethod map-dependents ((metaobject standard-generic-function) function)
+  (sys-map-dependents metaobject function))
+
+(defmethod update-dependent ((metaobject standard-class) dependent &rest initargs)
+  nil)
+
+(defmethod update-dependent ((metaobject standard-generic-function) dependent &rest initargs)
+  nil)
 
 (setf *use-make-method-lambda* t)
 

@@ -198,6 +198,9 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
         prim_update_instance_for_redefined_class,
     );
     globals.register_primitive("SYS-REINITIALIZE-INSTANCE", cl, prim_reinitialize_instance);
+    globals.register_primitive("SYS-ADD-DEPENDENT", cl, prim_sys_add_dependent);
+    globals.register_primitive("SYS-REMOVE-DEPENDENT", cl, prim_sys_remove_dependent);
+    globals.register_primitive("SYS-MAP-DEPENDENTS", cl, prim_sys_map_dependents);
     globals.register_primitive(
         "COMPUTE-CLASS-PRECEDENCE-LIST",
         cl,
@@ -3206,6 +3209,41 @@ fn method_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::Meth
     }
 }
 
+enum DependentKey {
+    Class(crate::clos::ClassId),
+    Generic(crate::clos::GenericId),
+}
+
+fn dependent_key_from_node(proc: &Process, node: NodeId) -> Option<DependentKey> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Class(id)) => Some(DependentKey::Class(crate::clos::ClassId(*id))),
+        Node::Leaf(OpaqueValue::Generic(id)) => {
+            Some(DependentKey::Generic(crate::clos::GenericId(*id)))
+        }
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            let sym = SymbolId(*id);
+            if let Some(cid) = proc.mop.find_class(sym) {
+                Some(DependentKey::Class(cid))
+            } else if let Some(gid) = proc.mop.find_generic(sym) {
+                Some(DependentKey::Generic(gid))
+            } else {
+                None
+            }
+        }
+        Node::Leaf(OpaqueValue::Instance(idx)) => {
+            let inst_idx = *idx as usize;
+            if let Some(cid) = proc.mop.class_id_for_meta_instance(inst_idx) {
+                Some(DependentKey::Class(cid))
+            } else if let Some(gid) = proc.mop.generic_id_for_meta_instance(inst_idx) {
+                Some(DependentKey::Generic(gid))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn arg_class_id(proc: &Process, node: NodeId) -> crate::clos::ClassId {
     match proc.arena.inner.get_unchecked(node) {
         Node::Leaf(OpaqueValue::Instance(id)) => proc
@@ -3329,6 +3367,61 @@ fn call_mop_function(
     } else {
         Err(ControlSignal::Error(format!("Undefined function: {}", name)))
     }
+}
+
+fn update_dependent_available(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+) -> bool {
+    let (sym_user, sym_cl) = {
+        let mut syms = ctx.symbols.write().unwrap();
+        let sym_user = syms.intern_in("UPDATE-DEPENDENT", PackageId(2));
+        let sym_cl = syms.intern_in("UPDATE-DEPENDENT", PackageId(1));
+        (sym_user, sym_cl)
+    };
+    proc.get_function(sym_user).is_some() || proc.get_function(sym_cl).is_some()
+}
+
+fn notify_dependents(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    key: DependentKey,
+    extra_args: &[NodeId],
+) -> Result<(), ControlSignal> {
+    if !update_dependent_available(proc, ctx) {
+        return Ok(());
+    }
+
+    let deps = match key {
+        DependentKey::Class(cid) => proc.mop.class_dependents(cid).map(|d| d.to_vec()),
+        DependentKey::Generic(gid) => proc.mop.generic_dependents(gid).map(|d| d.to_vec()),
+    };
+
+    let deps = match deps {
+        Some(deps) if !deps.is_empty() => deps,
+        _ => return Ok(()),
+    };
+
+    let meta_node = match key {
+        DependentKey::Class(cid) => proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Class(cid.0))),
+        DependentKey::Generic(gid) => proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Generic(gid.0))),
+    };
+
+    for dep in deps {
+        let mut args = Vec::with_capacity(2 + extra_args.len());
+        args.push(meta_node);
+        args.push(dep);
+        args.extend_from_slice(extra_args);
+        let _ = call_mop_function(proc, ctx, "UPDATE-DEPENDENT", &args)?;
+    }
+
+    Ok(())
 }
 
 fn call_slot_missing(
@@ -4443,6 +4536,16 @@ fn define_slot_accessors(
         .inner
         .alloc(Node::Leaf(OpaqueValue::Symbol(slot_accessor_sym.0)));
 
+    let kw_add_method = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in("ADD-METHOD", PackageId(0));
+    let kw_add_method_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(kw_add_method.0)));
+
     for slot in slots {
         let slot_sym_node = proc
             .arena
@@ -4475,13 +4578,23 @@ fn define_slot_accessors(
                 .inner
                 .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
 
-            proc.mop.add_method(
+            let method_id = proc.mop.add_method(
                 gf_id,
                 vec![crate::clos::Specializer::Class(class_id)],
                 Vec::new(),
                 vec![obj_sym],
                 closure_node,
             );
+            let method_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Method(method_id.0)));
+            notify_dependents(
+                proc,
+                ctx,
+                DependentKey::Generic(gf_id),
+                &[kw_add_method_node, method_node],
+            )?;
         }
 
         // Writers (skip if name is also a reader; those are treated as accessors)
@@ -4527,7 +4640,7 @@ fn define_slot_accessors(
                 .inner
                 .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
 
-            proc.mop.add_method(
+            let method_id = proc.mop.add_method(
                 gf_id,
                 vec![
                     crate::clos::Specializer::Class(proc.mop.t_class),
@@ -4537,6 +4650,16 @@ fn define_slot_accessors(
                 vec![val_sym, obj_sym],
                 closure_node,
             );
+            let method_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Method(method_id.0)));
+            notify_dependents(
+                proc,
+                ctx,
+                DependentKey::Generic(gf_id),
+                &[kw_add_method_node, method_node],
+            )?;
         }
     }
 
@@ -4641,6 +4764,7 @@ pub(crate) fn prim_ensure_class(
         .mop
         .find_class(name)
         .and_then(|cid| proc.mop.get_class(cid).map(|c| c.slots.clone()));
+    let class_existed = old_slots.is_some();
 
     let class_id = proc.mop.define_class_with_meta(
         name,
@@ -4662,6 +4786,9 @@ pub(crate) fn prim_ensure_class(
     for cid in class_ids {
         let _ = sync_class_metaobject(proc, ctx, cid);
     }
+    if class_existed {
+        notify_dependents(proc, ctx, DependentKey::Class(class_id), &args[1..])?;
+    }
     Ok(proc
         .arena
         .inner
@@ -4682,6 +4809,7 @@ fn prim_ensure_generic_function(
     let name = node_to_symbol(proc, name_node).ok_or(crate::eval::ControlSignal::Error(
         "Generic name != symbol".to_string(),
     ))?;
+    let generic_existed = proc.mop.find_generic(name).is_some();
 
     let kwargs = parse_keywords_list(proc, &args[1..]);
 
@@ -4875,6 +5003,10 @@ fn prim_ensure_generic_function(
     // Bind to function name in process
     proc.set_function(name, gf_node);
 
+    if generic_existed {
+        notify_dependents(proc, ctx, DependentKey::Generic(gid), &args[1..])?;
+    }
+
     Ok(gf_node)
 }
 
@@ -5017,10 +5149,28 @@ fn prim_ensure_method(
         proc.set_function(name, gf_node);
     }
 
-    Ok(proc
+    let method_node = proc
         .arena
         .inner
-        .alloc(Node::Leaf(OpaqueValue::Method(method_id.0))))
+        .alloc(Node::Leaf(OpaqueValue::Method(method_id.0)));
+
+    let kw_add_method = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in("ADD-METHOD", PackageId(0));
+    let kw_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(kw_add_method.0)));
+    notify_dependents(
+        proc,
+        ctx,
+        DependentKey::Generic(gf_id),
+        &[kw_node, method_node],
+    )?;
+
+    Ok(method_node)
 }
 
 fn prim_register_method_combination(
@@ -6687,6 +6837,94 @@ fn prim_reinitialize_instance(
         shared_args.extend_from_slice(&args[1..]);
     }
     prim_shared_initialize(proc, ctx, &shared_args)
+}
+
+fn prim_sys_add_dependent(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "SYS-ADD-DEPENDENT requires metaobject and dependent".to_string(),
+        ));
+    }
+    let key = dependent_key_from_node(proc, args[0]).ok_or_else(|| {
+        ControlSignal::Error("SYS-ADD-DEPENDENT requires class or generic".to_string())
+    })?;
+    let dependent = args[1];
+
+    match key {
+        DependentKey::Class(cid) => {
+            proc.mop
+                .add_class_dependent(cid, dependent, &proc.arena.inner);
+        }
+        DependentKey::Generic(gid) => {
+            proc.mop
+                .add_generic_dependent(gid, dependent, &proc.arena.inner);
+        }
+    }
+
+    Ok(dependent)
+}
+
+fn prim_sys_remove_dependent(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "SYS-REMOVE-DEPENDENT requires metaobject and dependent".to_string(),
+        ));
+    }
+    let key = dependent_key_from_node(proc, args[0]).ok_or_else(|| {
+        ControlSignal::Error("SYS-REMOVE-DEPENDENT requires class or generic".to_string())
+    })?;
+    let dependent = args[1];
+
+    let removed = match key {
+        DependentKey::Class(cid) => proc
+            .mop
+            .remove_class_dependent(cid, dependent, &proc.arena.inner),
+        DependentKey::Generic(gid) => proc
+            .mop
+            .remove_generic_dependent(gid, dependent, &proc.arena.inner),
+    };
+
+    if removed {
+        Ok(proc.make_t(ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_sys_map_dependents(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Err(ControlSignal::Error(
+            "SYS-MAP-DEPENDENTS requires metaobject and function".to_string(),
+        ));
+    }
+    let key = dependent_key_from_node(proc, args[0]).ok_or_else(|| {
+        ControlSignal::Error("SYS-MAP-DEPENDENTS requires class or generic".to_string())
+    })?;
+    let func = args[1];
+
+    let deps = match key {
+        DependentKey::Class(cid) => proc.mop.class_dependents(cid).map(|d| d.to_vec()),
+        DependentKey::Generic(gid) => proc.mop.generic_dependents(gid).map(|d| d.to_vec()),
+    }
+    .unwrap_or_default();
+
+    for dep in deps {
+        let _ = call_function_node(proc, ctx, func, &[dep])?;
+    }
+
+    Ok(proc.make_nil())
 }
 
 fn prim_change_class(

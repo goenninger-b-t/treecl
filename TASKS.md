@@ -27,9 +27,9 @@ This file tracks MOP work items across conversations.
 - Goal: `eql` specializers, `intern-eql-specializer`, dispatch support.
 - Tests: `tests/mop_eql_specializer_test.lisp`
 
-## Task 7 — Dependents protocol
+## Task 7 — Dependents protocol (DONE)
 - Goal: `add-dependent`, `remove-dependent`, `map-dependents`, `update-dependent`.
-- Tests: to add when task starts.
+- Tests: `tests/mop_dependents_protocol_test.lisp`
 
 ## Task 8 — Funcallable instances
 - Goal: funcallable standard classes, `set-funcallable-instance-function`, funcallable access.
