@@ -11,7 +11,7 @@
   (let ((i 0))
     (tagbody
       start
-      (if (eq i 10) (go end) nil)
+      (if (= i 10) (go end) nil)
       (print i)
       (setq i (+ i 1))
       (go start)

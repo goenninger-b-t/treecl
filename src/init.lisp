@@ -108,7 +108,7 @@
 (defun fourth (x) (cadddr x))
 (defun fifth (x) (car (cddddr x)))
 
-(defmacro return (val)
+(defmacro return (&optional val)
   `(return-from nil ,val))
 
 (defmacro loop (&rest body)
@@ -229,8 +229,7 @@
 (defsetf symbol-value set)
 ;; (defsetf symbol-function (sym) (store)
 ;;   `(set-symbol-function ,sym ,store))
-;; (defsetf get (sym indicator &optional default) (store)
-;;   `(put ,sym ,indicator ,store))
+(defsetf get put)
 
 
 
@@ -294,11 +293,30 @@
 
 ;;; CLOS Macros
 
+(defun %dc-expand-options (options)
+  (if (null options)
+      nil
+      (let ((opt (car options)))
+        (if (and (consp opt) (keywordp (car opt)))
+            (let ((key (car opt))
+                  (rest (cdr opt)))
+              (if (null rest)
+                  (%dc-expand-options (cdr options))
+                  (if (null (cdr rest))
+                      (cons key (cons (list 'quote (car rest))
+                                      (%dc-expand-options (cdr options))))
+                      (cons key (cons (list 'quote rest)
+                                      (%dc-expand-options (cdr options)))))))
+            (cons opt (%dc-expand-options (cdr options)))))))
+
 (defmacro defclass (name direct-superclasses direct-slots &rest options)
-  ;; Simplified DEFCLASS: options ignored for now
-  `(ensure-class ',name 
-                 :direct-superclasses ',direct-superclasses 
-                 :direct-slots ',direct-slots))
+  (let ((supers (if (null direct-superclasses) '(standard-object) direct-superclasses))
+        (opts (%dc-expand-options options)))
+    `(ensure-class-using-class (find-class ',name)
+                               ',name
+                               :direct-superclasses ',supers
+                               :direct-slots ',direct-slots
+                               ,@opts)))
 
 (defun %dg-quote-options (options)
   (if (null options)
@@ -512,6 +530,8 @@
     `(sys-make-method
       (function (lambda (&rest ,args) ,form)))))
 
+(defparameter *use-make-method-lambda* nil)
+
 (defun parse-defmethod-qualifiers (args qualifiers)
   (if (and (consp args) (symbolp (car args)) (not (null (car args))))
       (if (listp (car args))
@@ -535,27 +555,52 @@
                                              (cons t specs)))))))
 
 (defmacro defmethod (name &rest args)
-  (let ((parse-result (parse-defmethod-qualifiers args nil)))
-    (let ((qualifiers (nreverse (car parse-result)))
-          (rest (cadr parse-result)))
-    
-    (let ((ll (car rest)))
-      (setq body (cdr rest))
-      ;; Parse lambda list to extract specializers
-      (let ((ll-result (parse-defmethod-lambda-list ll nil nil)))
-        (let ((clean-ll (car ll-result))
-              (specs (cadr ll-result)))
-        
-        `(ensure-method ',name 
-                        :lambda-list ',clean-ll 
-                        :qualifiers ',qualifiers 
-                        :specializers ',specs 
-                        :body (function (lambda ,clean-ll ,@body))))))))
+  (let* ((parse-result (parse-defmethod-qualifiers args nil))
+         (qualifiers (nreverse (car parse-result)))
+         (rest (cadr parse-result))
+         (ll (car rest))
+         (body (cdr rest)))
+    ;; Parse lambda list to extract specializers
+    (let ((ll-result (parse-defmethod-lambda-list ll nil nil)))
+      (let ((clean-ll (car ll-result))
+            (specs (cadr ll-result)))
+        `(let* ((gf (if (fboundp ',name)
+                        (symbol-function ',name)
+                        (ensure-generic-function ',name :lambda-list ',clean-ll)))
+                (fn (function (lambda ,clean-ll ,@body))))
+           (ensure-method gf
+                          :lambda-list ',clean-ll
+                          :qualifiers ',qualifiers
+                          :specializers ',specs
+                          :body (if (and *use-make-method-lambda*
+                                         (generic-function-methods
+                                          (symbol-function 'make-method-lambda)))
+                                    (make-method-lambda gf nil fn nil)
+                                    fn)))))))
 
 (defgeneric allocate-instance (class &rest initargs))
 (defgeneric initialize-instance (instance &rest initargs))
 (defgeneric shared-initialize (instance slot-names &rest initargs))
 (defgeneric make-instance (class &rest initargs))
+(defgeneric ensure-class-using-class (class name &rest initargs))
+(defgeneric validate-superclass (class superclass))
+(defgeneric finalize-inheritance (class))
+(defgeneric reinitialize-instance (instance &rest initargs))
+(defgeneric change-class (instance new-class &rest initargs))
+(defgeneric update-instance-for-redefined-class (instance added discarded plist &rest initargs))
+(defgeneric slot-missing (class instance slot-name operation &optional new-value))
+(defgeneric slot-unbound (class instance slot-name))
+(defgeneric make-direct-slot-definition (class &rest initargs))
+(defgeneric make-effective-slot-definition (class &rest initargs))
+(defgeneric compute-discriminating-function (gf))
+(defgeneric compute-effective-method (gf method-combination methods))
+(defgeneric compute-effective-method-function (gf effective-method))
+(defgeneric method-function (method))
+(defgeneric make-method-lambda (gf method lambda-expression env))
+(defgeneric generic-function-argument-precedence-order (gf))
+
+(defun ensure-class (name &rest initargs)
+  (apply #'ensure-class-using-class (find-class name) name initargs))
 
 (defmethod allocate-instance ((class standard-class) &rest initargs)
   (sys-allocate-instance class))
@@ -566,6 +611,62 @@
 (defmethod shared-initialize ((instance standard-object) slot-names &rest initargs)
   (apply #'sys-shared-initialize-prim instance slot-names initargs))
 
+(defmethod ensure-class-using-class ((class t) name &rest initargs)
+  (apply #'sys-ensure-class name initargs))
+
+(defmethod validate-superclass ((class t) (superclass t))
+  t)
+
+(defmethod finalize-inheritance ((class standard-class))
+  (sys-finalize-inheritance class))
+
+(defmethod reinitialize-instance ((instance standard-object) &rest initargs)
+  (apply #'sys-reinitialize-instance instance initargs))
+
+(defmethod change-class ((instance standard-object) (new-class standard-class) &rest initargs)
+  (apply #'sys-change-class instance new-class initargs))
+
+(defmethod change-class ((instance standard-object) (new-class symbol) &rest initargs)
+  (apply #'change-class instance (find-class new-class) initargs))
+
+(defmethod update-instance-for-redefined-class
+  ((instance standard-object) added discarded plist &rest initargs)
+  instance)
+
+(defmethod slot-missing ((class standard-class) instance slot-name operation &optional new-value)
+  (error "Slot missing"))
+
+(defmethod slot-unbound ((class standard-class) instance slot-name)
+  (error "Slot unbound"))
+
+(defmethod make-direct-slot-definition ((class standard-class) &rest initargs)
+  (apply #'sys-make-direct-slot-definition class initargs))
+
+(defmethod make-effective-slot-definition ((class standard-class) &rest initargs)
+  (apply #'sys-make-effective-slot-definition class initargs))
+
+(defmethod compute-discriminating-function ((gf standard-generic-function))
+  (function (lambda (&rest args)
+              (sys-dispatch-generic gf args))))
+
+(defmethod compute-effective-method ((gf standard-generic-function) method-combination methods)
+  methods)
+
+(defmethod compute-effective-method-function ((gf standard-generic-function) effective-method)
+  (function (lambda (&rest args)
+              (sys-apply-effective-method gf effective-method args))))
+
+(defmethod method-function ((method standard-method))
+  (method-body method))
+
+(defmethod make-method-lambda ((gf standard-generic-function) method lambda-expression env)
+  lambda-expression)
+
+(defmethod generic-function-argument-precedence-order ((gf standard-generic-function))
+  (sys-generic-function-argument-precedence-order gf))
+
+(setf *use-make-method-lambda* t)
+
 (defmethod make-instance ((class standard-class) &rest initargs)
   (let ((instance (apply #'allocate-instance class initargs)))
     (apply #'initialize-instance instance initargs)
@@ -573,3 +674,7 @@
 
 (defmethod make-instance ((class symbol) &rest initargs)
   (apply #'make-instance (find-class class) initargs))
+
+;; REPL convenience (no-op in non-interactive runs)
+(defun quit (&optional code)
+  nil)

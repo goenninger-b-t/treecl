@@ -359,59 +359,52 @@ fn handle_syscall(
                 // Lock child to set up program
                 let mut child = child_arc.lock().unwrap();
 
-                // We need to copy `func` from Parent to Child.
-                // We need Parent Lock.
-                if let Some(parent_arc) = sched.registry.get(&pid) {
-                    let mut parent = parent_arc.lock().unwrap();
+                // Deep copy function node from parent into child arena
+                let func_copy =
+                    crate::arena::deep_copy(&proc.arena.inner, func, &mut child.arena.inner);
 
-                    // Deep copy function node
-                    let func_copy =
-                        crate::arena::deep_copy(&parent.arena.inner, func, &mut child.arena.inner);
+                // Wrap in (FUNCALL func_copy)
+                // Find FUNCALL symbol
+                let funcall_sym = globals
+                    .symbols
+                    .write()
+                    .unwrap()
+                    .intern_in("FUNCALL", crate::symbol::PackageId(1));
+                let funcall_val = OpaqueValue::Symbol(funcall_sym.0);
+                let funcall_node = child
+                    .arena
+                    .inner
+                    .alloc(crate::arena::Node::Leaf(funcall_val));
 
-                    // Wrap in (FUNCALL func_copy)
-                    // Find FUNCALL symbol
-                    let funcall_sym = globals
-                        .symbols
-                        .write()
-                        .unwrap()
-                        .intern_in("FUNCALL", crate::symbol::PackageId(1));
-                    let funcall_val = OpaqueValue::Symbol(funcall_sym.0);
-                    let funcall_node = child
-                        .arena
-                        .inner
-                        .alloc(crate::arena::Node::Leaf(funcall_val));
+                let nil = child.make_nil();
+                let args_list = child
+                    .arena
+                    .inner
+                    .alloc(crate::arena::Node::Fork(func_copy, nil));
+                let call_form = child
+                    .arena
+                    .inner
+                    .alloc(crate::arena::Node::Fork(funcall_node, args_list));
 
-                    let nil = child.make_nil();
-                    let args_list = child
-                        .arena
-                        .inner
-                        .alloc(crate::arena::Node::Fork(func_copy, nil));
-                    let call_form = child
-                        .arena
-                        .inner
-                        .alloc(crate::arena::Node::Fork(funcall_node, args_list));
+                child.program = call_form;
+                // Status is already Runnable (from spawn_process default? No check Process::new)
+                // Process::new sets Runnable.
 
-                    child.program = call_form;
-                    // Status is already Runnable (from spawn_process default? No check Process::new)
-                    // Process::new sets Runnable.
+                // Resume Parent with Child PID
+                let pid_node = proc.make_pid(child_pid);
 
-                    // Resume Parent with Child PID
-                    let pid_node = parent.make_pid(child_pid);
-
-                    if let Some(redex) = parent.pending_redex.take() {
-                        // Deep copy pid_node? No, pid_node is in parent arena (alloced by parent.make_pid)
-                        // Wait. `parent.make_pid` allocates in `parent.arena`.
-                        // `overwrite` takes NodeId (redex in parent) and Node (value).
-                        // `get_unchecked` returns &Node.
-                        let val = parent.arena.inner.get_unchecked(pid_node).clone();
-                        parent.arena.inner.overwrite(redex, val);
-                    }
-                    parent.status = Status::Runnable;
-
-                    // Schedule parent
-                    sched.global_queue.push(pid);
+                if let Some(redex) = proc.pending_redex.take() {
+                    // Deep copy pid_node? No, pid_node is in parent arena (alloced by parent.make_pid)
+                    // Wait. `parent.make_pid` allocates in `parent.arena`.
+                    // `overwrite` takes NodeId (redex in parent) and Node (value).
+                    // `get_unchecked` returns &Node.
+                    let val = proc.arena.inner.get_unchecked(pid_node).clone();
+                    proc.arena.inner.overwrite(redex, val);
                 }
-                // Unlock parent
+                proc.status = Status::Runnable;
+
+                // Schedule parent
+                sched.global_queue.push(pid);
 
                 // Schedule child
                 sched.global_queue.push(child_pid);

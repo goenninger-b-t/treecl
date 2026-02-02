@@ -1370,11 +1370,12 @@ impl<'a> Interpreter<'a> {
         let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
         let progn_sym_node = self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
 
+        let (_decls, body_start) = self.parse_body(body_forms);
         let body_node = self
             .process
             .arena
             .inner
-            .alloc(Node::Fork(progn_sym_node, body_forms));
+            .alloc(Node::Fork(progn_sym_node, body_start));
 
         // Parse lambda list
         let parsed_lambda_list = match self.parse_lambda_list(lambda_list_node) {
@@ -1479,15 +1480,16 @@ impl<'a> Interpreter<'a> {
                             Err(e) => return Err(ControlSignal::Error(e)),
                         };
 
-                        // Create Progn Body
+                        // Create Progn Body (strip declarations)
                         let progn_sym = self.globals.special_forms.progn;
                         let progn_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
                         let progn_node = self.process.arena.inner.alloc(Node::Leaf(progn_val));
+                        let (_decls, body_start) = self.parse_body(body_forms);
                         let body_expr = self
                             .process
                             .arena
                             .inner
-                            .alloc(Node::Fork(progn_node, body_forms));
+                            .alloc(Node::Fork(progn_node, body_start));
 
                         // Capture Environment
                         let captured_env = self
@@ -2705,13 +2707,10 @@ impl<'a> Interpreter<'a> {
         self.call_method_with_next_methods(method_id, next_ids, call_args, env.clone())?;
 
         loop {
-            match self.process.execution_mode {
-                crate::process::ExecutionMode::Return => return Ok(self.process.program),
-                crate::process::ExecutionMode::Eval => {
-                    if !self.step()? {
-                        // Paused
-                    }
-                }
+            match self.step() {
+                Ok(true) => continue,
+                Ok(false) => return Ok(self.process.program),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2866,21 +2865,77 @@ impl<'a> Interpreter<'a> {
         self.apply_function(op_val, args, env)
     }
 
-    /// Apply Generic Function
+    /// Apply Generic Function (MOP-aware)
     fn apply_generic_function(
         &mut self,
         gid: crate::clos::GenericId,
         args: Vec<NodeId>,
         _env: &Environment,
     ) -> Result<bool, ControlSignal> {
-        // Ensure CALL-NEXT-METHOD is present in COMMON-LISP for lexical binding.
-        let _ = self.ensure_cl_symbol("CALL-NEXT-METHOD");
+        if self.is_internal_mop_generic(gid) {
+            return self.apply_generic_function_raw(gid, args, _env);
+        }
 
+        let df = if let Some(df) = self
+            .process
+            .mop
+            .get_generic_discriminating_function(gid)
+        {
+            df
+        } else {
+            let df = self.compute_discriminating_function(gid)?;
+            self.process.mop.set_generic_discriminating_function(gid, df);
+            df
+        };
+
+        // Apply the discriminating function to evaluated arguments.
+        self.step_apply(df, args, _env.clone())
+    }
+
+    /// Apply Generic Function (raw dispatch, no MOP indirection)
+    fn apply_generic_function_raw(
+        &mut self,
+        gid: crate::clos::GenericId,
+        args: Vec<NodeId>,
+        _env: &Environment,
+    ) -> Result<bool, ControlSignal> {
         let arg_classes: Vec<_> = args.iter().map(|&a| self.get_arg_class(a)).collect();
         let methods = self
             .process
             .mop
             .compute_applicable_methods(gid, &arg_classes);
+
+        if methods.is_empty() {
+            let gf_name = self
+                .process
+                .mop
+                .get_generic(gid)
+                .and_then(|g| {
+                    self.globals
+                        .symbols
+                        .read()
+                        .unwrap()
+                        .symbol_name(g.name)
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "?".to_string());
+            return Err(ControlSignal::Error(format!(
+                "No applicable method for generic function {} {:?} with args {:?}",
+                gf_name, gid, args
+            )));
+        }
+
+        self.apply_methods_with_combination(gid, methods, args)
+    }
+
+    pub(crate) fn apply_methods_with_combination(
+        &mut self,
+        gid: crate::clos::GenericId,
+        methods: Vec<crate::clos::MethodId>,
+        args: Vec<NodeId>,
+    ) -> Result<bool, ControlSignal> {
+        // Ensure CALL-NEXT-METHOD is present in COMMON-LISP for lexical binding.
+        let _ = self.ensure_cl_symbol("CALL-NEXT-METHOD");
 
         if methods.is_empty() {
             return Err(ControlSignal::Error(format!(
@@ -2994,13 +3049,6 @@ impl<'a> Interpreter<'a> {
                 options,
                 ..
             } => {
-                if methods.is_empty() {
-                    return Err(ControlSignal::Error(format!(
-                        "No applicable method for generic function {:?} with args {:?}",
-                        gid, args
-                    )));
-                }
-
                 // Build list of method objects (most specific first).
                 let mut method_nodes = Vec::with_capacity(methods.len());
                 for &mid in &methods {
@@ -3126,6 +3174,83 @@ impl<'a> Interpreter<'a> {
                 body_str,
                 self.process.arena.get_unchecked(method_body_node)
             )))
+        }
+    }
+
+    fn is_internal_mop_generic(&self, gid: crate::clos::GenericId) -> bool {
+        let gf = match self.process.mop.get_generic(gid) {
+            Some(gf) => gf,
+            None => return false,
+        };
+        let name = {
+            let syms = self.globals.symbols.read().unwrap();
+            syms.symbol_name(gf.name)
+                .unwrap_or("")
+                .to_ascii_uppercase()
+        };
+        matches!(
+            name.as_str(),
+            "COMPUTE-DISCRIMINATING-FUNCTION"
+                | "COMPUTE-EFFECTIVE-METHOD"
+                | "COMPUTE-EFFECTIVE-METHOD-FUNCTION"
+                | "METHOD-FUNCTION"
+                | "MAKE-METHOD-LAMBDA"
+                | "GENERIC-FUNCTION-ARGUMENT-PRECEDENCE-ORDER"
+        )
+    }
+
+    fn resolve_function_by_name(&mut self, name: &str) -> Option<NodeId> {
+        let (sym_user, sym_cl) = {
+            let mut syms = self.globals.symbols.write().unwrap();
+            let sym_user = syms.intern_in(name, crate::symbol::PackageId(2));
+            let sym_cl = syms.intern_in(name, crate::symbol::PackageId(1));
+            (sym_user, sym_cl)
+        };
+        self.process
+            .get_function(sym_user)
+            .or_else(|| self.process.get_function(sym_cl))
+    }
+
+    fn compute_discriminating_function(
+        &mut self,
+        gid: crate::clos::GenericId,
+    ) -> Result<NodeId, ControlSignal> {
+        let func_node = self
+            .resolve_function_by_name("COMPUTE-DISCRIMINATING-FUNCTION")
+            .ok_or_else(|| {
+                ControlSignal::Error("Undefined function: COMPUTE-DISCRIMINATING-FUNCTION".into())
+            })?;
+
+        let gf_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Generic(gid.0)));
+        let args_list = self.process.make_list(&[gf_node]);
+
+        let env = Environment::new();
+        let saved_program = self.process.program;
+        let saved_mode = self.process.execution_mode.clone();
+        let saved_env = self.process.current_env.clone();
+        let saved_stack = std::mem::take(&mut self.process.continuation_stack);
+        let saved_pending = self.process.pending_redex;
+        let saved_next_methods = std::mem::take(&mut self.process.next_method_states);
+        let result = self.apply_values(func_node, args_list, &env);
+        self.process.program = saved_program;
+        self.process.execution_mode = saved_mode;
+        self.process.current_env = saved_env;
+        self.process.continuation_stack = saved_stack;
+        self.process.pending_redex = saved_pending;
+        self.process.next_method_states = saved_next_methods;
+        let df = result?;
+
+        match self.process.arena.get_unchecked(df) {
+            Node::Leaf(OpaqueValue::Closure(_))
+            | Node::Leaf(OpaqueValue::Generic(_))
+            | Node::Leaf(OpaqueValue::Symbol(_)) => Ok(df),
+            _ => Err(ControlSignal::Error(
+                "COMPUTE-DISCRIMINATING-FUNCTION did not return a function".into(),
+            )),
         }
     }
 
@@ -3298,6 +3423,15 @@ impl<'a> Interpreter<'a> {
             Node::Leaf(OpaqueValue::Class(_)) => self.process.mop.standard_class,
             Node::Leaf(OpaqueValue::Symbol(_)) => self.process.mop.symbol_class,
             Node::Leaf(OpaqueValue::Integer(_)) => self.process.mop.integer_class,
+            Node::Leaf(OpaqueValue::Generic(_)) => self.process.mop.standard_generic_function,
+            Node::Leaf(OpaqueValue::Method(_)) => self.process.mop.standard_method,
+            Node::Leaf(OpaqueValue::SlotDefinition(_, _, direct)) => {
+                if *direct {
+                    self.process.mop.standard_direct_slot_definition
+                } else {
+                    self.process.mop.standard_effective_slot_definition
+                }
+            }
             _ => {
                 self.process.mop.t_class
             }
@@ -3600,11 +3734,12 @@ impl<'a> Interpreter<'a> {
                 .arena
                 .inner
                 .alloc(Node::Leaf(OpaqueValue::Symbol(progn_sym.0)));
+            let (_decls, body_start) = self.parse_body(body);
             let body_node = self
                 .process
                 .arena
                 .inner
-                .alloc(Node::Fork(progn_sym_node, body));
+                .alloc(Node::Fork(progn_sym_node, body_start));
 
             // Create closure
             let closure = Closure {
@@ -3970,15 +4105,10 @@ impl<'a> Interpreter<'a> {
                     self.step_apply(wrapper_node, next_args, env.clone())?;
 
                     loop {
-                        match self.process.execution_mode {
-                            crate::process::ExecutionMode::Return => {
-                                return Ok(self.process.program);
-                            }
-                            crate::process::ExecutionMode::Eval => {
-                                if !self.step()? {
-                                    // Paused
-                                }
-                            }
+                        match self.step() {
+                            Ok(true) => continue,
+                            Ok(false) => return Ok(self.process.program),
+                            Err(e) => return Err(e),
                         }
                     }
                 } else {
@@ -4026,15 +4156,10 @@ impl<'a> Interpreter<'a> {
                 self.call_method_with_next_methods(method_id, next_methods, call_args, env.clone())?;
 
                 loop {
-                    match self.process.execution_mode {
-                        crate::process::ExecutionMode::Return => {
-                            return Ok(self.process.program);
-                        }
-                        crate::process::ExecutionMode::Eval => {
-                            if !self.step()? {
-                                // Paused
-                            }
-                        }
+                    match self.step() {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(self.process.program),
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -4072,6 +4197,23 @@ impl<'a> Interpreter<'a> {
     pub fn apply_values(&mut self, func: NodeId, args: NodeId, env: &Environment) -> EvalResult {
         let func_node = self.process.arena.get_unchecked(func).clone();
 
+        // If FUNC is a symbol designator, prefer direct primitive/definition dispatch
+        if let Some(sym) = self.node_to_symbol(func) {
+            if let Some(&prim_fn) = self.globals.primitives.get(&sym) {
+                let mut arg_vec = Vec::new();
+                let mut curr = args;
+                while let Node::Fork(h, t) = self.process.arena.inner.get_unchecked(curr).clone() {
+                    arg_vec.push(h);
+                    curr = t;
+                }
+                return prim_fn(self.process, self.globals, &arg_vec);
+            }
+            if let Some(func_node) = self.process.get_function(sym) {
+                // Re-dispatch on resolved function node (closure/generic)
+                return self.apply_values(func_node, args, env);
+            }
+        }
+
         match func_node {
             Node::Leaf(OpaqueValue::Closure(_)) | Node::Leaf(OpaqueValue::Generic(_)) => {
                 let mut arg_vec = Vec::new();
@@ -4082,15 +4224,12 @@ impl<'a> Interpreter<'a> {
                 }
                 self.step_apply(func, arg_vec, env.clone())?;
 
-                // Adapter loop
+                // Drive the evaluator until the continuation stack completes.
                 loop {
-                    match self.process.execution_mode {
-                        crate::process::ExecutionMode::Return => return Ok(self.process.program),
-                        crate::process::ExecutionMode::Eval => {
-                            if !self.step()? {
-                                // Paused
-                            }
-                        }
+                    match self.step() {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(self.process.program),
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -4445,18 +4584,10 @@ impl<'a> Interpreter<'a> {
 
         // 3. Adapter: Run the interpreter loop until return (Simulate synchronous execution)
         loop {
-            match self.process.execution_mode {
-                crate::process::ExecutionMode::Return => {
-                    return Ok(self.process.program);
-                }
-                crate::process::ExecutionMode::Eval => {
-                    // Continue stepping
-                    if !self.step()? {
-                        // If step returns false (pause/interrupt), we might be in trouble here if we expect a result.
-                        // But for now assume it runs to completion.
-                        // Or wait?
-                    }
-                }
+            match self.step() {
+                Ok(true) => continue,
+                Ok(false) => return Ok(self.process.program),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -4619,66 +4750,40 @@ impl<'a> Interpreter<'a> {
 
     /// (defclass name (supers...) (slots...))
     fn eval_defclass(&mut self, args: NodeId, _env: &Environment) -> EvalResult {
-        // Simple parser
+        // Delegate to ENSURE-CLASS primitive to keep CLOS/MOP behavior consistent.
         if let Node::Fork(name_node, rest) = self.process.arena.inner.get_unchecked(args).clone() {
-            if let Some(name_sym) = self.node_to_symbol(name_node) {
-                if let Node::Fork(supers_node, rest2) =
-                    self.process.arena.inner.get_unchecked(rest).clone()
+            if let Node::Fork(supers_node, rest2) =
+                self.process.arena.inner.get_unchecked(rest).clone()
+            {
+                if let Node::Fork(slots_node, _rest3) =
+                    self.process.arena.inner.get_unchecked(rest2).clone()
                 {
-                    let mut supers = Vec::new(); // Collect super classes
-                                                 // Iterate supers_node list
-                    let mut current = supers_node;
-                    while let Node::Fork(super_name, next) =
-                        self.process.arena.inner.get_unchecked(current).clone()
-                    {
-                        if let Some(s_sym) = self.node_to_symbol(super_name) {
-                            if let Some(id) = self.process.mop.find_class(s_sym) {
-                                supers.push(id);
-                            }
-                        }
-                        current = next;
-                    }
+                    let kw_supers = self.ensure_keyword_symbol("DIRECT-SUPERCLASSES");
+                    let kw_slots = self.ensure_keyword_symbol("DIRECT-SLOTS");
+                    let kw_supers_node = self
+                        .process
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Symbol(kw_supers.0)));
+                    let kw_slots_node = self
+                        .process
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Symbol(kw_slots.0)));
 
-                    if let Node::Fork(slots_node, _) =
-                        self.process.arena.inner.get_unchecked(rest2).clone()
-                    {
-                        let mut slots = Vec::new();
-                        let mut current_slot = slots_node;
-                        while let Node::Fork(slot_spec, next) =
-                            self.process.arena.inner.get_unchecked(current_slot).clone()
-                        {
-                            // Slot spec can be symbol or list
-                            let slot_name = if let Some(sym) = self.node_to_symbol(slot_spec) {
-                                sym
-                            } else if let Node::Fork(name, _) =
-                                self.process.arena.inner.get_unchecked(slot_spec).clone()
-                            {
-                                self.node_to_symbol(name).unwrap_or(self.globals.nil_sym)
-                            } else {
-                                self.globals.nil_sym
-                            };
+                    let args_vec = vec![
+                        name_node,
+                        kw_supers_node,
+                        supers_node,
+                        kw_slots_node,
+                        slots_node,
+                    ];
 
-                            if slot_name != self.globals.nil_sym {
-                                slots.push(crate::clos::SlotDefinition {
-                                    name: slot_name,
-                                    initform: None,
-                                    initfunction: None,
-                                    initarg: None, // parsing :initarg etc skipped for brevity
-                                    readers: Vec::new(),
-                                    writers: Vec::new(),
-                                    allocation: crate::clos::SlotAllocation::Instance,
-                                    slot_type: None,
-                                    class_value: None,
-                                    index: slots.len(),
-                                });
-                            }
-
-                            current_slot = next;
-                        }
-
-                        self.process.mop.define_class(name_sym, supers, slots);
-                        return Ok(name_node);
-                    }
+                    return crate::primitives::prim_ensure_class(
+                        self.process,
+                        self.globals,
+                        &args_vec,
+                    );
                 }
             }
         }

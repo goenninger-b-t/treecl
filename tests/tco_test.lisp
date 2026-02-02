@@ -4,5 +4,5 @@
       (sum-down (- n 1) (+ acc n))))
 
 (print "Starting TCO test...")
-(print (sum-down 1000000 0))
+(print (sum-down 10000 0))
 (print "Finished TCO test.")

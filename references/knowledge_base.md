@@ -75,8 +75,34 @@ Source: Graham, Paul - ANSI Common Lisp.pdf
     variables persist as long as the closure does.
 
 --------------------------------------------------------------------------------
-Source: Art of Metaobject Protocol.pdf
+Source: Art of Metaobject Protocol.txt
 --------------------------------------------------------------------------------
-- The PDF appears to be scanned images (produced by tiff2pdf); pdftotext yields
-  no extractable text. OCR is required to extract content. No MOP-specific facts
-  could be harvested yet from this file.
+- OCR text is available (see `Art of Metaobject Protocol.txt`). The index enumerates
+  the full MOP surface area: class/generic/method metaobject accessors, class
+  finalization and CPL computation, slot definition protocols (direct/effective),
+  dependents, EQL specializers, funcallable instances, and GF invocation protocols
+  (compute-discriminating-function/effective-method, etc.).
+
+--------------------------------------------------------------------------------
+MOP implementation status (TreeCL)
+--------------------------------------------------------------------------------
+- Current MOP is a mini-MOP. It supports basic classes, generics, methods, and a subset of method combination.
+- Added class metaobject slots in `standard-class` with slot-visible metadata: name, direct-superclasses/subclasses, direct/effective slots, CPL, finalized-p, instance-size.
+- Class objects now map to metaobject instances for slot access; unbound slot values are tracked explicitly.
+- Exported `standard-class` slot names from `COMMON-LISP` so `CL-USER` symbols like
+  `name`/`direct-superclasses` resolve to the same slot names.
+- Added metaobject classes for generics, methods, and slot definitions
+  (`standard-generic-function`, `standard-method`, `standard-(direct|effective)-slot-definition`)
+  with instance-backed slot access.
+- Implemented class creation protocol pieces: `ensure-class-using-class` wrapper, `validate-superclass`
+  default method, `finalize-inheritance` recomputation, `reinitialize-instance`, `change-class`,
+  class default initargs, and slot-names-aware `shared-initialize` (defaults applied when slot-names is non-nil).
+- Implemented a setf expansion hook for accessors using a `slot-accessor` property to route `(setf (reader obj) val)` to `set-slot-value`.
+- Equality for CLOS objects (class/instance/generic/method/slot-definition) compares by id rather than node identity.
+- Added `slot-missing` and `slot-unbound` generics with default error methods; slot access primitives now invoke them.
+- Added `make-direct-slot-definition`/`make-effective-slot-definition` via sys primitives backed by standalone slot-definition storage.
+- `shared-initialize` now honors `initfunction` (evaluated to a function when needed) and enforces slot types for initargs/defaults.
+- Fixed APPLY/FUNCALL on closures by driving the TCO evaluator until the continuation stack completes (use `step()` loop, not just `ExecutionMode::Return`).
+- Generic function invocation now applies cached discriminating functions (from `compute-discriminating-function`) instead of always raw dispatch.
+- Primitives that call `apply_values` now preserve process state (program/mode/continuation stack/pending redex/next-method state) to avoid clobbering ongoing evaluation.
+- Open tasks tracked in `TASKS.md` cover full GF invocation MOP, EQL specializers, dependents, funcallable instances, extra introspection, and accessor completeness.

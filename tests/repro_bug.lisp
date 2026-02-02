@@ -16,7 +16,9 @@
   (print rest)
   (loop
     (if (and (consp rest) (symbolp (car rest)))
-        (print "Qualifier found")
+        (progn
+          (print "Qualifier found")
+          (setq rest (cdr rest)))
         (return)))
   (print "Loop finished"))
 
