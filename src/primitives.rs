@@ -10,6 +10,7 @@ use crate::symbol::{PackageId, SymbolId};
 use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
 use crate::tree_calculus;
+use crate::clos::GenericName;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
@@ -740,6 +741,18 @@ fn prim_symbol_function(
                 return err_helper(&format!("Undefined function: {:?}", sym_id));
             }
         }
+        if let Some(sym_id) = setf_function_name_from_node(proc, arg) {
+            if let Some(func) = proc.get_setf_function(sym_id) {
+                return Ok(func);
+            }
+            if let Some(gid) = proc.mop.find_setf_generic(sym_id) {
+                return Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Generic(gid.0))));
+            }
+            return err_helper("Undefined SETF function");
+        }
     }
     err_helper("SYMBOL-FUNCTION: invalid argument")
 }
@@ -754,6 +767,12 @@ fn prim_fboundp(
             if proc.get_function(sym_id).is_some()
                 || proc.macros.contains_key(&sym_id)
                 || ctx.primitives.contains_key(&sym_id)
+            {
+                return Ok(proc.make_t(ctx));
+            }
+        } else if let Some(sym_id) = setf_function_name_from_node(proc, arg) {
+            if proc.get_setf_function(sym_id).is_some()
+                || proc.mop.find_setf_generic(sym_id).is_some()
             {
                 return Ok(proc.make_t(ctx));
             }
@@ -772,6 +791,9 @@ fn prim_fmakunbound(
             if let Some(binding) = proc.dictionary.get_mut(&sym_id) {
                 binding.function = None;
             }
+            return Ok(arg);
+        } else if let Some(sym_id) = setf_function_name_from_node(proc, arg) {
+            proc.clear_setf_function(sym_id);
             return Ok(arg);
         }
     }
@@ -3167,6 +3189,19 @@ fn list_to_vec(proc: &Process, list: NodeId) -> Vec<NodeId> {
     vec
 }
 
+fn setf_function_name_from_node(proc: &Process, node: NodeId) -> Option<SymbolId> {
+    if let Node::Fork(car, rest) = proc.arena.inner.get_unchecked(node).clone() {
+        if let Some(sym) = node_to_symbol(proc, car) {
+            if sym == proc.mop.setf_symbol {
+                if let Node::Fork(target, _) = proc.arena.inner.get_unchecked(rest).clone() {
+                    return node_to_symbol(proc, target);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn class_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::ClassId> {
     match proc.arena.inner.get_unchecked(node) {
         Node::Leaf(OpaqueValue::Class(id)) => Some(crate::clos::ClassId(*id)),
@@ -3264,7 +3299,7 @@ fn generic_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::Gen
     match proc.arena.inner.get_unchecked(node) {
         Node::Leaf(OpaqueValue::Generic(id)) => Some(crate::clos::GenericId(*id)),
         Node::Leaf(OpaqueValue::Symbol(id)) => proc.mop.find_generic(SymbolId(*id)),
-        _ => None,
+        _ => setf_function_name_from_node(proc, node).and_then(|sym| proc.mop.find_setf_generic(sym)),
     }
 }
 
@@ -3368,6 +3403,56 @@ fn make_method_list(proc: &mut Process, method_ids: &[crate::clos::MethodId]) ->
         );
     }
     proc.make_list(&nodes)
+}
+
+fn generic_name_to_node(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    name: GenericName,
+) -> NodeId {
+    match name {
+        GenericName::Symbol(sym) => proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))),
+        GenericName::Setf(sym) => {
+            let setf_sym = cl_symbol_id(ctx, "SETF");
+            let setf_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(setf_sym.0)));
+            let base_node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)));
+            proc.make_list(&[setf_node, base_node])
+        }
+    }
+}
+
+fn generic_name_to_string(
+    ctx: &crate::context::GlobalContext,
+    name: GenericName,
+) -> String {
+    match name {
+        GenericName::Symbol(sym) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(sym)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        GenericName::Setf(sym) => {
+            let base = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            format!("(SETF {})", base)
+        }
+    }
 }
 
 fn make_initargs_plist(proc: &mut Process, pairs: &[(SymbolId, NodeId)]) -> NodeId {
@@ -3985,10 +4070,7 @@ fn sync_generic_metaobject(
 
     let slot_map = slot_map_for_class(proc, proc.mop.standard_generic_function)?;
 
-    let name_node = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Symbol(gf_name.0)));
+    let name_node = generic_name_to_node(proc, ctx, gf_name);
     let lambda_list = make_symbol_list(proc, &gf_lambda_list);
     let methods = make_method_list(proc, &gf_methods);
     let method_combination = {
@@ -4590,13 +4672,11 @@ fn define_slot_accessors(
     let quote_sym = syms.intern_in("QUOTE", cl_pkg);
     let obj_sym = syms.intern_in("OBJ", cl_pkg);
     let val_sym = syms.intern_in("VALUE", cl_pkg);
-    let slot_accessor_sym = syms.intern_in("SLOT-ACCESSOR", cl_pkg);
     syms.export_symbol(slot_value_sym);
     syms.export_symbol(set_slot_value_sym);
     syms.export_symbol(quote_sym);
     syms.export_symbol(obj_sym);
     syms.export_symbol(val_sym);
-    syms.export_symbol(slot_accessor_sym);
     drop(syms);
 
     let slot_value_node = proc
@@ -4619,11 +4699,6 @@ fn define_slot_accessors(
         .arena
         .inner
         .alloc(Node::Leaf(OpaqueValue::Symbol(val_sym.0)));
-
-    let accessor_indicator_node = proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::Symbol(slot_accessor_sym.0)));
 
     let kw_add_method = ctx
         .symbols
@@ -4686,18 +4761,62 @@ fn define_slot_accessors(
             )?;
         }
 
-        // Writers (skip if name is also a reader; those are treated as accessors)
+        // Writers (if also reader, use setf generic for accessor)
         for &writer in &slot.writers {
             if slot.readers.contains(&writer) {
-                let sym_node = proc
+                let gf_id = proc.mop.define_setf_generic_with_options(
+                    writer,
+                    vec![val_sym, obj_sym],
+                    Vec::new(),
+                    None,
+                );
+                let gf_node = proc
                     .arena
                     .inner
-                    .alloc(Node::Leaf(OpaqueValue::Symbol(writer.0)));
-                let _ = prim_put(
+                    .alloc(Node::Leaf(OpaqueValue::Generic(gf_id.0)));
+                proc.set_setf_function(writer, gf_node);
+
+                let body = proc.make_list(&[
+                    set_slot_value_node,
+                    obj_node,
+                    quoted_slot,
+                    val_node,
+                ]);
+                let mut lambda_list = ParsedLambdaList::default();
+                lambda_list.req = vec![val_node, obj_node];
+                let closure = Closure {
+                    lambda_list,
+                    destructuring: None,
+                    body,
+                    env: Environment::new(),
+                };
+                let closure_idx = proc.closures.len();
+                proc.closures.push(closure);
+                let closure_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Closure(closure_idx as u32)));
+
+                let method_id = proc.mop.add_method(
+                    gf_id,
+                    vec![
+                        crate::clos::Specializer::Class(proc.mop.t_class),
+                        crate::clos::Specializer::Class(class_id),
+                    ],
+                    Vec::new(),
+                    vec![val_sym, obj_sym],
+                    closure_node,
+                );
+                let method_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Method(method_id.0)));
+                notify_dependents(
                     proc,
                     ctx,
-                    &[sym_node, accessor_indicator_node, slot_sym_node],
-                );
+                    DependentKey::Generic(gf_id),
+                    &[kw_add_method_node, method_node],
+                )?;
                 continue;
             }
 
@@ -4904,10 +5023,20 @@ fn prim_ensure_generic_function(
         ));
     }
     let name_node = args[0];
-    let name = node_to_symbol(proc, name_node).ok_or(crate::eval::ControlSignal::Error(
-        "Generic name != symbol".to_string(),
-    ))?;
-    let generic_existed = proc.mop.find_generic(name).is_some();
+    let (name, is_setf) = if let Some(sym) = node_to_symbol(proc, name_node) {
+        (sym, false)
+    } else if let Some(sym) = setf_function_name_from_node(proc, name_node) {
+        (sym, true)
+    } else {
+        return Err(crate::eval::ControlSignal::Error(
+            "Generic name must be a symbol or (setf <symbol>)".to_string(),
+        ));
+    };
+    let generic_existed = if is_setf {
+        proc.mop.find_setf_generic(name).is_some()
+    } else {
+        proc.mop.find_generic(name).is_some()
+    };
 
     let kwargs = parse_keywords_list(proc, &args[1..]);
 
@@ -5029,12 +5158,21 @@ fn prim_ensure_generic_function(
         }
     }
 
-    let gid = proc.mop.define_generic_with_options(
-        name,
-        lambda_list,
-        required_parameters,
-        argument_precedence_order,
-    );
+    let gid = if is_setf {
+        proc.mop.define_setf_generic_with_options(
+            name,
+            lambda_list,
+            required_parameters,
+            argument_precedence_order,
+        )
+    } else {
+        proc.mop.define_generic_with_options(
+            name,
+            lambda_list,
+            required_parameters,
+            argument_precedence_order,
+        )
+    };
     if let Some(mc_node) = method_combination_node {
         let mut comb_args = proc.make_nil();
         let comb_sym = if let Some(sym) = node_to_symbol(proc, mc_node) {
@@ -5099,7 +5237,11 @@ fn prim_ensure_generic_function(
         .alloc(Node::Leaf(OpaqueValue::Generic(gid.0)));
 
     // Bind to function name in process
-    proc.set_function(name, gf_node);
+    if is_setf {
+        proc.set_setf_function(name, gf_node);
+    } else {
+        proc.set_function(name, gf_node);
+    }
 
     if generic_existed {
         notify_dependents(proc, ctx, DependentKey::Generic(gid), &args[1..])?;
@@ -5169,6 +5311,7 @@ fn prim_ensure_method(
 
     let gf_node = args[0];
     let mut gf_name: Option<SymbolId> = None;
+    let mut gf_setf_name: Option<SymbolId> = None;
     let gf_id = match proc.arena.inner.get_unchecked(gf_node) {
         Node::Leaf(OpaqueValue::Generic(id)) => GenericId(*id),
         Node::Leaf(OpaqueValue::Symbol(id)) => {
@@ -5181,9 +5324,18 @@ fn prim_ensure_method(
             }
         }
         _ => {
-            return Err(crate::eval::ControlSignal::Error(
-                "Invalid GF spec".to_string(),
-            ))
+            if let Some(sym) = setf_function_name_from_node(proc, gf_node) {
+                gf_setf_name = Some(sym);
+                if let Some(gid) = proc.mop.find_setf_generic(sym) {
+                    gid
+                } else {
+                    proc.mop.define_setf_generic_with_options(sym, Vec::new(), Vec::new(), None)
+                }
+            } else {
+                return Err(crate::eval::ControlSignal::Error(
+                    "Invalid GF spec".to_string(),
+                ));
+            }
         }
     };
 
@@ -5245,6 +5397,13 @@ fn prim_ensure_method(
             .inner
             .alloc(Node::Leaf(OpaqueValue::Generic(gf_id.0)));
         proc.set_function(name, gf_node);
+    }
+    if let Some(name) = gf_setf_name {
+        let gf_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Generic(gf_id.0)));
+        proc.set_setf_function(name, gf_node);
     }
 
     let method_node = proc
@@ -5715,10 +5874,7 @@ fn prim_generic_function_name(
     }
     if let Some(gid) = generic_id_from_node(proc, args[0]) {
         if let Some(gf) = proc.mop.get_generic(gid) {
-            return Ok(proc
-                .arena
-                .inner
-                .alloc(Node::Leaf(OpaqueValue::Symbol(gf.name.0))));
+            return Ok(generic_name_to_node(proc, _ctx, gf.name));
         }
     }
     Ok(proc.make_nil())
@@ -5844,13 +6000,7 @@ fn prim_sys_dispatch_generic(
         let gf_name = proc
             .mop
             .get_generic(gid)
-            .and_then(|g| {
-                ctx.symbols
-                    .read()
-                    .unwrap()
-                    .symbol_name(g.name)
-                    .map(|s| s.to_string())
-            })
+            .map(|g| generic_name_to_string(ctx, g.name))
             .unwrap_or_else(|| "?".to_string());
         return Err(ControlSignal::Error(format!(
             "No applicable method for generic function {} {:?} with args {:?}",
@@ -9009,6 +9159,9 @@ fn prim_set_symbol_function(
 
     if let Some(sym_id) = node_to_symbol(proc, sym_node) {
         proc.set_function(sym_id, func_node);
+        Ok(func_node)
+    } else if let Some(sym_id) = setf_function_name_from_node(proc, sym_node) {
+        proc.set_setf_function(sym_id, func_node);
         Ok(func_node)
     } else {
         err_helper("SET-SYMBOL-FUNCTION: first argument must be a symbol")

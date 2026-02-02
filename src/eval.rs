@@ -1466,6 +1466,34 @@ impl<'a> Interpreter<'a> {
             return Ok(true);
         }
 
+        // (setf name) case: resolve setf function binding or generic
+        let node = self.process.arena.get_unchecked(target).clone();
+        if let Node::Fork(head, tail) = node {
+            if let Some(s) = self.node_to_symbol(head) {
+                if s == self.process.mop.setf_symbol {
+                    if let Node::Fork(base_node, _) =
+                        self.process.arena.get_unchecked(tail).clone()
+                    {
+                        if let Some(base_sym) = self.node_to_symbol(base_node) {
+                            if let Some(func_node) = self.process.get_setf_function(base_sym) {
+                                self.process.program = func_node;
+                                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                                return Ok(true);
+                            }
+                            if let Some(gid) = self.process.mop.find_setf_generic(base_sym) {
+                                let gf_node = self.process.arena.inner.alloc(Node::Leaf(
+                                    crate::types::OpaqueValue::Generic(gid.0),
+                                ));
+                                self.process.program = gf_node;
+                                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Lambda case: (lambda args body)
         // Check if head is lambda
         let node = self.process.arena.get_unchecked(target).clone();
@@ -2931,13 +2959,26 @@ impl<'a> Interpreter<'a> {
                 .process
                 .mop
                 .get_generic(gid)
-                .and_then(|g| {
-                    self.globals
+                .map(|g| match g.name {
+                    crate::clos::GenericName::Symbol(sym) => self
+                        .globals
                         .symbols
                         .read()
                         .unwrap()
-                        .symbol_name(g.name)
+                        .symbol_name(sym)
                         .map(|s| s.to_string())
+                        .unwrap_or_else(|| "?".to_string()),
+                    crate::clos::GenericName::Setf(sym) => {
+                        let base = self
+                            .globals
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(sym)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        format!("(SETF {})", base)
+                    }
                 })
                 .unwrap_or_else(|| "?".to_string());
             return Err(ControlSignal::Error(format!(
@@ -3203,11 +3244,14 @@ impl<'a> Interpreter<'a> {
             Some(gf) => gf,
             None => return false,
         };
-        let name = {
-            let syms = self.globals.symbols.read().unwrap();
-            syms.symbol_name(gf.name)
-                .unwrap_or("")
-                .to_ascii_uppercase()
+        let name = match gf.name {
+            crate::clos::GenericName::Symbol(sym) => {
+                let syms = self.globals.symbols.read().unwrap();
+                syms.symbol_name(sym)
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+            }
+            crate::clos::GenericName::Setf(_) => return false,
         };
         matches!(
             name.as_str(),
@@ -3812,6 +3856,27 @@ impl<'a> Interpreter<'a> {
             if let Some(sym) = self.node_to_symbol(name) {
                 if let Some(func) = self.process.get_function(sym) {
                     return Ok(func);
+                }
+            } else if let Node::Fork(car, rest) = self.process.arena.get_unchecked(name).clone() {
+                if let Some(sym) = self.node_to_symbol(car) {
+                    if sym == self.process.mop.setf_symbol {
+                        if let Node::Fork(target, _) =
+                            self.process.arena.get_unchecked(rest).clone()
+                        {
+                            if let Some(base_sym) = self.node_to_symbol(target) {
+                                if let Some(func) = self.process.get_setf_function(base_sym) {
+                                    return Ok(func);
+                                }
+                                if let Some(gid) =
+                                    self.process.mop.find_setf_generic(base_sym)
+                                {
+                                    return Ok(self.process.arena.inner.alloc(Node::Leaf(
+                                        OpaqueValue::Generic(gid.0),
+                                    )));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

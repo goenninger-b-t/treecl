@@ -142,6 +142,8 @@ pub struct Process {
 
     /// Global Functions (SymbolId -> Closure Index)
     pub functions: HashMap<SymbolId, usize>,
+    /// SETF Functions (SymbolId -> Function Node)
+    pub setf_functions: HashMap<SymbolId, NodeId>,
 
     /// Condition System State
     pub conditions: crate::conditions::ConditionSystem,
@@ -224,6 +226,7 @@ impl Process {
             closures,
             macros: HashMap::new(), // Initialize macros
             functions: HashMap::new(),
+            setf_functions: HashMap::new(),
             conditions,
             arrays,
             readtable,
@@ -325,6 +328,11 @@ impl Process {
                     self.mark_node(root, &mut marked);
                 }
             }
+        }
+
+        // Mark SETF Functions
+        for &func in self.setf_functions.values() {
+            self.mark_node(func, &mut marked);
         }
 
         // Mark Next Method States
@@ -442,6 +450,18 @@ impl Process {
 
     pub fn set_function(&mut self, sym: SymbolId, func: NodeId) {
         self.dictionary.entry(sym).or_default().function = Some(func);
+    }
+
+    pub fn get_setf_function(&self, sym: SymbolId) -> Option<NodeId> {
+        self.setf_functions.get(&sym).copied()
+    }
+
+    pub fn set_setf_function(&mut self, sym: SymbolId, func: NodeId) {
+        self.setf_functions.insert(sym, func);
+    }
+
+    pub fn clear_setf_function(&mut self, sym: SymbolId) {
+        self.setf_functions.remove(&sym);
     }
 
     pub fn unbind_value(&mut self, sym: SymbolId) {

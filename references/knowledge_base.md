@@ -97,7 +97,8 @@ MOP implementation status (TreeCL)
 - Implemented class creation protocol pieces: `ensure-class-using-class` wrapper, `validate-superclass`
   default method, `finalize-inheritance` recomputation, `reinitialize-instance`, `change-class`,
   class default initargs, and slot-names-aware `shared-initialize` (defaults applied when slot-names is non-nil).
-- Implemented a setf expansion hook for accessors using a `slot-accessor` property to route `(setf (reader obj) val)` to `set-slot-value`.
+- Implemented canonical `(setf <reader>)` generic functions for `:accessor` slots and setf function-name handling, so `(setf (reader obj) val)` routes through the setf generic (no slot-accessor property needed).
+- The `function` special operator now resolves `(setf <symbol>)` names to setf generics/functions, so setf expansions invoke the proper generic (including :before/:after methods).
 - Equality for CLOS objects (class/instance/generic/method/slot-definition) compares by id rather than node identity.
 - Added `slot-missing` and `slot-unbound` generics with default error methods; slot access primitives now invoke them.
 - Added `make-direct-slot-definition`/`make-effective-slot-definition` via sys primitives backed by standalone slot-definition storage.
@@ -109,4 +110,4 @@ MOP implementation status (TreeCL)
 - Added dependents protocol support: `add-dependent`, `remove-dependent`, `map-dependents`, and `update-dependent` generics backed by MOP storage, with update notifications on class/generic redefinition and method addition.
 - Added funcallable instances: `funcallable-standard-class`/`funcallable-standard-object`, `set-funcallable-instance-function` (generic + funcallable instances), and `funcallable-standard-instance-access`.
 - Added introspection extras: `class-direct-methods`, `class-direct-generic-functions`, `specializer-direct-methods`, and `specializer-direct-generic-functions`.
-- Open tasks tracked in `TASKS.md` cover accessor completeness.
+- Accessor/setf completeness is now covered by Task 10 in `TASKS.md` (done).

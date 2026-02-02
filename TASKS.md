@@ -39,6 +39,6 @@ This file tracks MOP work items across conversations.
 - Goal: `class-direct-methods`, `class-direct-generic-functions`, `specializer-direct-methods`, `specializer-direct-generic-functions`.
 - Tests: `tests/mop_introspection_extras_test.lisp`
 
-## Task 10 — Accessor/setf completeness
+## Task 10 — Accessor/setf completeness (DONE)
 - Goal: proper `(setf <reader>)` generic functions for `:accessor`, full accessor method semantics.
-- Tests: to add when task starts.
+- Tests: `tests/mop_accessor_setf_test.lisp`

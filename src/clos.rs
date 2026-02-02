@@ -73,7 +73,7 @@ pub struct SlotDefinition {
 /// A generic function
 #[derive(Debug, Clone)]
 pub struct GenericFunction {
-    pub name: SymbolId,
+    pub name: GenericName,
     pub lambda_list: Vec<SymbolId>,
     pub required_parameters: Vec<SymbolId>,
     pub argument_precedence_order: Option<Vec<SymbolId>>,
@@ -81,6 +81,25 @@ pub struct GenericFunction {
     pub method_cache: HashMap<Vec<ClassId>, NodeId>,
     pub methods: Vec<MethodId>,
     pub method_combination: MethodCombination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenericName {
+    Symbol(SymbolId),
+    Setf(SymbolId),
+}
+
+impl GenericName {
+    pub fn base_symbol(self) -> SymbolId {
+        match self {
+            GenericName::Symbol(sym) => sym,
+            GenericName::Setf(sym) => sym,
+        }
+    }
+
+    pub fn is_setf(self) -> bool {
+        matches!(self, GenericName::Setf(_))
+    }
 }
 
 /// A method
@@ -180,6 +199,10 @@ pub struct MetaObjectProtocol {
     generics: Vec<GenericFunction>,
     /// Generic name -> GenericId
     generic_names: HashMap<SymbolId, GenericId>,
+    /// Setf generic name -> GenericId
+    setf_generic_names: HashMap<SymbolId, GenericId>,
+    /// Symbol ID for SETF
+    pub setf_symbol: SymbolId,
     /// All methods
     methods: Vec<Method>,
     /// GenericId -> metaobject instance index
@@ -268,6 +291,8 @@ impl MetaObjectProtocol {
             integer_class: ClassId(4),
             generics: Vec::new(),
             generic_names: HashMap::new(),
+            setf_generic_names: HashMap::new(),
+            setf_symbol: SymbolId(0),
             methods: Vec::new(),
             generic_meta_instances: HashMap::new(),
             method_meta_instances: HashMap::new(),
@@ -284,6 +309,10 @@ impl MetaObjectProtocol {
 
         // Bootstrap the class hierarchy
         let cl = PackageId(1);
+
+        // SETF symbol (for setf function names)
+        mop.setf_symbol = symbols.intern_in("SETF", cl);
+        symbols.export_symbol(mop.setf_symbol);
 
         // T class (root)
         let t_name = symbols.intern_in("T", cl);
@@ -1139,7 +1168,7 @@ impl MetaObjectProtocol {
         let id = GenericId(self.generics.len() as u32);
 
         self.generics.push(GenericFunction {
-            name,
+            name: GenericName::Symbol(name),
             lambda_list,
             required_parameters,
             argument_precedence_order,
@@ -1153,9 +1182,50 @@ impl MetaObjectProtocol {
         id
     }
 
+    /// Define a setf generic function with lambda-list metadata.
+    pub fn define_setf_generic_with_options(
+        &mut self,
+        name: SymbolId,
+        lambda_list: Vec<SymbolId>,
+        required_parameters: Vec<SymbolId>,
+        argument_precedence_order: Option<Vec<SymbolId>>,
+    ) -> GenericId {
+        if let Some(&id) = self.setf_generic_names.get(&name) {
+            if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+                gf.lambda_list = lambda_list;
+                gf.required_parameters = required_parameters;
+                gf.argument_precedence_order = argument_precedence_order;
+                gf.discriminating_function = None;
+                gf.method_cache.clear();
+            }
+            return id;
+        }
+
+        let id = GenericId(self.generics.len() as u32);
+
+        self.generics.push(GenericFunction {
+            name: GenericName::Setf(name),
+            lambda_list,
+            required_parameters,
+            argument_precedence_order,
+            discriminating_function: None,
+            method_cache: HashMap::new(),
+            methods: Vec::new(),
+            method_combination: MethodCombination::Standard,
+        });
+
+        self.setf_generic_names.insert(name, id);
+        id
+    }
+
     /// Find generic function by name
     pub fn find_generic(&self, name: SymbolId) -> Option<GenericId> {
         self.generic_names.get(&name).copied()
+    }
+
+    /// Find setf generic function by name
+    pub fn find_setf_generic(&self, name: SymbolId) -> Option<GenericId> {
+        self.setf_generic_names.get(&name).copied()
     }
 
     /// Get generic function by ID
