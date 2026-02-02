@@ -264,6 +264,9 @@
 (defmacro trace (&rest specs)
   `(format t "TRACE not implemented~%"))
 
+(defmacro time (form)
+  `(sys-time-eval (lambda () ,form)))
+
 (defmacro let* (bindings &rest body)
   (if (null bindings)
       `(progn ,@body)

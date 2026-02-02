@@ -11,6 +11,7 @@ use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
 use crate::tree_calculus;
 use crate::clos::GenericName;
+use libc;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
@@ -375,6 +376,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("WRITE-STRING", cl, prim_write_string);
     globals.register_primitive("WRITE-CHAR", cl, prim_write_char);
     globals.register_primitive("FRESH-LINE", cl, prim_fresh_line);
+    globals.register_primitive("SYS-TIME-EVAL", cl, prim_sys_time_eval);
 
     // Concurrency
     globals.register_primitive("SPAWN", cl, prim_spawn);
@@ -2593,6 +2595,52 @@ fn prim_format(
         let _ = proc.streams.write_string(out_id, &result);
         Ok(proc.make_nil())
     }
+}
+
+fn get_rusage_times() -> (f64, f64) {
+    unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return (0.0, 0.0);
+        }
+        let user = usage.ru_utime.tv_sec as f64
+            + (usage.ru_utime.tv_usec as f64 / 1_000_000.0);
+        let sys = usage.ru_stime.tv_sec as f64
+            + (usage.ru_stime.tv_usec as f64 / 1_000_000.0);
+        (user, sys)
+    }
+}
+
+fn prim_sys_time_eval(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("SYS-TIME-EVAL requires one argument (thunk)");
+    }
+
+    let thunk = args[0];
+    let start_real = std::time::Instant::now();
+    let (start_user, start_sys) = get_rusage_times();
+
+    let result = call_function_node(proc, ctx, thunk, &[])?;
+
+    let real = start_real.elapsed().as_secs_f64();
+    let (end_user, end_sys) = get_rusage_times();
+    let user = (end_user - start_user).max(0.0);
+    let sys = (end_sys - start_sys).max(0.0);
+    let total = user + sys;
+    let cpu = if real > 0.0 { (total / real) * 100.0 } else { 0.0 };
+
+    let output = format!(
+        "Evaluation time:\n  {:.3} seconds of real time\n  {:.6} seconds of total run time ({:.6} user, {:.6} system)\n  {:.2}% CPU\n",
+        real, total, user, sys, cpu
+    );
+    let out_id = get_current_output_stream(proc, ctx);
+    let _ = proc.streams.write_string(out_id, &output);
+
+    Ok(result)
 }
 
 // ============================================================================
