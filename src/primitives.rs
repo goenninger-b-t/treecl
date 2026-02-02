@@ -149,6 +149,21 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
         cl,
         prim_ensure_generic_function_using_class,
     );
+    globals.register_primitive(
+        "SET-FUNCALLABLE-INSTANCE-FUNCTION",
+        cl,
+        prim_set_funcallable_instance_function,
+    );
+    globals.register_primitive(
+        "FUNCALLABLE-STANDARD-INSTANCE-ACCESS",
+        cl,
+        prim_funcallable_standard_instance_access,
+    );
+    globals.register_primitive(
+        "SET-FUNCALLABLE-STANDARD-INSTANCE-ACCESS",
+        cl,
+        prim_set_funcallable_standard_instance_access,
+    );
     globals.register_primitive("ENSURE-METHOD", cl, prim_ensure_method);
     globals.register_primitive(
         "REGISTER-METHOD-COMBINATION",
@@ -3500,6 +3515,29 @@ fn resolve_function_designator(
     }
 }
 
+fn resolve_funcallable_designator(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    func: NodeId,
+) -> Result<NodeId, ControlSignal> {
+    match proc.arena.inner.get_unchecked(func) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            let sym = SymbolId(*id);
+            if proc.get_function(sym).is_some() || ctx.primitives.contains_key(&sym) {
+                Ok(func)
+            } else {
+                Err(ControlSignal::Error(
+                    "Funcallable function symbol is not fbound".to_string(),
+                ))
+            }
+        }
+        Node::Leaf(OpaqueValue::Closure(_))
+        | Node::Leaf(OpaqueValue::Generic(_))
+        | Node::Leaf(OpaqueValue::Instance(_)) => Ok(func),
+        _ => resolve_function_designator(proc, ctx, func),
+    }
+}
+
 fn call_function_node(
     proc: &mut Process,
     ctx: &crate::context::GlobalContext,
@@ -4739,6 +4777,15 @@ pub(crate) fn prim_ensure_class(
     if let Some(k) = kw_metaclass {
         if let Some(&meta_node) = kwargs.get(&k) {
             metaclass = class_id_from_node(proc, meta_node);
+        }
+    }
+
+    if let Some(meta_id) = metaclass {
+        if meta_id == proc.mop.funcallable_standard_class
+            && (supers.is_empty()
+                || (supers.len() == 1 && supers[0] == proc.mop.standard_object))
+        {
+            supers = vec![proc.mop.funcallable_standard_object];
         }
     }
 
@@ -6837,6 +6884,125 @@ fn prim_reinitialize_instance(
         shared_args.extend_from_slice(&args[1..]);
     }
     prim_shared_initialize(proc, ctx, &shared_args)
+}
+
+fn prim_set_funcallable_instance_function(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return Err(ControlSignal::Error(
+            "SET-FUNCALLABLE-INSTANCE-FUNCTION requires instance and function".to_string(),
+        ));
+    }
+
+    let func_node = resolve_funcallable_designator(proc, ctx, args[1])?;
+
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Generic(id)) => {
+            let gid = crate::clos::GenericId(*id);
+            proc.mop.set_generic_discriminating_function(gid, func_node);
+            Ok(func_node)
+        }
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            let sym = SymbolId(*id);
+            if let Some(gid) = proc.mop.find_generic(sym) {
+                proc.mop.set_generic_discriminating_function(gid, func_node);
+                return Ok(func_node);
+            }
+            Err(ControlSignal::Error(
+                "SET-FUNCALLABLE-INSTANCE-FUNCTION requires a funcallable instance or generic".to_string(),
+            ))
+        }
+        Node::Leaf(OpaqueValue::Instance(idx)) => {
+            let inst_idx = *idx as usize;
+            let class_id = proc
+                .mop
+                .get_instance(inst_idx)
+                .map(|i| i.class)
+                .unwrap_or(proc.mop.standard_object);
+            if !proc.mop.class_is_funcallable(class_id) {
+                return Err(ControlSignal::Error(
+                    "SET-FUNCALLABLE-INSTANCE-FUNCTION on non-funcallable instance".to_string(),
+                ));
+            }
+            proc.mop.set_instance_function(inst_idx, func_node);
+            Ok(func_node)
+        }
+        _ => Err(ControlSignal::Error(
+            "SET-FUNCALLABLE-INSTANCE-FUNCTION requires a funcallable instance or generic".to_string(),
+        )),
+    }
+}
+
+fn prim_funcallable_standard_instance_access(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(ControlSignal::Error(
+            "FUNCALLABLE-STANDARD-INSTANCE-ACCESS requires instance, index, and optional value"
+                .to_string(),
+        ));
+    }
+
+    let inst_idx = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Instance(idx)) => *idx as usize,
+        _ => {
+            return Err(ControlSignal::Error(
+                "FUNCALLABLE-STANDARD-INSTANCE-ACCESS requires an instance".to_string(),
+            ))
+        }
+    };
+
+    let class_id = proc
+        .mop
+        .get_instance(inst_idx)
+        .map(|i| i.class)
+        .unwrap_or(proc.mop.standard_object);
+    if !proc.mop.class_is_funcallable(class_id) {
+        return Err(ControlSignal::Error(
+            "FUNCALLABLE-STANDARD-INSTANCE-ACCESS on non-funcallable instance".to_string(),
+        ));
+    }
+
+    let idx_val = extract_number(&proc.arena.inner, args[1]);
+    let idx = match idx_val {
+        NumVal::Int(n) if n >= 0 => n as usize,
+        NumVal::Big(n) => n.to_usize().ok_or_else(|| {
+            ControlSignal::Error("FUNCALLABLE-STANDARD-INSTANCE-ACCESS index out of range".into())
+        })?,
+        _ => {
+            return Err(ControlSignal::Error(
+                "FUNCALLABLE-STANDARD-INSTANCE-ACCESS index must be integer".to_string(),
+            ))
+        }
+    };
+
+    if args.len() == 2 {
+        proc.mop
+            .slot_value(inst_idx, idx)
+            .ok_or_else(|| ControlSignal::Error("Slot index out of bounds".into()))
+    } else {
+        let value = args[2];
+        proc.mop.set_slot_value(inst_idx, idx, value);
+        Ok(value)
+    }
+}
+
+fn prim_set_funcallable_standard_instance_access(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return Err(ControlSignal::Error(
+            "SET-FUNCALLABLE-STANDARD-INSTANCE-ACCESS requires instance, index, value".to_string(),
+        ));
+    }
+    prim_funcallable_standard_instance_access(proc, ctx, args)
 }
 
 fn prim_sys_add_dependent(

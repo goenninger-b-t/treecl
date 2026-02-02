@@ -226,6 +226,7 @@
 (defsetf cdr rplacd)
 ;; (defsetf aref set-aref)
 (defsetf slot-value set-slot-value)
+(defsetf funcallable-standard-instance-access set-funcallable-standard-instance-access)
 (defsetf symbol-value set)
 ;; (defsetf symbol-function (sym) (store)
 ;;   `(set-symbol-function ,sym ,store))

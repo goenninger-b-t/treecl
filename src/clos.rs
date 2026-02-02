@@ -145,6 +145,7 @@ pub enum WrapperKind {
 pub struct Instance {
     pub class: ClassId,
     pub slots: Vec<NodeId>,
+    pub funcallable_function: Option<NodeId>,
 }
 
 /// State for call-next-method
@@ -166,6 +167,8 @@ pub struct MetaObjectProtocol {
     pub t_class: ClassId,
     pub standard_object: ClassId,
     pub standard_class: ClassId,
+    pub funcallable_standard_class: ClassId,
+    pub funcallable_standard_object: ClassId,
     pub standard_generic_function: ClassId,
     pub standard_method: ClassId,
     pub standard_direct_slot_definition: ClassId,
@@ -254,6 +257,8 @@ impl MetaObjectProtocol {
             t_class: ClassId(0),
             standard_object: ClassId(1),
             standard_class: ClassId(2),
+            funcallable_standard_class: ClassId(0),
+            funcallable_standard_object: ClassId(0),
             standard_generic_function: ClassId(0),
             standard_method: ClassId(0),
             standard_direct_slot_definition: ClassId(0),
@@ -471,6 +476,24 @@ impl MetaObjectProtocol {
 
         let _ = mop.define_class(sc_name, vec![mop.standard_object], sc_slots);
 
+        // FUNCALLABLE-STANDARD-CLASS
+        let fsc_name = symbols.intern_in("FUNCALLABLE-STANDARD-CLASS", cl);
+        symbols.export_symbol(fsc_name);
+        let fsc_id = mop.define_class(fsc_name, vec![mop.standard_class], Vec::new());
+        mop.funcallable_standard_class = fsc_id;
+
+        // FUNCALLABLE-STANDARD-OBJECT
+        let fso_name = symbols.intern_in("FUNCALLABLE-STANDARD-OBJECT", cl);
+        symbols.export_symbol(fso_name);
+        let fso_id = mop.define_class_with_meta(
+            fso_name,
+            vec![mop.standard_object],
+            Vec::new(),
+            Some(fsc_id),
+            Vec::new(),
+        );
+        mop.funcallable_standard_object = fso_id;
+
         // STANDARD-GENERIC-FUNCTION
         let sgf_name = symbols.intern_in("STANDARD-GENERIC-FUNCTION", cl);
         symbols.export_symbol(sgf_name);
@@ -506,7 +529,13 @@ impl MetaObjectProtocol {
         push_sgf_slot(k_methods, kw_methods, 2);
         push_sgf_slot(k_method_combination, kw_method_combination, 3);
         push_sgf_slot(k_arg_precedence, kw_arg_precedence, 4);
-        let sgf_id = mop.define_class(sgf_name, vec![mop.standard_object], sgf_slots);
+        let sgf_id = mop.define_class_with_meta(
+            sgf_name,
+            vec![mop.funcallable_standard_object],
+            sgf_slots,
+            Some(mop.funcallable_standard_class),
+            Vec::new(),
+        );
         mop.standard_generic_function = sgf_id;
 
         // STANDARD-METHOD
@@ -631,12 +660,6 @@ impl MetaObjectProtocol {
         let existing_id = self.class_names.get(&name).copied();
         let id = existing_id.unwrap_or_else(|| ClassId(self.classes.len() as u32));
 
-        let supers = if supers.is_empty() {
-            vec![self.standard_object]
-        } else {
-            supers
-        };
-        let supers_clone = supers.clone();
         let metaclass = metaclass
             .or_else(|| {
                 existing_id.and_then(|eid| {
@@ -646,6 +669,20 @@ impl MetaObjectProtocol {
                 })
             })
             .unwrap_or(self.standard_class);
+
+        let supers = if supers.is_empty() {
+            if self.funcallable_standard_class.0 != 0
+                && metaclass == self.funcallable_standard_class
+                && self.funcallable_standard_object.0 != 0
+            {
+                vec![self.funcallable_standard_object]
+            } else {
+                vec![self.standard_object]
+            }
+        } else {
+            supers
+        };
+        let supers_clone = supers.clone();
 
         // Track old supers for subclass list maintenance.
         let old_supers = existing_id
@@ -1008,6 +1045,7 @@ impl MetaObjectProtocol {
         self.instances.push(Instance {
             class: class_id,
             slots,
+            funcallable_function: None,
         });
 
         Some(idx)
@@ -1025,6 +1063,31 @@ impl MetaObjectProtocol {
     /// Get mutable instance by index
     pub fn get_instance_mut(&mut self, idx: usize) -> Option<&mut Instance> {
         self.instances.get_mut(idx)
+    }
+
+    pub fn get_instance_function(&self, idx: usize) -> Option<NodeId> {
+        self.instances
+            .get(idx)
+            .and_then(|inst| inst.funcallable_function)
+    }
+
+    pub fn set_instance_function(&mut self, idx: usize, func: NodeId) -> bool {
+        if let Some(inst) = self.instances.get_mut(idx) {
+            inst.funcallable_function = Some(func);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn class_is_funcallable(&self, class_id: ClassId) -> bool {
+        if self.funcallable_standard_object.0 == 0 {
+            return false;
+        }
+        self.classes
+            .get(class_id.0 as usize)
+            .map(|c| c.cpl.contains(&self.funcallable_standard_object))
+            .unwrap_or(false)
     }
 
     /// Get slot value

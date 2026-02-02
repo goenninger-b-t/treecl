@@ -31,9 +31,9 @@ This file tracks MOP work items across conversations.
 - Goal: `add-dependent`, `remove-dependent`, `map-dependents`, `update-dependent`.
 - Tests: `tests/mop_dependents_protocol_test.lisp`
 
-## Task 8 — Funcallable instances
+## Task 8 — Funcallable instances (DONE)
 - Goal: funcallable standard classes, `set-funcallable-instance-function`, funcallable access.
-- Tests: to add when task starts.
+- Tests: `tests/mop_funcallable_instances_test.lisp`
 
 ## Task 9 — Class/specializer introspection extras
 - Goal: `class-direct-methods`, `class-direct-generic-functions`, `specializer-direct-methods`, `specializer-direct-generic-functions`.

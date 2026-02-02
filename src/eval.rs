@@ -2029,6 +2029,28 @@ impl<'a> Interpreter<'a> {
             return self.apply_generic_function(crate::clos::GenericId(*gid), args, &env);
         }
 
+        // Check for Funcallable Instance
+        if let Node::Leaf(OpaqueValue::Instance(idx)) =
+            self.process.arena.get_unchecked(func_node)
+        {
+            let inst_idx = *idx as usize;
+            let class_id = self
+                .process
+                .mop
+                .get_instance(inst_idx)
+                .map(|i| i.class)
+                .unwrap_or(self.process.mop.standard_object);
+            if !self.process.mop.class_is_funcallable(class_id) {
+                return Err(ControlSignal::Error(
+                    "Attempt to call non-funcallable instance".into(),
+                ));
+            }
+            let func = self.process.mop.get_instance_function(inst_idx).ok_or_else(|| {
+                ControlSignal::Error("Funcallable instance has no function".into())
+            })?;
+            return self.step_apply(func, args, env);
+        }
+
         // Check for NextMethod (call-next-method invocation)
         if let Node::Leaf(OpaqueValue::NextMethod(state_idx)) =
             self.process.arena.get_unchecked(func_node)
@@ -4071,6 +4093,45 @@ impl<'a> Interpreter<'a> {
                 self.apply_generic(id, args, env)
                 // Ok(self.process.make_nil())
             }
+            Node::Leaf(OpaqueValue::Instance(idx)) => {
+                let inst_idx = idx as usize;
+                let class_id = self
+                    .process
+                    .mop
+                    .get_instance(inst_idx)
+                    .map(|i| i.class)
+                    .unwrap_or(self.process.mop.standard_object);
+                if !self.process.mop.class_is_funcallable(class_id) {
+                    return Err(ControlSignal::Error(
+                        "Attempt to call non-funcallable instance".into(),
+                    ));
+                }
+                let func = self.process.mop.get_instance_function(inst_idx).ok_or_else(|| {
+                    ControlSignal::Error(
+                        "Funcallable instance has no function".into(),
+                    )
+                })?;
+
+                // Evaluate arguments
+                let mut evaluated_args = Vec::new();
+                let mut current = args;
+                while let Node::Fork(arg, rest) =
+                    self.process.arena.inner.get_unchecked(current).clone()
+                {
+                    let val = self.eval(arg, env)?;
+                    evaluated_args.push(val);
+                    current = rest;
+                }
+
+                self.step_apply(func, evaluated_args, env.clone())?;
+                loop {
+                    match self.step() {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(self.process.program),
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
             Node::Leaf(OpaqueValue::NextMethod(state_idx)) => {
                 let state_idx = state_idx as usize;
                 if state_idx >= self.process.next_method_states.len() {
@@ -4235,6 +4296,39 @@ impl<'a> Interpreter<'a> {
                 self.step_apply(func, arg_vec, env.clone())?;
 
                 // Drive the evaluator until the continuation stack completes.
+                loop {
+                    match self.step() {
+                        Ok(true) => continue,
+                        Ok(false) => return Ok(self.process.program),
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Node::Leaf(OpaqueValue::Instance(idx)) => {
+                let inst_idx = idx as usize;
+                let class_id = self
+                    .process
+                    .mop
+                    .get_instance(inst_idx)
+                    .map(|i| i.class)
+                    .unwrap_or(self.process.mop.standard_object);
+                if !self.process.mop.class_is_funcallable(class_id) {
+                    return Err(ControlSignal::Error(
+                        "Attempt to call non-funcallable instance".into(),
+                    ));
+                }
+                let func = self.process.mop.get_instance_function(inst_idx).ok_or_else(|| {
+                    ControlSignal::Error("Funcallable instance has no function".into())
+                })?;
+
+                let mut arg_vec = Vec::new();
+                let mut curr = args;
+                while let Node::Fork(h, t) = self.process.arena.inner.get_unchecked(curr).clone() {
+                    arg_vec.push(h);
+                    curr = t;
+                }
+                self.step_apply(func, arg_vec, env.clone())?;
+
                 loop {
                     match self.step() {
                         Ok(true) => continue,
