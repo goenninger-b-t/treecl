@@ -149,6 +149,11 @@ impl Arena {
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
+
+    /// Total heap size in bytes for arena node storage.
+    pub fn total_bytes(&self) -> usize {
+        self.nodes.len().saturating_mul(std::mem::size_of::<Entry>())
+    }
 }
 
 /// Deep copy a tree from one arena to another

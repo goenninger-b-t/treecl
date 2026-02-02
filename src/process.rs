@@ -124,6 +124,10 @@ pub struct Process {
     pub t_node: NodeId,
     /// Cached Unbound node in this process arena
     pub unbound_node: NodeId,
+    /// Garbage collection stats
+    pub gc_count: u64,
+    pub gc_time_sec: f64,
+    pub gc_freed_total: usize,
 
     /// Program Counter (Pointer to current root of reduction)
     pub program: NodeId,
@@ -234,6 +238,9 @@ impl Process {
             nil_node,
             t_node,
             unbound_node,
+            gc_count: 0,
+            gc_time_sec: 0.0,
+            gc_freed_total: 0,
             program,
             mailbox: VecDeque::new(),
             dictionary,
@@ -275,6 +282,7 @@ impl Process {
     }
 
     pub fn collect_garbage(&mut self) -> usize {
+        let start = std::time::Instant::now();
         let mut marked = HashSet::new();
 
         // 1. Mark Roots
@@ -367,6 +375,10 @@ impl Process {
         // 2. Sweep
         let freed = self.arena.inner.sweep(&marked);
         self.arena.inner.reset_alloc_count();
+        let elapsed = start.elapsed().as_secs_f64();
+        self.gc_count = self.gc_count.saturating_add(1);
+        self.gc_time_sec += elapsed;
+        self.gc_freed_total = self.gc_freed_total.saturating_add(freed);
         freed
     }
 

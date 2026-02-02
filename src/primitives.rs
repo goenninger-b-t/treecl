@@ -2623,6 +2623,11 @@ fn prim_sys_time_eval(
     let thunk = args[0];
     let start_real = std::time::Instant::now();
     let (start_user, start_sys) = get_rusage_times();
+    let start_gc_count = proc.gc_count;
+    let start_gc_time = proc.gc_time_sec;
+    let start_gc_freed = proc.gc_freed_total;
+    let start_stats = proc.arena.inner.stats();
+    let live_before = start_stats.total_slots.saturating_sub(start_stats.free_slots);
 
     let result = call_function_node(proc, ctx, thunk, &[])?;
 
@@ -2632,10 +2637,32 @@ fn prim_sys_time_eval(
     let sys = (end_sys - start_sys).max(0.0);
     let total = user + sys;
     let cpu = if real > 0.0 { (total / real) * 100.0 } else { 0.0 };
+    let gc_count = proc.gc_count.saturating_sub(start_gc_count);
+    let gc_time = (proc.gc_time_sec - start_gc_time).max(0.0);
+    let gc_freed = proc.gc_freed_total.saturating_sub(start_gc_freed);
+    let gc_pct = if total > 0.0 { (gc_time / total) * 100.0 } else { 0.0 };
+    let end_stats = proc.arena.inner.stats();
+    let heap_bytes = proc.arena.inner.total_bytes();
+    let live_after = end_stats
+        .total_slots
+        .saturating_sub(end_stats.free_slots);
 
     let output = format!(
-        "Evaluation time:\n  {:.3} seconds of real time\n  {:.6} seconds of total run time ({:.6} user, {:.6} system)\n  {:.2}% CPU\n",
-        real, total, user, sys, cpu
+        "Evaluation time:\n  {:.3} seconds of real time\n  {:.6} seconds of total run time ({:.6} user, {:.6} system)\n  {:.2}% CPU\n  {:.6} seconds of GC time ({:.2}% of total), {} collections, {} nodes freed\n  Live nodes: {} -> {}, Heap size: {} slots ({} bytes), Allocs since GC: {}\n",
+        real,
+        total,
+        user,
+        sys,
+        cpu,
+        gc_time,
+        gc_pct,
+        gc_count,
+        gc_freed,
+        live_before,
+        live_after,
+        end_stats.total_slots,
+        heap_bytes,
+        end_stats.allocs_since_gc
     );
     let out_id = get_current_output_stream(proc, ctx);
     let _ = proc.streams.write_string(out_id, &output);
