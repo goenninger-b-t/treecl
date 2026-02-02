@@ -2,8 +2,10 @@
 //
 // Implements a minimal MOP-compliant object system.
 
+use crate::arena::{Arena, Node};
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
-use crate::types::NodeId;
+use crate::types::{NodeId, OpaqueValue};
+use num_traits::ToPrimitive;
 use std::collections::HashMap;
 
 /// Unique identifier for a class
@@ -84,8 +86,8 @@ pub struct GenericFunction {
 /// A method
 #[derive(Debug, Clone)]
 pub struct Method {
-    /// Specializers (ClassIds for each parameter)
-    pub specializers: Vec<ClassId>,
+    /// Specializers (ClassIds or EQL specializers for each parameter)
+    pub specializers: Vec<Specializer>,
     /// Method qualifiers (:before, :after, :around, or primary)
     pub qualifiers: Vec<SymbolId>,
     /// Method lambda list (symbols)
@@ -94,6 +96,17 @@ pub struct Method {
     pub body: NodeId,
     /// Generic function this method is attached to
     pub generic: Option<GenericId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Specializer {
+    Class(ClassId),
+    Eql(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct EqlSpecializer {
+    pub object: NodeId,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +170,7 @@ pub struct MetaObjectProtocol {
     pub standard_method: ClassId,
     pub standard_direct_slot_definition: ClassId,
     pub standard_effective_slot_definition: ClassId,
+    pub eql_specializer_class: ClassId,
     pub symbol_class: ClassId,
     pub integer_class: ClassId,
     /// All generic functions
@@ -180,6 +194,8 @@ pub struct MetaObjectProtocol {
     method_combinations: HashMap<SymbolId, MethodCombinationDef>,
     /// All instances
     instances: Vec<Instance>,
+    /// Interned EQL specializers
+    eql_specializers: Vec<EqlSpecializer>,
 }
 
 impl MetaObjectProtocol {
@@ -211,6 +227,7 @@ impl MetaObjectProtocol {
             standard_method: ClassId(0),
             standard_direct_slot_definition: ClassId(0),
             standard_effective_slot_definition: ClassId(0),
+            eql_specializer_class: ClassId(0),
             symbol_class: ClassId(3),
             integer_class: ClassId(4),
             generics: Vec::new(),
@@ -224,6 +241,7 @@ impl MetaObjectProtocol {
             after_wrappers: HashMap::new(),
             method_combinations: HashMap::new(),
             instances: Vec::new(),
+            eql_specializers: Vec::new(),
         };
 
         // Bootstrap the class hierarchy
@@ -318,6 +336,26 @@ impl MetaObjectProtocol {
             default_initargs: Vec::new(),
         });
         mop.class_names.insert(int_name, ClassId(4));
+
+        // EQL-SPECIALIZER
+        let eql_spec_name = symbols.intern_in("EQL-SPECIALIZER", cl);
+        symbols.export_symbol(eql_spec_name);
+        let eql_spec_id = ClassId(mop.classes.len() as u32);
+        mop.classes.push(Class {
+            name: eql_spec_name,
+            metaclass: ClassId(2),
+            supers: vec![mop.standard_object],
+            direct_slots: Vec::new(),
+            slots: Vec::new(),
+            cpl: vec![eql_spec_id, mop.standard_object, mop.t_class],
+            instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
+        });
+        mop.class_names.insert(eql_spec_name, eql_spec_id);
+        mop.eql_specializer_class = eql_spec_id;
 
         // Populate direct subclasses for bootstrap classes.
         let class_count = mop.classes.len();
@@ -1032,7 +1070,7 @@ impl MetaObjectProtocol {
     pub fn add_method(
         &mut self,
         generic_id: GenericId,
-        specializers: Vec<ClassId>,
+        specializers: Vec<Specializer>,
         qualifiers: Vec<SymbolId>,
         lambda_list: Vec<SymbolId>,
         body: NodeId,
@@ -1078,7 +1116,7 @@ impl MetaObjectProtocol {
     /// Add a method without attaching it to a generic function (used for wrappers).
     pub fn add_method_raw(
         &mut self,
-        specializers: Vec<ClassId>,
+        specializers: Vec<Specializer>,
         qualifiers: Vec<SymbolId>,
         body: NodeId,
     ) -> MethodId {
@@ -1102,7 +1140,7 @@ impl MetaObjectProtocol {
         self.methods.get(id.0 as usize).map(|m| m.qualifiers.as_slice())
     }
 
-    pub fn get_method_specializers(&self, id: MethodId) -> Option<&[ClassId]> {
+    pub fn get_method_specializers(&self, id: MethodId) -> Option<&[Specializer]> {
         self.methods
             .get(id.0 as usize)
             .map(|m| m.specializers.as_slice())
@@ -1146,8 +1184,245 @@ impl MetaObjectProtocol {
         false
     }
 
-    /// Find applicable methods for given argument classes
+    pub fn get_eql_specializer_object(&self, idx: u32) -> Option<NodeId> {
+        self.eql_specializers
+            .get(idx as usize)
+            .map(|s| s.object)
+    }
+
+    pub fn intern_eql_specializer(&mut self, arena: &Arena, object: NodeId) -> u32 {
+        for (idx, spec) in self.eql_specializers.iter().enumerate() {
+            if self.eql_nodes(arena, spec.object, object) {
+                return idx as u32;
+            }
+        }
+        let idx = self.eql_specializers.len() as u32;
+        self.eql_specializers.push(EqlSpecializer { object });
+        idx
+    }
+
+    pub fn generic_uses_eql_specializers(&self, generic_id: GenericId) -> bool {
+        if let Some(gf) = self.get_generic(generic_id) {
+            for &mid in &gf.methods {
+                if let Some(method) = self.get_method(mid) {
+                    if method
+                        .specializers
+                        .iter()
+                        .any(|s| matches!(s, Specializer::Eql(_)))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn class_of_node(&self, node: NodeId, arena: &Arena) -> ClassId {
+        match arena.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Instance(id)) => self
+                .get_instance(*id as usize)
+                .map(|i| i.class)
+                .unwrap_or(self.standard_object),
+            Node::Leaf(OpaqueValue::Class(_)) => self.standard_class,
+            Node::Leaf(OpaqueValue::Symbol(_)) => self.symbol_class,
+            Node::Leaf(OpaqueValue::Integer(_)) => self.integer_class,
+            Node::Leaf(OpaqueValue::Generic(_)) => self.standard_generic_function,
+            Node::Leaf(OpaqueValue::Method(_)) => self.standard_method,
+            Node::Leaf(OpaqueValue::SlotDefinition(_, _, direct)) => {
+                if *direct {
+                    self.standard_direct_slot_definition
+                } else {
+                    self.standard_effective_slot_definition
+                }
+            }
+            Node::Leaf(OpaqueValue::EqlSpecializer(_)) => self.eql_specializer_class,
+            _ => self.t_class,
+        }
+    }
+
+    fn eql_nodes(&self, arena: &Arena, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+
+        match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+            (Node::Leaf(OpaqueValue::Integer(ai)), Node::Leaf(OpaqueValue::Integer(bi))) => {
+                return ai == bi;
+            }
+            (Node::Leaf(OpaqueValue::BigInt(ai)), Node::Leaf(OpaqueValue::BigInt(bi))) => {
+                return ai == bi;
+            }
+            (Node::Leaf(OpaqueValue::Float(af)), Node::Leaf(OpaqueValue::Float(bf))) => {
+                return af == bf;
+            }
+            (Node::Leaf(OpaqueValue::Integer(ai)), Node::Leaf(OpaqueValue::Float(bf))) => {
+                return (*ai as f64) == *bf;
+            }
+            (Node::Leaf(OpaqueValue::Float(af)), Node::Leaf(OpaqueValue::Integer(bi))) => {
+                return *af == (*bi as f64);
+            }
+            (Node::Leaf(OpaqueValue::BigInt(ai)), Node::Leaf(OpaqueValue::Float(bf))) => {
+                return ai.to_f64().unwrap_or(f64::INFINITY) == *bf;
+            }
+            (Node::Leaf(OpaqueValue::Float(af)), Node::Leaf(OpaqueValue::BigInt(bi))) => {
+                return *af == bi.to_f64().unwrap_or(f64::INFINITY);
+            }
+            (Node::Leaf(OpaqueValue::Integer(ai)), Node::Leaf(OpaqueValue::BigInt(bi))) => {
+                return num_bigint::BigInt::from(*ai) == *bi;
+            }
+            (Node::Leaf(OpaqueValue::BigInt(ai)), Node::Leaf(OpaqueValue::Integer(bi))) => {
+                return *ai == num_bigint::BigInt::from(*bi);
+            }
+            _ => {}
+        }
+
+        match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+            (Node::Leaf(OpaqueValue::Symbol(id1)), Node::Leaf(OpaqueValue::Symbol(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Class(id1)), Node::Leaf(OpaqueValue::Class(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Instance(id1)), Node::Leaf(OpaqueValue::Instance(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Generic(id1)), Node::Leaf(OpaqueValue::Generic(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Method(id1)), Node::Leaf(OpaqueValue::Method(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::EqlSpecializer(id1)), Node::Leaf(OpaqueValue::EqlSpecializer(id2))) => {
+                id1 == id2
+            }
+            (
+                Node::Leaf(OpaqueValue::SlotDefinition(c1, s1, d1)),
+                Node::Leaf(OpaqueValue::SlotDefinition(c2, s2, d2)),
+            ) => c1 == c2 && s1 == s2 && d1 == d2,
+            (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil)) => true,
+            _ => false,
+        }
+    }
+
+    fn method_applicable_values(
+        &self,
+        method: &Method,
+        arg_values: &[NodeId],
+        arg_classes: &[ClassId],
+        arena: &Arena,
+    ) -> bool {
+        if method.specializers.len() > arg_values.len() {
+            return false;
+        }
+
+        for (i, spec) in method.specializers.iter().enumerate() {
+            match spec {
+                Specializer::Class(class_id) => {
+                    if let Some(&arg_class) = arg_classes.get(i) {
+                        if let Some(class) = self.classes.get(arg_class.0 as usize) {
+                            if !class.cpl.contains(class_id) {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                Specializer::Eql(idx) => {
+                    let obj = match self.get_eql_specializer_object(*idx) {
+                        Some(obj) => obj,
+                        None => return false,
+                    };
+                    let arg = match arg_values.get(i) {
+                        Some(v) => *v,
+                        None => return false,
+                    };
+                    if !self.eql_nodes(arena, obj, arg) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn method_applicable_classes(&self, method: &Method, arg_classes: &[ClassId]) -> bool {
+        if method
+            .specializers
+            .iter()
+            .any(|s| matches!(s, Specializer::Eql(_)))
+        {
+            return false;
+        }
+
+        if method.specializers.len() > arg_classes.len() {
+            return false;
+        }
+
+        for (i, spec) in method.specializers.iter().enumerate() {
+            let class_id = match spec {
+                Specializer::Class(cid) => cid,
+                Specializer::Eql(_) => return false,
+            };
+            if let Some(&arg_class) = arg_classes.get(i) {
+                if let Some(class) = self.classes.get(arg_class.0 as usize) {
+                    if !class.cpl.contains(class_id) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Find applicable methods for given argument values
     pub fn compute_applicable_methods(
+        &self,
+        generic_id: GenericId,
+        arg_values: &[NodeId],
+        arena: &Arena,
+    ) -> Vec<MethodId> {
+        let gf = match self.get_generic(generic_id) {
+            Some(gf) => gf,
+            None => return Vec::new(),
+        };
+
+        let arg_classes: Vec<ClassId> = arg_values
+            .iter()
+            .map(|&v| self.class_of_node(v, arena))
+            .collect();
+
+        let mut applicable = Vec::new();
+
+        for &method_id in &gf.methods {
+            if let Some(method) = self.get_method(method_id) {
+                if self.method_applicable_values(method, arg_values, &arg_classes, arena) {
+                    applicable.push(method_id);
+                }
+            }
+        }
+
+        let order = self.argument_precedence_order_indices(generic_id);
+
+        // Sort by specificity (most specific first)
+        applicable.sort_by(|&a, &b| {
+            let ma = self.get_method(a).unwrap();
+            let mb = self.get_method(b).unwrap();
+            self.compare_method_specificity(ma, mb, &arg_classes, &order)
+        });
+
+        applicable
+    }
+
+    /// Find applicable methods for given argument classes (EQL specializers ignored)
+    pub fn compute_applicable_methods_using_classes(
         &self,
         generic_id: GenericId,
         arg_classes: &[ClassId],
@@ -1161,7 +1436,7 @@ impl MetaObjectProtocol {
 
         for &method_id in &gf.methods {
             if let Some(method) = self.get_method(method_id) {
-                if self.method_applicable(method, arg_classes) {
+                if self.method_applicable_classes(method, arg_classes) {
                     applicable.push(method_id);
                 }
             }
@@ -1169,7 +1444,6 @@ impl MetaObjectProtocol {
 
         let order = self.argument_precedence_order_indices(generic_id);
 
-        // Sort by specificity (most specific first)
         applicable.sort_by(|&a, &b| {
             let ma = self.get_method(a).unwrap();
             let mb = self.get_method(b).unwrap();
@@ -1177,26 +1451,6 @@ impl MetaObjectProtocol {
         });
 
         applicable
-    }
-
-    pub fn method_applicable(&self, method: &Method, arg_classes: &[ClassId]) -> bool {
-        if method.specializers.len() > arg_classes.len() {
-            return false;
-        }
-
-        for (i, &spec) in method.specializers.iter().enumerate() {
-            if let Some(&arg_class) = arg_classes.get(i) {
-                if let Some(class) = self.classes.get(arg_class.0 as usize) {
-                    if !class.cpl.contains(&spec) {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
-        }
-
-        true
     }
 
     fn argument_precedence_order_indices(&self, generic_id: GenericId) -> Vec<usize> {
@@ -1249,14 +1503,35 @@ impl MetaObjectProtocol {
                 None => continue,
             };
 
-            let sa = ma.specializers.get(i).copied().unwrap_or(self.t_class);
-            let sb = mb.specializers.get(i).copied().unwrap_or(self.t_class);
+            let sa = ma
+                .specializers
+                .get(i)
+                .cloned()
+                .unwrap_or(Specializer::Class(self.t_class));
+            let sb = mb
+                .specializers
+                .get(i)
+                .cloned()
+                .unwrap_or(Specializer::Class(self.t_class));
 
-            let posa = cpl.iter().position(|c| *c == sa).unwrap_or(usize::MAX);
-            let posb = cpl.iter().position(|c| *c == sb).unwrap_or(usize::MAX);
+            match (&sa, &sb) {
+                (Specializer::Eql(_), Specializer::Class(_)) => {
+                    return std::cmp::Ordering::Less;
+                }
+                (Specializer::Class(_), Specializer::Eql(_)) => {
+                    return std::cmp::Ordering::Greater;
+                }
+                (Specializer::Eql(_), Specializer::Eql(_)) => {
+                    continue;
+                }
+                (Specializer::Class(ca), Specializer::Class(cb)) => {
+                    let posa = cpl.iter().position(|c| *c == *ca).unwrap_or(usize::MAX);
+                    let posb = cpl.iter().position(|c| *c == *cb).unwrap_or(usize::MAX);
 
-            if posa != posb {
-                return posa.cmp(&posb);
+                    if posa != posb {
+                        return posa.cmp(&posb);
+                    }
+                }
             }
         }
 
@@ -1307,6 +1582,11 @@ impl MetaObjectProtocol {
             for func in gf.method_cache.values() {
                 roots.push(*func);
             }
+        }
+
+        // Trace interned EQL specializers
+        for spec in &self.eql_specializers {
+            roots.push(spec.object);
         }
 
         // Trace Instances (slot values) - REMOVED

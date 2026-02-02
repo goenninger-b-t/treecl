@@ -256,6 +256,9 @@ impl<'a> Printer<'a> {
             OpaqueValue::Method(id) => {
                 self.output.push_str(&format!("#<method:{}>", id));
             }
+            OpaqueValue::EqlSpecializer(id) => {
+                self.output.push_str(&format!("#<eql-specializer:{}>", id));
+            }
             OpaqueValue::SlotDefinition(class_id, slot_idx, direct) => {
                 let tag = if direct { ":direct" } else { "" };
                 self.output.push_str(&format!(

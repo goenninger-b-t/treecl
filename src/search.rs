@@ -466,6 +466,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::CallMethod(id) => format!("#<call-method:{}>", id),
             OpaqueValue::MethodWrapper(a, b) => format!("#<method-wrapper:{}:{}>", a, b),
             OpaqueValue::Method(id) => format!("#<method:{}>", id),
+            OpaqueValue::EqlSpecializer(id) => format!("#<eql-specializer:{}>", id),
             OpaqueValue::SlotDefinition(class_id, slot_idx, direct) => {
                 let tag = if *direct { ":direct" } else { "" };
                 format!("#<slot-definition:{}:{}{}>", class_id, slot_idx, tag)

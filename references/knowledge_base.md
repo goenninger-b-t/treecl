@@ -105,4 +105,5 @@ MOP implementation status (TreeCL)
 - Fixed APPLY/FUNCALL on closures by driving the TCO evaluator until the continuation stack completes (use `step()` loop, not just `ExecutionMode::Return`).
 - Generic function invocation now applies cached discriminating functions (from `compute-discriminating-function`) instead of always raw dispatch.
 - Primitives that call `apply_values` now preserve process state (program/mode/continuation stack/pending redex/next-method state) to avoid clobbering ongoing evaluation.
-- Open tasks tracked in `TASKS.md` cover full GF invocation MOP, EQL specializers, dependents, funcallable instances, extra introspection, and accessor completeness.
+- Added EQL specializer support: `eql-specializer` class, `intern-eql-specializer`, `eql-specializer-object`, EQL-aware method applicability/specificity, and dispatch that ignores caching when EQL specializers are present.
+- Open tasks tracked in `TASKS.md` cover dependents, funcallable instances, extra introspection, and accessor completeness.

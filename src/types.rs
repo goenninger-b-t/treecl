@@ -38,6 +38,7 @@ pub enum OpaqueValue {
     CallMethod(u32),            // Handle to Call-Method state (CLOS)
     MethodWrapper(u32, u32),    // (ClosureIndex, NextMethodIndex)
     Method(u32),                // Handle to Method (CLOS)
+    EqlSpecializer(u32),        // Handle to EQL specializer (CLOS)
     SlotDefinition(u32, u32, bool), // (ClassId, SlotIndex, Direct?)
 }
 

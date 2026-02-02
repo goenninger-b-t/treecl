@@ -2899,11 +2899,10 @@ impl<'a> Interpreter<'a> {
         args: Vec<NodeId>,
         _env: &Environment,
     ) -> Result<bool, ControlSignal> {
-        let arg_classes: Vec<_> = args.iter().map(|&a| self.get_arg_class(a)).collect();
         let methods = self
             .process
             .mop
-            .compute_applicable_methods(gid, &arg_classes);
+            .compute_applicable_methods(gid, &args, &self.process.arena.inner);
 
         if methods.is_empty() {
             let gf_name = self
@@ -3274,6 +3273,44 @@ impl<'a> Interpreter<'a> {
             .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)))
     }
 
+    fn parse_specializer(&mut self, spec_node: NodeId) -> crate::clos::Specializer {
+        // Handle (eql <object>) specializers
+        if let Node::Fork(car, rest) = self.process.arena.inner.get_unchecked(spec_node).clone() {
+            if let Some(sym) = self.node_to_symbol(car) {
+                if sym == self.ensure_cl_symbol("EQL") {
+                    if let Node::Fork(obj, _) =
+                        self.process.arena.inner.get_unchecked(rest).clone()
+                    {
+                        let idx = self
+                            .process
+                            .mop
+                            .intern_eql_specializer(&self.process.arena.inner, obj);
+                        return crate::clos::Specializer::Eql(idx);
+                    }
+                }
+            }
+        }
+
+        match self.process.arena.inner.get_unchecked(spec_node) {
+            Node::Leaf(OpaqueValue::EqlSpecializer(idx)) => {
+                crate::clos::Specializer::Eql(*idx)
+            }
+            Node::Leaf(OpaqueValue::Class(id)) => {
+                crate::clos::Specializer::Class(crate::clos::ClassId(*id))
+            }
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                let sym = SymbolId(*id);
+                let class_id = self
+                    .process
+                    .mop
+                    .find_class(sym)
+                    .unwrap_or(self.process.mop.t_class);
+                crate::clos::Specializer::Class(class_id)
+            }
+            _ => crate::clos::Specializer::Class(self.process.mop.t_class),
+        }
+    }
+
     fn get_or_create_wrapper(
         &mut self,
         method_id: crate::clos::MethodId,
@@ -3409,33 +3446,6 @@ impl<'a> Interpreter<'a> {
         self.process
             .mop
             .add_method_raw(Vec::new(), Vec::new(), closure_node)
-    }
-
-    fn get_arg_class(&self, arg: NodeId) -> crate::clos::ClassId {
-        match self.process.arena.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::Instance(id)) => {
-                if let Some(inst) = self.process.mop.get_instance(*id as usize) {
-                    inst.class
-                } else {
-                    self.process.mop.standard_object
-                }
-            }
-            Node::Leaf(OpaqueValue::Class(_)) => self.process.mop.standard_class,
-            Node::Leaf(OpaqueValue::Symbol(_)) => self.process.mop.symbol_class,
-            Node::Leaf(OpaqueValue::Integer(_)) => self.process.mop.integer_class,
-            Node::Leaf(OpaqueValue::Generic(_)) => self.process.mop.standard_generic_function,
-            Node::Leaf(OpaqueValue::Method(_)) => self.process.mop.standard_method,
-            Node::Leaf(OpaqueValue::SlotDefinition(_, _, direct)) => {
-                if *direct {
-                    self.process.mop.standard_direct_slot_definition
-                } else {
-                    self.process.mop.standard_effective_slot_definition
-                }
-            }
-            _ => {
-                self.process.mop.t_class
-            }
-        }
     }
 
     fn method_id_from_node(
@@ -4604,6 +4614,7 @@ impl<'a> Interpreter<'a> {
                     self.process.mop.standard_object // Fallback
                 }
             }
+            Node::Leaf(OpaqueValue::EqlSpecializer(_)) => self.process.mop.eql_specializer_class,
             // ... handle other types ...
             _ => self.process.mop.t_class,
         }
@@ -4812,29 +4823,24 @@ impl<'a> Interpreter<'a> {
                             // Unspecialized (T)
                             params.push(sym);
                             params_nodes.push(param_spec);
-                            specializers.push(self.process.mop.t_class);
+                            specializers.push(crate::clos::Specializer::Class(
+                                self.process.mop.t_class,
+                            ));
                         } else if let Node::Fork(pname, ptype_rest) =
                             self.process.arena.inner.get_unchecked(param_spec).clone()
                         {
                             if let Some(psym) = self.node_to_symbol(pname) {
                                 params.push(psym);
                                 params_nodes.push(pname);
-                                // Get class
-                                let class_id = if let Node::Fork(cname, _) =
+                                // Get specializer (class or (eql ...))
+                                let spec = if let Node::Fork(spec_node, _) =
                                     self.process.arena.inner.get_unchecked(ptype_rest).clone()
                                 {
-                                    if let Some(csym) = self.node_to_symbol(cname) {
-                                        self.process
-                                            .mop
-                                            .find_class(csym)
-                                            .unwrap_or(self.process.mop.t_class)
-                                    } else {
-                                        self.process.mop.t_class
-                                    }
+                                    self.parse_specializer(spec_node)
                                 } else {
-                                    self.process.mop.t_class
+                                    crate::clos::Specializer::Class(self.process.mop.t_class)
                                 };
-                                specializers.push(class_id);
+                                specializers.push(spec);
                             }
                         }
                         current = next;

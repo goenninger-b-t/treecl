@@ -23,9 +23,9 @@ This file tracks MOP work items across conversations.
 - Goal: `compute-discriminating-function`, `compute-effective-method`, `compute-effective-method-function`, method caching, `generic-function-argument-precedence-order`, `method-function`, `make-method-lambda`.
 - Tests: `tests/mop_generic_invocation_protocol_test.lisp`
 
-## Task 6 — EQL specializers
+## Task 6 — EQL specializers (DONE)
 - Goal: `eql` specializers, `intern-eql-specializer`, dispatch support.
-- Tests: to add when task starts.
+- Tests: `tests/mop_eql_specializer_test.lisp`
 
 ## Task 7 — Dependents protocol
 - Goal: `add-dependent`, `remove-dependent`, `map-dependents`, `update-dependent`.

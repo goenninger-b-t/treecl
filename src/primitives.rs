@@ -160,6 +160,12 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("METHOD-LAMBDA-LIST", cl, prim_method_lambda_list);
     globals.register_primitive("METHOD-GENERIC-FUNCTION", cl, prim_method_generic_function);
     globals.register_primitive("METHOD-BODY", cl, prim_method_body);
+    globals.register_primitive("INTERN-EQL-SPECIALIZER", cl, prim_intern_eql_specializer);
+    globals.register_primitive(
+        "SYS-EQL-SPECIALIZER-OBJECT",
+        cl,
+        prim_sys_eql_specializer_object,
+    );
     globals.register_primitive("SYS-MAKE-METHOD", cl, prim_sys_make_method);
     globals.register_primitive("CLASS-NAME", cl, prim_class_name);
     globals.register_primitive(
@@ -1842,6 +1848,11 @@ fn prim_eq(
                 return Ok(proc.make_t(ctx));
             }
         }
+        (Node::Leaf(OpaqueValue::EqlSpecializer(id1)), Node::Leaf(OpaqueValue::EqlSpecializer(id2))) => {
+            if id1 == id2 {
+                return Ok(proc.make_t(ctx));
+            }
+        }
         (
             Node::Leaf(OpaqueValue::SlotDefinition(c1, s1, d1)),
             Node::Leaf(OpaqueValue::SlotDefinition(c2, s2, d2)),
@@ -1905,6 +1916,11 @@ fn prim_eql(
             }
         }
         (Node::Leaf(OpaqueValue::Method(id1)), Node::Leaf(OpaqueValue::Method(id2))) => {
+            if id1 == id2 {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+        (Node::Leaf(OpaqueValue::EqlSpecializer(id1)), Node::Leaf(OpaqueValue::EqlSpecializer(id2))) => {
             if id1 == id2 {
                 return Ok(proc.make_t(ctx));
             }
@@ -2945,6 +2961,7 @@ fn prim_class_of(
                     proc.mop.standard_effective_slot_definition
                 }
             }
+            Node::Leaf(OpaqueValue::EqlSpecializer(_)) => proc.mop.eql_specializer_class,
             _ => proc.mop.t_class,
         };
         // Return class object
@@ -3124,6 +3141,56 @@ fn class_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::Class
     }
 }
 
+fn eql_specializer_id_from_node(proc: &Process, node: NodeId) -> Option<u32> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::EqlSpecializer(id)) => Some(*id),
+        _ => None,
+    }
+}
+
+fn parse_specializer_node(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> crate::clos::Specializer {
+    if let Some(idx) = eql_specializer_id_from_node(proc, node) {
+        return crate::clos::Specializer::Eql(idx);
+    }
+
+    if let Some(cid) = class_id_from_node(proc, node) {
+        return crate::clos::Specializer::Class(cid);
+    }
+
+    if let Node::Fork(car, rest) = proc.arena.inner.get_unchecked(node).clone() {
+        if let Some(sym) = node_to_symbol(proc, car) {
+            if let Some(name) = ctx.symbols.read().unwrap().symbol_name(sym) {
+                if name.eq_ignore_ascii_case("EQL") {
+                    if let Node::Fork(obj, _) = proc.arena.inner.get_unchecked(rest).clone() {
+                        let idx =
+                            proc.mop.intern_eql_specializer(&proc.arena.inner, obj);
+                        return crate::clos::Specializer::Eql(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    crate::clos::Specializer::Class(proc.mop.t_class)
+}
+
+fn specializer_to_node(proc: &mut Process, spec: &crate::clos::Specializer) -> NodeId {
+    match spec {
+        crate::clos::Specializer::Class(cid) => proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Class(cid.0))),
+        crate::clos::Specializer::Eql(idx) => proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::EqlSpecializer(*idx))),
+    }
+}
+
 fn generic_id_from_node(proc: &Process, node: NodeId) -> Option<crate::clos::GenericId> {
     match proc.arena.inner.get_unchecked(node) {
         Node::Leaf(OpaqueValue::Generic(id)) => Some(crate::clos::GenericId(*id)),
@@ -3158,6 +3225,7 @@ fn arg_class_id(proc: &Process, node: NodeId) -> crate::clos::ClassId {
                 proc.mop.standard_effective_slot_definition
             }
         }
+        Node::Leaf(OpaqueValue::EqlSpecializer(_)) => proc.mop.eql_specializer_class,
         _ => proc.mop.t_class,
     }
 }
@@ -3395,6 +3463,7 @@ fn value_class_id(proc: &Process, node: NodeId) -> crate::clos::ClassId {
                 proc.mop.standard_effective_slot_definition
             }
         }
+        Node::Leaf(OpaqueValue::EqlSpecializer(_)) => proc.mop.eql_specializer_class,
         _ => proc.mop.t_class,
     }
 }
@@ -3793,7 +3862,11 @@ fn sync_method_metaobject(
 
     let lambda_list = make_symbol_list(proc, &lambda_list_src);
     let qualifiers = make_symbol_list(proc, &qualifiers_src);
-    let specializers = make_class_list(proc, &specializers_src);
+    let mut spec_nodes = Vec::with_capacity(specializers_src.len());
+    for spec in &specializers_src {
+        spec_nodes.push(specializer_to_node(proc, spec));
+    }
+    let specializers = proc.make_list(&spec_nodes);
     let generic_function = if let Some(gid) = generic_src {
         proc.arena
             .inner
@@ -4404,7 +4477,7 @@ fn define_slot_accessors(
 
             proc.mop.add_method(
                 gf_id,
-                vec![class_id],
+                vec![crate::clos::Specializer::Class(class_id)],
                 Vec::new(),
                 vec![obj_sym],
                 closure_node,
@@ -4456,7 +4529,10 @@ fn define_slot_accessors(
 
             proc.mop.add_method(
                 gf_id,
-                vec![proc.mop.t_class, class_id],
+                vec![
+                    crate::clos::Specializer::Class(proc.mop.t_class),
+                    crate::clos::Specializer::Class(class_id),
+                ],
                 Vec::new(),
                 vec![val_sym, obj_sym],
                 closure_node,
@@ -4853,7 +4929,7 @@ fn prim_ensure_method(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    use crate::clos::{ClassId, GenericId};
+    use crate::clos::GenericId;
 
     if args.is_empty() {
         return Err(crate::eval::ControlSignal::Error(
@@ -4895,17 +4971,7 @@ fn prim_ensure_method(
     if let Some(k) = kw_specializers {
         if let Some(&specs_node) = kwargs.get(&k) {
             for head in list_to_vec(proc, specs_node) {
-                let class_id = match proc.arena.inner.get_unchecked(head) {
-                    Node::Leaf(OpaqueValue::Class(id)) => Some(ClassId(*id)),
-                    Node::Leaf(OpaqueValue::Symbol(id)) => proc.mop.find_class(SymbolId(*id)),
-                    _ => None,
-                };
-
-                if let Some(cid) = class_id {
-                    specializers.push(cid);
-                } else {
-                    specializers.push(proc.mop.t_class); // Default to T
-                }
+                specializers.push(parse_specializer_node(proc, ctx, head));
             }
         }
     }
@@ -5439,11 +5505,10 @@ fn prim_sys_dispatch_generic(
     })?;
     let args_list = args[1];
     let arg_vals = list_to_vec(proc, args_list);
-    let arg_classes: Vec<_> = arg_vals.iter().map(|&v| arg_class_id(proc, v)).collect();
 
     let methods = proc
         .mop
-        .compute_applicable_methods(gid, &arg_classes);
+        .compute_applicable_methods(gid, &arg_vals, &proc.arena.inner);
 
     if methods.is_empty() {
         let gf_name = proc
@@ -5463,10 +5528,20 @@ fn prim_sys_dispatch_generic(
         )));
     }
 
-    let cache_hit = proc
-        .mop
-        .get_cached_effective_method(gid, &arg_classes)
-        .is_some();
+    let uses_eql = proc.mop.generic_uses_eql_specializers(gid);
+    let arg_classes: Vec<_> = if uses_eql {
+        Vec::new()
+    } else {
+        arg_vals.iter().map(|&v| arg_class_id(proc, v)).collect()
+    };
+
+    let cache_hit = if uses_eql {
+        false
+    } else {
+        proc.mop
+            .get_cached_effective_method(gid, &arg_classes)
+            .is_some()
+    };
 
     let method_nodes: Vec<NodeId> = methods
         .iter()
@@ -5528,7 +5603,7 @@ fn prim_sys_dispatch_generic(
     proc.pending_redex = saved_pending;
     proc.next_method_states = saved_next_methods;
 
-    if !cache_hit {
+    if !cache_hit && !uses_eql {
         let effective_method = call_mop_function(
             proc,
             ctx,
@@ -5616,7 +5691,11 @@ fn prim_method_specializers(
     if let Some(mid) = method_id_from_node(proc, args[0]) {
         if let Some(specs) = proc.mop.get_method_specializers(mid) {
             let specs = specs.to_vec();
-            return Ok(make_class_list(proc, &specs));
+            let mut nodes = Vec::with_capacity(specs.len());
+            for spec in &specs {
+                nodes.push(specializer_to_node(proc, spec));
+            }
+            return Ok(proc.make_list(&nodes));
         }
     }
     Ok(proc.make_nil())
@@ -5678,6 +5757,44 @@ fn prim_method_body(
         }
     }
     Ok(proc.make_nil())
+}
+
+fn prim_intern_eql_specializer(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "INTERN-EQL-SPECIALIZER requires one argument".to_string(),
+        ));
+    }
+    let obj = args[0];
+    let idx = proc.mop.intern_eql_specializer(&proc.arena.inner, obj);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::EqlSpecializer(idx))))
+}
+
+fn prim_sys_eql_specializer_object(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SYS-EQL-SPECIALIZER-OBJECT requires one argument".to_string(),
+        ));
+    }
+    if let Some(idx) = eql_specializer_id_from_node(proc, args[0]) {
+        if let Some(obj) = proc.mop.get_eql_specializer_object(idx) {
+            return Ok(obj);
+        }
+    }
+    Err(ControlSignal::Error(
+        "SYS-EQL-SPECIALIZER-OBJECT requires an eql-specializer".to_string(),
+    ))
 }
 
 fn prim_slot_definition_name(
@@ -6388,9 +6505,9 @@ fn prim_compute_applicable_methods(
         args[1..].to_vec()
     };
 
-    let arg_classes: Vec<_> = arg_nodes.iter().map(|&a| arg_class_id(proc, a)).collect();
-
-    let methods = proc.mop.compute_applicable_methods(gid, &arg_classes);
+    let methods = proc
+        .mop
+        .compute_applicable_methods(gid, &arg_nodes, &proc.arena.inner);
     let mut nodes = Vec::with_capacity(methods.len());
     for mid in methods {
         nodes.push(
@@ -6422,7 +6539,9 @@ fn prim_compute_applicable_methods_using_classes(
             class_ids.push(cid);
         }
     }
-    let methods = proc.mop.compute_applicable_methods(gid, &class_ids);
+    let methods = proc
+        .mop
+        .compute_applicable_methods_using_classes(gid, &class_ids);
     let mut nodes = Vec::with_capacity(methods.len());
     for mid in methods {
         nodes.push(
@@ -6436,7 +6555,7 @@ fn prim_compute_applicable_methods_using_classes(
 
 fn prim_find_method(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
+    ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if args.len() != 3 {
@@ -6453,9 +6572,9 @@ fn prim_find_method(
         .filter_map(|&n| node_to_symbol(proc, n))
         .collect();
 
-    let specializers: Vec<crate::clos::ClassId> = list_to_vec(proc, args[2])
+    let specializers: Vec<crate::clos::Specializer> = list_to_vec(proc, args[2])
         .iter()
-        .filter_map(|&n| class_id_from_node(proc, n))
+        .map(|&n| parse_specializer_node(proc, ctx, n))
         .collect();
 
     if let Some(gf) = proc.mop.get_generic(gid) {

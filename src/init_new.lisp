@@ -650,6 +650,10 @@
 (defmethod make-method-lambda ((gf standard-generic-function) method lambda-expression env)
   lambda-expression)
 
+(defgeneric eql-specializer-object (specializer))
+(defmethod eql-specializer-object ((specializer eql-specializer))
+  (sys-eql-specializer-object specializer))
+
 (defmethod generic-function-argument-precedence-order ((gf standard-generic-function))
   (sys-generic-function-argument-precedence-order gf))
 
