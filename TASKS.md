@@ -35,9 +35,9 @@ This file tracks MOP work items across conversations.
 - Goal: funcallable standard classes, `set-funcallable-instance-function`, funcallable access.
 - Tests: `tests/mop_funcallable_instances_test.lisp`
 
-## Task 9 — Class/specializer introspection extras
+## Task 9 — Class/specializer introspection extras (DONE)
 - Goal: `class-direct-methods`, `class-direct-generic-functions`, `specializer-direct-methods`, `specializer-direct-generic-functions`.
-- Tests: to add when task starts.
+- Tests: `tests/mop_introspection_extras_test.lisp`
 
 ## Task 10 — Accessor/setf completeness
 - Goal: proper `(setf <reader>)` generic functions for `:accessor`, full accessor method semantics.

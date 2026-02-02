@@ -1342,6 +1342,42 @@ impl MetaObjectProtocol {
         self.methods.get(id.0 as usize).and_then(|m| m.generic)
     }
 
+    pub fn class_direct_methods(&self, class_id: ClassId) -> Vec<MethodId> {
+        let target = Specializer::Class(class_id);
+        self.specializer_direct_methods(&target)
+    }
+
+    pub fn class_direct_generic_functions(&self, class_id: ClassId) -> Vec<GenericId> {
+        let target = Specializer::Class(class_id);
+        self.specializer_direct_generic_functions(&target)
+    }
+
+    pub fn specializer_direct_methods(&self, spec: &Specializer) -> Vec<MethodId> {
+        let mut methods = Vec::new();
+        for (idx, method) in self.methods.iter().enumerate() {
+            if method.specializers.iter().any(|s| s == spec) {
+                methods.push(MethodId(idx as u32));
+            }
+        }
+        methods
+    }
+
+    pub fn specializer_direct_generic_functions(&self, spec: &Specializer) -> Vec<GenericId> {
+        let mut generics = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for method in self.methods.iter() {
+            if !method.specializers.iter().any(|s| s == spec) {
+                continue;
+            }
+            if let Some(gid) = method.generic {
+                if seen.insert(gid) {
+                    generics.push(gid);
+                }
+            }
+        }
+        generics
+    }
+
     pub fn get_wrapper(&self, kind: WrapperKind, id: MethodId) -> Option<MethodId> {
         match kind {
             WrapperKind::Before => self.before_wrappers.get(&id).copied(),

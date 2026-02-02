@@ -587,6 +587,10 @@
 (defgeneric method-function (method))
 (defgeneric make-method-lambda (gf method lambda-expression env))
 (defgeneric generic-function-argument-precedence-order (gf))
+(defgeneric class-direct-methods (class))
+(defgeneric class-direct-generic-functions (class))
+(defgeneric specializer-direct-methods (specializer))
+(defgeneric specializer-direct-generic-functions (specializer))
 (defgeneric add-dependent (metaobject dependent))
 (defgeneric remove-dependent (metaobject dependent))
 (defgeneric map-dependents (metaobject function))
@@ -661,6 +665,24 @@
 
 (defmethod generic-function-argument-precedence-order ((gf standard-generic-function))
   (sys-generic-function-argument-precedence-order gf))
+
+(defmethod class-direct-methods ((class standard-class))
+  (sys-class-direct-methods class))
+
+(defmethod class-direct-generic-functions ((class standard-class))
+  (sys-class-direct-generic-functions class))
+
+(defmethod specializer-direct-methods ((specializer standard-class))
+  (sys-specializer-direct-methods specializer))
+
+(defmethod specializer-direct-methods ((specializer eql-specializer))
+  (sys-specializer-direct-methods specializer))
+
+(defmethod specializer-direct-generic-functions ((specializer standard-class))
+  (sys-specializer-direct-generic-functions specializer))
+
+(defmethod specializer-direct-generic-functions ((specializer eql-specializer))
+  (sys-specializer-direct-generic-functions specializer))
 
 (defmethod add-dependent ((metaobject standard-class) dependent)
   (sys-add-dependent metaobject dependent))

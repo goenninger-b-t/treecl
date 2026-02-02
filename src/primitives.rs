@@ -195,6 +195,26 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     );
     globals.register_primitive("CLASS-DIRECT-SLOTS", cl, prim_class_direct_slots);
     globals.register_primitive("CLASS-SLOTS", cl, prim_class_slots);
+    globals.register_primitive(
+        "SYS-CLASS-DIRECT-METHODS",
+        cl,
+        prim_sys_class_direct_methods,
+    );
+    globals.register_primitive(
+        "SYS-CLASS-DIRECT-GENERIC-FUNCTIONS",
+        cl,
+        prim_sys_class_direct_generic_functions,
+    );
+    globals.register_primitive(
+        "SYS-SPECIALIZER-DIRECT-METHODS",
+        cl,
+        prim_sys_specializer_direct_methods,
+    );
+    globals.register_primitive(
+        "SYS-SPECIALIZER-DIRECT-GENERIC-FUNCTIONS",
+        cl,
+        prim_sys_specializer_direct_generic_functions,
+    );
     globals.register_primitive("CLASS-PRECEDENCE-LIST", cl, prim_class_precedence_list);
     globals.register_primitive("CLASS-FINALIZED-P", cl, prim_class_finalized_p);
     globals.register_primitive("CLASS-PROTOTYPE", cl, prim_class_prototype);
@@ -3196,6 +3216,37 @@ fn parse_specializer_node(
     crate::clos::Specializer::Class(proc.mop.t_class)
 }
 
+fn specializer_from_node(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Result<crate::clos::Specializer, ControlSignal> {
+    if let Some(idx) = eql_specializer_id_from_node(proc, node) {
+        return Ok(crate::clos::Specializer::Eql(idx));
+    }
+
+    if let Some(cid) = class_id_from_node(proc, node) {
+        return Ok(crate::clos::Specializer::Class(cid));
+    }
+
+    if let Node::Fork(car, rest) = proc.arena.inner.get_unchecked(node).clone() {
+        if let Some(sym) = node_to_symbol(proc, car) {
+            if let Some(name) = ctx.symbols.read().unwrap().symbol_name(sym) {
+                if name.eq_ignore_ascii_case("EQL") {
+                    if let Node::Fork(obj, _) = proc.arena.inner.get_unchecked(rest).clone() {
+                        let idx = proc.mop.intern_eql_specializer(&proc.arena.inner, obj);
+                        return Ok(crate::clos::Specializer::Eql(idx));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(ControlSignal::Error(
+        "Invalid specializer (expected class or eql specializer)".to_string(),
+    ))
+}
+
 fn specializer_to_node(proc: &mut Process, spec: &crate::clos::Specializer) -> NodeId {
     match spec {
         crate::clos::Specializer::Class(cid) => proc
@@ -5464,6 +5515,88 @@ fn prim_class_slots(
         }
     }
     Ok(proc.make_nil())
+}
+
+fn prim_sys_class_direct_methods(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SYS-CLASS-DIRECT-METHODS requires one argument".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or_else(|| {
+        ControlSignal::Error("SYS-CLASS-DIRECT-METHODS expects a class".to_string())
+    })?;
+    let methods = proc.mop.class_direct_methods(class_id);
+    Ok(make_method_list(proc, &methods))
+}
+
+fn prim_sys_class_direct_generic_functions(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SYS-CLASS-DIRECT-GENERIC-FUNCTIONS requires one argument".to_string(),
+        ));
+    }
+    let class_id = class_id_from_node(proc, args[0]).ok_or_else(|| {
+        ControlSignal::Error(
+            "SYS-CLASS-DIRECT-GENERIC-FUNCTIONS expects a class".to_string(),
+        )
+    })?;
+    let generics = proc.mop.class_direct_generic_functions(class_id);
+    let mut nodes = Vec::with_capacity(generics.len());
+    for gid in generics {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Generic(gid.0))),
+        );
+    }
+    Ok(proc.make_list(&nodes))
+}
+
+fn prim_sys_specializer_direct_methods(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SYS-SPECIALIZER-DIRECT-METHODS requires one argument".to_string(),
+        ));
+    }
+    let spec = specializer_from_node(proc, ctx, args[0])?;
+    let methods = proc.mop.specializer_direct_methods(&spec);
+    Ok(make_method_list(proc, &methods))
+}
+
+fn prim_sys_specializer_direct_generic_functions(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return Err(ControlSignal::Error(
+            "SYS-SPECIALIZER-DIRECT-GENERIC-FUNCTIONS requires one argument".to_string(),
+        ));
+    }
+    let spec = specializer_from_node(proc, ctx, args[0])?;
+    let generics = proc.mop.specializer_direct_generic_functions(&spec);
+    let mut nodes = Vec::with_capacity(generics.len());
+    for gid in generics {
+        nodes.push(
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Generic(gid.0))),
+        );
+    }
+    Ok(proc.make_list(&nodes))
 }
 
 fn prim_class_precedence_list(
