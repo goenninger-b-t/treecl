@@ -72,11 +72,12 @@ fn main() -> io::Result<()> {
         let mut expressions = Vec::new();
         {
             let mut symbols_guard = globals.symbols.write().unwrap();
+            let readtable = interpreter.process.current_readtable().clone();
             let mut reader = treecl::reader::Reader::new(
                 INIT_LISP,
                 &mut interpreter.process.arena.inner,
                 &mut *symbols_guard,
-                &interpreter.process.readtable,
+                &readtable,
                 Some(&mut interpreter.process.arrays),
             );
 
@@ -116,11 +117,12 @@ fn main() -> io::Result<()> {
             process.status = Status::Runnable;
 
             let mut symbols_guard = globals.symbols.write().unwrap();
+            let readtable = process.current_readtable().clone();
             let mut reader = treecl::reader::Reader::new(
                 &file_content,
                 &mut process.arena.inner,
                 &mut *symbols_guard,
-                &process.readtable,
+                &readtable,
                 Some(&mut process.arrays),
             );
 

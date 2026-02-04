@@ -112,3 +112,30 @@ MOP implementation status (TreeCL)
 - Added introspection extras: `class-direct-methods`, `class-direct-generic-functions`, `specializer-direct-methods`, and `specializer-direct-generic-functions`.
 - Accessor/setf completeness is now covered by Task 10 in `TASKS.md` (done).
 - Process-level caching: NIL/T/UNBOUND nodes are cached per process arena (`make_nil`, `make_t`, `make_unbound`) to reduce allocations and stabilize identity for NIL/T; instance allocation reuses the cached UNBOUND node.
+
+--------------------------------------------------------------------------------
+ANSI Common Lisp compliance status (TreeCL, Feb 4 2026)
+--------------------------------------------------------------------------------
+- Status summary: TreeCL is an experimental CL with a working evaluator, basic reader, minimal standard library, and a mostly-complete MOP, but it is far from full ANSI compliance. Many ANSI test categories are missing or partially stubbed.
+- Special forms and evaluator: core forms like `quote`, `if`, `progn`, `setq`, `let`, `lambda`, `function`, `block`, `return-from`, `tagbody`, `go`, `catch`, `throw`, `unwind-protect`, `defmacro`, `multiple-value-bind`, `multiple-value-call`, `values`, `flet`, `labels`, `macrolet`, `symbol-macrolet`, `load-time-value`, `progv` exist, but some ANSI forms are missing or incomplete, notably `eval-when`, `the`, `multiple-value-prog1`, and full declaration handling (`locally`/`declare`) in `src/eval.rs`.
+- Reader/readtable: `src/reader.rs` supports lists, strings, quote/quasiquote/unquote, line comments, `#'`, `#\` character literals (stored as integers), `#(` vectors, `#:` gensyms, `#x/#o/#b` radix ints, `#P` pathnames (passes through), and `#+/-` feature checks with hardcoded features. Missing or incomplete: dispatch macros `#.` (read-time eval), `#| |#` block comments, `#n=`/`#n#` (circular), `#S`, `#A`, `#*`, `#R`, `#C`, `#:` details, `read-number-dispatch`, readtable-case, `*readtable*`/`*read-base*`/`*read-eval*`/`*read-suppress*` variables, and ANSI numeric token syntax.
+- Packages/symbols: `src/symbol.rs` implements basic packages (COMMON-LISP, KEYWORD, CL-USER), intern, export, find-package, and in-package. Missing: `defpackage`, `find-symbol` status, import/export/shadowing/shadowing-import/unintern/use-package/unuse-package, package nicknames management, with-package-iterator, and most package accessors (use-list/used-by-list/shadowing-symbols).
+- Numbers: numeric tower is limited to integers, bignums, and f64 floats (`OpaqueValue::Integer`, `BigInt`, `Float`). Missing: ratios, complexes, float subtypes, and most numeric functions (`floor`, `ceiling`, `round`, `truncate`, `rational`, `numerator`, `denominator`, `phase`, etc.).
+- Characters/strings: characters are not a distinct type (reader maps `#\` to integer). String functionality is minimal; many ANSI string functions and character predicates are missing.
+- Arrays/sequences: arrays are only simple vectors in `src/arrays.rs`, with `make-array/aref/set-aref` support for one-dimensional vectors. Missing: multi-dimensional arrays, adjustable arrays, fill pointers, displaced arrays, bit-vectors, and full sequence functions (`elt`, `subseq`, `map`, `reduce`, `position`, `remove`, `sort`, etc.).
+- Hash tables: `src/hashtables.rs` implements a linear-scan hash table with tests `eq/eql/equal/equalp`, but lacks hashing, rehashing controls, and standard API surface (maphash, clrhash, hash-table-xxx accessors, sxhash).
+- Streams/files/pathnames: `src/streams.rs` covers basic standard streams plus string/file/broadcast/two-way/echo/synonym scaffolding, but there are no ANSI stream functions like `open`, `read-char`, `read-line`, `peek-char`, `unread-char`, `read-byte`, `write-byte`, `finish-output`, etc. Pathname functions in `src/primitives.rs` are stubs (`make-pathname`, `merge-pathnames`, `pathname-type`, `truename`, `directory`, `compile-file-pathname`).
+- Conditions: `src/conditions.rs` provides basic handler/restart stacks and simple error types, but `define-condition`, `signal`, `warn`, `handler-case`, `restart-case`, `invoke-restart`, and correct condition class integration with CLOS are missing or incomplete.
+- Compiler/load: `load` in `src/primitives.rs` reads and evals forms from a file; there is no ANSI `compile-file` pipeline and `macroexpand-1` currently returns a two-element list instead of multiple values. `eval-when` semantics are not implemented.
+- Types/structures: `typep`, `subtypep`, `type-of`, `deftype`, and `defstruct` are missing. Type declarations and `the` are not enforced.
+- Printer: `format` exists but is limited; `print`/`prin1`/`princ` support is minimal, and `*print-*` variables and pretty printer are not implemented.
+- CLOS: MOP is strong, but ANSI class/type integration, built-in classes, full method combination, and CLOS-related type predicates remain incomplete.
+- ANSI tests: the suite lives in `tests/ansi-test`. Full compliance will require closing the gaps above, then running category-by-category tests.
+- ASDF: asdf.lisp is not yet present in the repo; loading it requires full ANSI reader, package system, pathnames/files/streams, eval-when/load-time-value, and condition handling.
+
+--------------------------------------------------------------------------------
+Progress update (Feb 4 2026)
+--------------------------------------------------------------------------------
+- Added `src/asdf.lisp` (vendor drop-in) for ASDF bootstrap work.
+- Reader improvements (in progress): added readtable store + case modes, `*readtable*`/`*read-base*`/`*read-eval*`/`*read-suppress*`/`*features*` defaults, readtable-case handling with escape-aware symbol parsing, `#.` read-time eval hook (used by `load`), and `#| |#` block comments; feature expressions now consult `*features*`.
+- Note: multiple values, full reader macro coverage (`#n=`/`#n#`, `#R`, etc.), and full readtable API (`read`, `read-from-string`, `get-macro-character` returning function values, etc.) remain outstanding for ANSI reader compliance.

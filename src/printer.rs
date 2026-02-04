@@ -266,6 +266,9 @@ impl<'a> Printer<'a> {
                     class_id, slot_idx, tag
                 ));
             }
+            OpaqueValue::Readtable(id) => {
+                self.output.push_str(&format!("#<readtable:{}>", id));
+            }
         }
     }
 

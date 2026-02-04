@@ -78,20 +78,19 @@ impl Package {
 
     /// Export a symbol
     pub fn export(&mut self, name: &str, sym: SymbolId) {
-        self.external.insert(name.to_uppercase(), sym);
+        self.external.insert(name.to_string(), sym);
     }
 
     /// Find an external symbol
     pub fn find_external(&self, name: &str) -> Option<SymbolId> {
-        self.external.get(&name.to_uppercase()).copied()
+        self.external.get(name).copied()
     }
 
     /// Find any symbol (internal or external)
     pub fn find_symbol(&self, name: &str) -> Option<SymbolId> {
-        let upper = name.to_uppercase();
         self.external
-            .get(&upper)
-            .or_else(|| self.internal.get(&upper))
+            .get(name)
+            .or_else(|| self.internal.get(name))
             .copied()
     }
 }
@@ -228,18 +227,18 @@ impl SymbolTable {
 
     /// Intern a symbol in a specific package
     pub fn intern_in(&mut self, name: &str, pkg_id: PackageId) -> SymbolId {
-        let upper = name.to_uppercase();
+        let name = name.to_string();
 
         // Check if already exists in package
         if let Some(pkg) = self.packages.get(pkg_id.0 as usize) {
-            if let Some(sym) = pkg.find_symbol(&upper) {
+            if let Some(sym) = pkg.find_symbol(&name) {
                 return sym;
             }
 
             // Check used packages for external symbol
             for &used_id in &pkg.use_list.clone() {
                 if let Some(used_pkg) = self.packages.get(used_id.0 as usize) {
-                    if let Some(sym) = used_pkg.find_external(&upper) {
+                    if let Some(sym) = used_pkg.find_external(&name) {
                         return sym;
                     }
                 }
@@ -248,16 +247,16 @@ impl SymbolTable {
 
         // Create new symbol
         let sym_id = SymbolId(self.symbols.len() as u32);
-        let symbol = Symbol::new(upper.clone(), Some(pkg_id));
+        let symbol = Symbol::new(name.clone(), Some(pkg_id));
         self.symbols.push(symbol);
 
         // Add to package
         if let Some(pkg) = self.packages.get_mut(pkg_id.0 as usize) {
             // Keywords are automatically external
             if pkg_id == PackageId(0) {
-                pkg.external.insert(upper, sym_id);
+                pkg.external.insert(name, sym_id);
             } else {
-                pkg.internal.insert(upper, sym_id);
+                pkg.internal.insert(name, sym_id);
             }
         }
 
@@ -272,7 +271,7 @@ impl SymbolTable {
     /// Create an uninterned symbol (gensym)
     pub fn make_symbol(&mut self, name: &str) -> SymbolId {
         let sym_id = SymbolId(self.symbols.len() as u32);
-        let symbol = Symbol::new(name.to_uppercase(), None);
+        let symbol = Symbol::new(name.to_string(), None);
         self.symbols.push(symbol);
         sym_id
     }

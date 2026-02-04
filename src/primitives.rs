@@ -6,6 +6,7 @@ use crate::arena::{Arena, Node};
 use crate::context::PrimitiveFn;
 use crate::eval::{Closure, ControlSignal, Environment, EvalResult, Interpreter, ParsedLambdaList};
 use crate::process::Process;
+use crate::readtable::{ReadtableCase, ReadtableId};
 use crate::symbol::{PackageId, SymbolId};
 use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
@@ -331,6 +332,10 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("SET-MACRO-CHARACTER", cl, prim_set_macro_character);
     globals.register_primitive("GET-MACRO-CHARACTER", cl, prim_get_macro_character);
     globals.register_primitive("SET-SYNTAX-FROM-CHAR", cl, prim_set_syntax_from_char);
+    globals.register_primitive("READTABLEP", cl, prim_readtablep);
+    globals.register_primitive("COPY-READTABLE", cl, prim_copy_readtable);
+    globals.register_primitive("READTABLE-CASE", cl, prim_readtable_case);
+    globals.register_primitive("SET-READTABLE-CASE", cl, prim_set_readtable_case);
 
     // Tools
     globals.register_primitive("COMPILE", cl, prim_compile);
@@ -1104,24 +1109,45 @@ fn prim_load(
 
         let mut exprs = Vec::new();
         // Scope for reader
-        {
+        let read_result: Result<(), ControlSignal> = {
             let mut symbols_guard = ctx.symbols.write().unwrap();
-            let mut reader = crate::reader::Reader::new(
+            let options = build_reader_options(&interpreter.process, ctx, false);
+            let rt_id = current_readtable_id(&interpreter.process, ctx);
+            let readtable = interpreter
+                .process
+                .readtable_by_id(rt_id)
+                .expect("readtable missing")
+                .clone();
+            // Enable read-time eval for #. while loading
+            crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
+                proc_ptr: interpreter.process as *mut _,
+                globals_ptr: ctx as *const _,
+                env_ptr: &env as *const _,
+            }));
+            let mut reader = crate::reader::Reader::new_with_options(
                 &content,
                 &mut interpreter.process.arena.inner,
                 &mut *symbols_guard,
-                &interpreter.process.readtable,
+                &readtable,
                 Some(&mut interpreter.process.arrays),
+                options,
             );
 
             loop {
                 match reader.read() {
                     Ok(expr) => exprs.push(expr),
                     Err(crate::reader::ReaderError::UnexpectedEof) => break,
-                    Err(e) => return Err(ControlSignal::Error(format!("LOAD: read error: {}", e))),
+                    Err(e) => {
+                        crate::reader::set_read_eval_context(None);
+                        return Err(ControlSignal::Error(format!("LOAD: read error: {}", e)));
+                    }
                 }
             }
-        }
+            Ok(())
+        };
+        crate::reader::set_read_eval_context(None);
+        read_result?;
+        crate::reader::set_read_eval_context(None);
 
         for expr in exprs {
             interpreter.eval(expr, &env)?;
@@ -1143,6 +1169,66 @@ fn prim_load(
     } else {
         err_helper("LOAD: missing argument")
     }
+}
+
+fn build_reader_options(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    preserve_whitespace: bool,
+) -> crate::reader::ReaderOptions {
+    let mut opts = crate::reader::ReaderOptions::default();
+    opts.preserve_whitespace = preserve_whitespace;
+
+    let get_sym = |name: &str| -> crate::symbol::SymbolId {
+        ctx.symbols
+            .write()
+            .unwrap()
+            .intern_in(name, crate::symbol::PackageId(1))
+    };
+
+    let read_base_sym = get_sym("*READ-BASE*");
+    if let Some(val) = proc.get_value(read_base_sym) {
+        if let Node::Leaf(OpaqueValue::Integer(n)) = proc.arena.inner.get_unchecked(val) {
+            if *n >= 2 && *n <= 36 {
+                opts.read_base = *n as u32;
+            }
+        }
+    }
+
+    let read_eval_sym = get_sym("*READ-EVAL*");
+    if let Some(val) = proc.get_value(read_eval_sym) {
+        opts.read_eval = !matches!(proc.arena.inner.get_unchecked(val), Node::Leaf(OpaqueValue::Nil));
+    }
+
+    let read_suppress_sym = get_sym("*READ-SUPPRESS*");
+    if let Some(val) = proc.get_value(read_suppress_sym) {
+        opts.read_suppress =
+            !matches!(proc.arena.inner.get_unchecked(val), Node::Leaf(OpaqueValue::Nil));
+    }
+
+    let features_sym = get_sym("*FEATURES*");
+    if let Some(val) = proc.get_value(features_sym) {
+        let mut feats = Vec::new();
+        let mut cur = val;
+        while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(cur) {
+            if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(*car) {
+                if let Some(name) = ctx
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(crate::symbol::SymbolId(*id))
+                {
+                    feats.push(name.to_uppercase());
+                }
+            }
+            cur = *cdr;
+        }
+        if !feats.is_empty() {
+            opts.features = feats;
+        }
+    }
+
+    opts
 }
 
 fn prim_mapc(
@@ -1915,6 +2001,11 @@ fn prim_eq(
                 return Ok(proc.make_t(ctx));
             }
         }
+        (Node::Leaf(OpaqueValue::Readtable(id1)), Node::Leaf(OpaqueValue::Readtable(id2))) => {
+            if id1 == id2 {
+                return Ok(proc.make_t(ctx));
+            }
+        }
         (
             Node::Leaf(OpaqueValue::SlotDefinition(c1, s1, d1)),
             Node::Leaf(OpaqueValue::SlotDefinition(c2, s2, d2)),
@@ -1983,6 +2074,11 @@ fn prim_eql(
             }
         }
         (Node::Leaf(OpaqueValue::EqlSpecializer(id1)), Node::Leaf(OpaqueValue::EqlSpecializer(id2))) => {
+            if id1 == id2 {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+        (Node::Leaf(OpaqueValue::Readtable(id1)), Node::Leaf(OpaqueValue::Readtable(id2))) => {
             if id1 == id2 {
                 return Ok(proc.make_t(ctx));
             }
@@ -7861,9 +7957,9 @@ fn prim_set_macro_character(
 ) -> EvalResult {
     // (set-macro-character char function [non-terminating-p])
     // function: currently only accepts a SYMBOL naming a built-in macro.
-    if args.len() < 2 || args.len() > 3 {
+    if args.len() < 2 || args.len() > 4 {
         return Err(crate::eval::ControlSignal::Error(
-            "set-macro-character requires 2 or 3 arguments".to_string(),
+            "SET-MACRO-CHARACTER requires 2 to 4 arguments".to_string(),
         ));
     }
 
@@ -7908,6 +8004,16 @@ fn prim_set_macro_character(
         false
     };
 
+    // 4. Optional readtable
+    let rt_id = if args.len() > 3 {
+        readtable_from_node(proc, args[3])?
+    } else {
+        current_readtable_id(proc, ctx)
+    };
+    let rt = proc
+        .readtable_by_id_mut(rt_id)
+        .ok_or_else(|| ControlSignal::Error("SET-MACRO-CHARACTER: invalid readtable".to_string()))?;
+
     // Update readtable
     use crate::readtable::SyntaxType;
     let syntax = if non_terminating {
@@ -7916,10 +8022,139 @@ fn prim_set_macro_character(
         SyntaxType::TerminatingMacro
     };
 
-    proc.readtable.set_syntax_type(ch, syntax);
-    proc.readtable.set_macro_character(ch, Some(macro_fn));
+    rt.set_syntax_type(ch, syntax);
+    rt.set_macro_character(ch, Some(macro_fn));
 
     Ok(proc.make_t(ctx))
+}
+
+fn prim_readtablep(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("READTABLEP requires exactly 1 argument");
+    }
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Readtable(_)) => Ok(proc.make_t(ctx)),
+        _ => Ok(proc.make_nil()),
+    }
+}
+
+fn prim_copy_readtable(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 2 {
+        return err_helper("COPY-READTABLE accepts at most 2 arguments");
+    }
+
+    let from_id = if args.is_empty() {
+        current_readtable_id(proc, ctx)
+    } else {
+        readtable_from_node(proc, args[0])?
+    };
+
+    let from = proc
+        .readtable_by_id(from_id)
+        .ok_or_else(|| ControlSignal::Error("COPY-READTABLE: missing source".to_string()))?
+        .clone();
+
+    let dest_id = if args.len() == 2 {
+        match proc.arena.inner.get_unchecked(args[1]) {
+            Node::Leaf(OpaqueValue::Nil) => proc.readtables.alloc(from),
+            Node::Leaf(OpaqueValue::Readtable(id)) => {
+                let rid = ReadtableId(*id);
+                if let Some(dest) = proc.readtable_by_id_mut(rid) {
+                    *dest = from;
+                    rid
+                } else {
+                    return err_helper("COPY-READTABLE: invalid destination");
+                }
+            }
+            _ => return err_helper("COPY-READTABLE: invalid destination"),
+        }
+    } else {
+        proc.readtables.alloc(from)
+    };
+
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Readtable(dest_id.0))))
+}
+
+fn prim_readtable_case(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 1 {
+        return err_helper("READTABLE-CASE accepts at most 1 argument");
+    }
+    let rt_id = if args.is_empty() {
+        current_readtable_id(proc, ctx)
+    } else {
+        readtable_from_node(proc, args[0])?
+    };
+    let rt = proc
+        .readtable_by_id(rt_id)
+        .ok_or_else(|| ControlSignal::Error("READTABLE-CASE: invalid readtable".to_string()))?;
+
+    let case_sym = match rt.readtable_case() {
+        ReadtableCase::Upcase => "UPCASE",
+        ReadtableCase::Downcase => "DOWNCASE",
+        ReadtableCase::Preserve => "PRESERVE",
+        ReadtableCase::Invert => "INVERT",
+    };
+    let sym_id = ctx.symbols.write().unwrap().intern_keyword(case_sym);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))))
+}
+
+fn prim_set_readtable_case(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("SET-READTABLE-CASE requires readtable and case");
+    }
+    let rt_id = readtable_from_node(proc, args[0])?;
+    let case_sym = match proc.arena.inner.get_unchecked(args[1]) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .unwrap_or("")
+            .to_uppercase(),
+        _ => {
+            return err_helper("SET-READTABLE-CASE: case must be a symbol");
+        }
+    };
+
+    let mode = match case_sym.as_str() {
+        "UPCASE" => ReadtableCase::Upcase,
+        "DOWNCASE" => ReadtableCase::Downcase,
+        "PRESERVE" => ReadtableCase::Preserve,
+        "INVERT" => ReadtableCase::Invert,
+        _ => return err_helper("SET-READTABLE-CASE: invalid case symbol"),
+    };
+
+    if let Some(rt) = proc.readtable_by_id_mut(rt_id) {
+        rt.set_readtable_case(mode);
+    }
+
+    let sym_id = ctx.symbols.write().unwrap().intern_keyword(&case_sym);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))))
 }
 
 fn prim_get_macro_character(
@@ -7927,8 +8162,8 @@ fn prim_get_macro_character(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    if args.is_empty() {
-        return err_helper("get-macro-character: too few arguments");
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("GET-MACRO-CHARACTER requires 1 or 2 arguments");
     }
 
     let ch_code = if let Node::Leaf(OpaqueValue::Integer(n)) =
@@ -7942,7 +8177,16 @@ fn prim_get_macro_character(
     let ch = std::char::from_u32(ch_code)
         .ok_or_else(|| ControlSignal::Error(format!("Invalid char code: {}", ch_code)))?;
 
-    if let Some(_func) = proc.readtable.get_macro_character(ch) {
+    let rt_id = if args.len() > 1 {
+        readtable_from_node(proc, args[1])?
+    } else {
+        current_readtable_id(proc, ctx)
+    };
+    let rt = proc
+        .readtable_by_id(rt_id)
+        .ok_or_else(|| ControlSignal::Error("GET-MACRO-CHARACTER: invalid readtable".to_string()))?;
+
+    if let Some(_func) = rt.get_macro_character(ch) {
         // We can't return the Rust function pointer directly as a Lisp object yet
         // For Phase 10, let's just return T if a macro is set, or NIL.
         // In next phases, we would return a special OpaqueValue for read-macros.
@@ -7957,8 +8201,8 @@ fn prim_set_syntax_from_char(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    if args.len() < 2 {
-        return err_helper("set-syntax-from-char: too few arguments");
+    if args.len() < 2 || args.len() > 4 {
+        return err_helper("SET-SYNTAX-FROM-CHAR requires 2 to 4 arguments");
     }
 
     let to_code = if let Node::Leaf(OpaqueValue::Integer(n)) =
@@ -7982,14 +8226,31 @@ fn prim_set_syntax_from_char(
     let from_ch = std::char::from_u32(from_code)
         .ok_or_else(|| ControlSignal::Error(format!("Invalid from-char code: {}", from_code)))?;
 
-    let syntax = proc.readtable.get_syntax_type(from_ch);
-    let macro_fn = proc.readtable.get_macro_character(from_ch);
-
-    proc.readtable.set_syntax_type(to_ch, syntax);
-    if let Some(f) = macro_fn {
-        proc.readtable.set_macro_character(to_ch, Some(f));
+    let to_rt_id = if args.len() > 2 {
+        readtable_from_node(proc, args[2])?
     } else {
-        proc.readtable.set_macro_character(to_ch, None);
+        current_readtable_id(proc, ctx)
+    };
+    let from_rt_id = if args.len() > 3 {
+        readtable_from_node(proc, args[3])?
+    } else {
+        current_readtable_id(proc, ctx)
+    };
+
+    let from_rt = proc
+        .readtable_by_id(from_rt_id)
+        .ok_or_else(|| ControlSignal::Error("SET-SYNTAX-FROM-CHAR: invalid from readtable".to_string()))?;
+    let syntax = from_rt.get_syntax_type(from_ch);
+    let macro_fn = from_rt.get_macro_character(from_ch);
+
+    let to_rt = proc
+        .readtable_by_id_mut(to_rt_id)
+        .ok_or_else(|| ControlSignal::Error("SET-SYNTAX-FROM-CHAR: invalid to readtable".to_string()))?;
+    to_rt.set_syntax_type(to_ch, syntax);
+    if let Some(f) = macro_fn {
+        to_rt.set_macro_character(to_ch, Some(f));
+    } else {
+        to_rt.set_macro_character(to_ch, None);
     }
 
     Ok(proc.make_t(ctx))
@@ -8000,6 +8261,44 @@ fn get_reader_macro(name: &str) -> Option<crate::readtable::ReaderMacroFn> {
         "READ-LEFT-BRACKET" => Some(wrap_read_left_bracket),
         "READ-RIGHT-BRACKET" => Some(wrap_read_right_bracket),
         _ => None,
+    }
+}
+
+fn current_readtable_id(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+) -> ReadtableId {
+    let readtable_sym = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in("*READTABLE*", PackageId(1));
+    if let Some(val) = proc.get_value(readtable_sym) {
+        if let Node::Leaf(OpaqueValue::Readtable(id)) = proc.arena.inner.get_unchecked(val) {
+            let rid = ReadtableId(*id);
+            if proc.readtable_by_id(rid).is_some() {
+                return rid;
+            }
+        }
+    }
+    proc.current_readtable
+}
+
+fn readtable_from_node(
+    proc: &crate::process::Process,
+    node: NodeId,
+) -> Result<ReadtableId, ControlSignal> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Readtable(id)) => {
+            let rid = ReadtableId(*id);
+            if proc.readtable_by_id(rid).is_some() {
+                Ok(rid)
+            } else {
+                Err(ControlSignal::Error("Invalid readtable id".to_string()))
+            }
+        }
+        Node::Leaf(OpaqueValue::Nil) => Ok(proc.standard_readtable),
+        _ => Err(ControlSignal::Error("Invalid readtable designator".to_string())),
     }
 }
 

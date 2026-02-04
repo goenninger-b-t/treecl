@@ -20,12 +20,26 @@ pub enum SyntaxType {
 /// Takes the Reader and the triggering character.
 pub type ReaderMacroFn = fn(&mut Reader, char) -> ReaderResult;
 
+/// Readtable case modes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadtableCase {
+    Upcase,
+    Downcase,
+    Preserve,
+    Invert,
+}
+
+/// Handle for a stored readtable
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReadtableId(pub u32);
+
 /// The Readtable
 #[derive(Clone)]
 pub struct Readtable {
     syntax_types: HashMap<char, SyntaxType>,
     macro_functions: HashMap<char, ReaderMacroFn>,
     default_syntax: SyntaxType,
+    case_mode: ReadtableCase,
 }
 
 impl Readtable {
@@ -34,6 +48,7 @@ impl Readtable {
             syntax_types: HashMap::new(),
             macro_functions: HashMap::new(),
             default_syntax: SyntaxType::Constituent,
+            case_mode: ReadtableCase::Upcase,
         };
         rt.initialize_standard();
         rt
@@ -84,5 +99,47 @@ impl Readtable {
     
     pub fn is_whitespace(&self, c: char) -> bool {
         self.get_syntax_type(c) == SyntaxType::Whitespace
+    }
+
+    pub fn readtable_case(&self) -> ReadtableCase {
+        self.case_mode
+    }
+
+    pub fn set_readtable_case(&mut self, mode: ReadtableCase) {
+        self.case_mode = mode;
+    }
+}
+
+/// Storage for readtables
+pub struct ReadtableStore {
+    tables: Vec<Readtable>,
+    free_list: Vec<u32>,
+}
+
+impl ReadtableStore {
+    pub fn new() -> Self {
+        Self {
+            tables: Vec::new(),
+            free_list: Vec::new(),
+        }
+    }
+
+    pub fn alloc(&mut self, table: Readtable) -> ReadtableId {
+        if let Some(idx) = self.free_list.pop() {
+            self.tables[idx as usize] = table;
+            ReadtableId(idx)
+        } else {
+            let idx = self.tables.len() as u32;
+            self.tables.push(table);
+            ReadtableId(idx)
+        }
+    }
+
+    pub fn get(&self, id: ReadtableId) -> Option<&Readtable> {
+        self.tables.get(id.0 as usize)
+    }
+
+    pub fn get_mut(&mut self, id: ReadtableId) -> Option<&mut Readtable> {
+        self.tables.get_mut(id.0 as usize)
     }
 }

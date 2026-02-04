@@ -4,9 +4,11 @@
 
 use crate::arena::{Arena, Node};
 use crate::arrays::ArrayStore;
-use crate::readtable::{Readtable, SyntaxType};
+use crate::readtable::{Readtable, ReadtableCase, SyntaxType};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -34,6 +36,49 @@ impl std::fmt::Display for ReaderError {
 
 pub type ReaderResult = Result<NodeId, ReaderError>;
 
+pub struct ReaderOptions {
+    pub read_base: u32,
+    pub read_eval: bool,
+    pub read_suppress: bool,
+    pub preserve_whitespace: bool,
+    pub features: Vec<String>,
+}
+
+impl Default for ReaderOptions {
+    fn default() -> Self {
+        Self {
+            read_base: 10,
+            read_eval: true,
+            read_suppress: false,
+            preserve_whitespace: false,
+            features: vec![
+                "ANSI-CL".to_string(),
+                "COMMON-LISP".to_string(),
+                "TREECL".to_string(),
+                "IEEE-FLOATING-POINT".to_string(),
+                "X86-64".to_string(),
+                "LITTLE-ENDIAN".to_string(),
+            ],
+        }
+    }
+}
+
+pub struct ReadEvalContext {
+    pub proc_ptr: *mut crate::process::Process,
+    pub globals_ptr: *const crate::context::GlobalContext,
+    pub env_ptr: *const crate::eval::Environment,
+}
+
+thread_local! {
+    static READ_EVAL_CONTEXT: RefCell<Option<ReadEvalContext>> = RefCell::new(None);
+}
+
+pub fn set_read_eval_context(ctx: Option<ReadEvalContext>) {
+    READ_EVAL_CONTEXT.with(|cell| {
+        *cell.borrow_mut() = ctx;
+    });
+}
+
 /// The TreeCL Reader
 pub struct Reader<'a> {
     input: Peekable<Chars<'a>>,
@@ -42,6 +87,12 @@ pub struct Reader<'a> {
     readtable: &'a Readtable,
     arrays: Option<&'a mut ArrayStore>,
     nil_node: NodeId,
+    read_base: u32,
+    read_eval: bool,
+    read_suppress: bool,
+    preserve_whitespace: bool,
+    features: Vec<String>,
+    label_map: HashMap<u32, NodeId>,
 }
 
 impl<'a> Reader<'a> {
@@ -51,6 +102,24 @@ impl<'a> Reader<'a> {
         symbols: &'a mut SymbolTable,
         readtable: &'a Readtable,
         arrays: Option<&'a mut ArrayStore>,
+    ) -> Self {
+        Self::new_with_options(
+            input,
+            arena,
+            symbols,
+            readtable,
+            arrays,
+            ReaderOptions::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        input: &'a str,
+        arena: &'a mut Arena,
+        symbols: &'a mut SymbolTable,
+        readtable: &'a Readtable,
+        arrays: Option<&'a mut ArrayStore>,
+        options: ReaderOptions,
     ) -> Self {
         // Create or get NIL node
         let nil_node = arena.alloc(Node::Leaf(OpaqueValue::Nil));
@@ -62,6 +131,16 @@ impl<'a> Reader<'a> {
             readtable,
             arrays,
             nil_node,
+            read_base: options.read_base,
+            read_eval: options.read_eval,
+            read_suppress: options.read_suppress,
+            preserve_whitespace: options.preserve_whitespace,
+            features: options
+                .features
+                .into_iter()
+                .map(|s| s.to_uppercase())
+                .collect(),
+            label_map: HashMap::new(),
         }
     }
 
@@ -73,7 +152,7 @@ impl<'a> Reader<'a> {
             None => Err(ReaderError::UnexpectedEof),
             Some(&c) => {
                 let syntax = self.readtable.get_syntax_type(c);
-                match syntax {
+                let result = match syntax {
                     SyntaxType::TerminatingMacro | SyntaxType::NonTerminatingMacro => {
                         // Dispatch macro
                         // Note: Macros consume the char, so we need to consume it?
@@ -127,7 +206,19 @@ impl<'a> Reader<'a> {
                         self.read()
                     }
                     _ => self.read_atom(), // Constituent, Escape
+                };
+
+                let mut out = result?;
+
+                if self.read_suppress {
+                    out = self.nil_node;
                 }
+
+                if !self.preserve_whitespace {
+                    self.skip_whitespace();
+                }
+
+                Ok(out)
             }
         }
     }
@@ -135,7 +226,7 @@ impl<'a> Reader<'a> {
     /// Skip whitespace and comments
     fn skip_whitespace(&mut self) {
         while let Some(&c) = self.input.peek() {
-            if c.is_whitespace() {
+            if self.readtable.is_whitespace(c) {
                 self.input.next();
             } else {
                 break;
@@ -149,6 +240,58 @@ impl<'a> Reader<'a> {
             if c == '\n' {
                 break;
             }
+        }
+    }
+
+    /// Skip a possibly nested block comment (#| ... |#)
+    fn skip_block_comment(&mut self) -> Result<(), ReaderError> {
+        let mut depth = 1usize;
+        while let Some(c) = self.input.next() {
+            match c {
+                '#' => {
+                    if self.input.peek() == Some(&'|') {
+                        self.input.next();
+                        depth += 1;
+                    }
+                }
+                '|' => {
+                    if self.input.peek() == Some(&'#') {
+                        self.input.next();
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(ReaderError::UnexpectedEof)
+    }
+
+    fn read_eval_form(&mut self, form: NodeId) -> ReaderResult {
+        let result = READ_EVAL_CONTEXT.with(|cell| {
+            cell.borrow().as_ref().map(|ctx| unsafe {
+                let proc = &mut *ctx.proc_ptr;
+                let globals = &*ctx.globals_ptr;
+                let env = &*ctx.env_ptr;
+                let mut interp = crate::eval::Interpreter::new(proc, globals);
+                interp.eval(form, env)
+            })
+        });
+
+        match result {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(ReaderError::InvalidChar(format!(
+                "READ-EVAL error: {:?}",
+                e
+            ))),
+            None => Err(ReaderError::InvalidChar(
+                "READ-EVAL context not available".to_string(),
+            )),
         }
     }
 
@@ -283,6 +426,27 @@ impl<'a> Reader<'a> {
                 self.input.next();
                 self.read_character()
             }
+            Some(&'.') => {
+                // #. read-time eval
+                self.input.next();
+                if self.read_suppress {
+                    let _ = self.read()?;
+                    return Ok(self.nil_node);
+                }
+                if !self.read_eval {
+                    return Err(ReaderError::InvalidChar(
+                        "READ-EVAL is disabled".to_string(),
+                    ));
+                }
+                let form = self.read()?;
+                self.read_eval_form(form)
+            }
+            Some(&'|') => {
+                // #| ... |# block comment (possibly nested)
+                self.input.next();
+                self.skip_block_comment()?;
+                self.read()
+            }
             Some(&'(') => {
                 // #(...) -> vector
                 self.read_vector()
@@ -350,7 +514,7 @@ impl<'a> Reader<'a> {
     /// Read number in specific radix
     fn read_radix(&mut self, radix: u32) -> ReaderResult {
         // Read token
-        let s = self.read_symbol_name();
+        let s = self.read_symbol_name()?;
         // We can reuse read_symbol_name which reads until delimiter
         // Then parse with radix
 
@@ -374,23 +538,12 @@ impl<'a> Reader<'a> {
 
     /// Evaluate a feature expression against *FEATURES* (hardcoded for now)
     fn eval_feature(&mut self, node_id: NodeId) -> bool {
+        let features = &self.features;
         match self.arena.get_unchecked(node_id) {
             Node::Leaf(OpaqueValue::Symbol(id)) => {
-                // Check if symbol is in features
-                // For now, hardcode some features
-                // :ansi-cl :common-lisp :treecl :ieee-floating-point
-                // And maybe platform stuff
                 if let Some(name) = self.symbols.symbol_name(crate::symbol::SymbolId(*id)) {
                     let name = name.to_uppercase();
-                    matches!(
-                        name.as_str(),
-                        "ANSI-CL"
-                            | "COMMON-LISP"
-                            | "TREECL"
-                            | "IEEE-FLOATING-POINT"
-                            | "X86-64"
-                            | "LITTLE-ENDIAN"
-                    )
+                    features.iter().any(|f| f == &name)
                 } else {
                     false
                 }
@@ -457,24 +610,28 @@ impl<'a> Reader<'a> {
 
     /// Read a character literal: #\x or #\space
     fn read_character(&mut self) -> ReaderResult {
-        let mut name = String::new();
-
-        while let Some(&c) = self.input.peek() {
-            if c.is_alphanumeric() || c == '-' {
-                name.push(c);
-                self.input.next();
+        let name = self.read_token_with_case(ReadtableCase::Preserve)?;
+        let ch = if name.is_empty() {
+            // Fallback: single character after #\
+            if let Some(c) = self.input.next() {
+                c
             } else {
-                break;
+                return Err(ReaderError::UnexpectedEof);
             }
-        }
-
-        let ch = match name.to_uppercase().as_str() {
-            "SPACE" => ' ',
-            "NEWLINE" => '\n',
-            "TAB" => '\t',
-            "RETURN" => '\r',
-            s if s.len() == 1 => s.chars().next().unwrap(),
-            _ => return Err(ReaderError::InvalidChar(name)),
+        } else {
+            match name.to_uppercase().as_str() {
+                "SPACE" => ' ',
+                "NEWLINE" => '\n',
+                "TAB" => '\t',
+                "RETURN" => '\r',
+                "LINEFEED" => '\n',
+                "PAGE" => '\x0c',
+                "RUBOUT" => '\x7f',
+                "BACKSPACE" => '\x08',
+                "NULL" => '\0',
+                s if s.len() == 1 => s.chars().next().unwrap(),
+                _ => return Err(ReaderError::InvalidChar(name)),
+            }
         };
 
         // Store character as integer (code point)
@@ -570,7 +727,7 @@ impl<'a> Reader<'a> {
 
     /// Read an uninterned symbol: #:foo
     fn read_uninterned_symbol(&mut self) -> ReaderResult {
-        let name = self.read_symbol_name();
+        let name = self.read_symbol_name()?;
         let sym_id = self.symbols.make_symbol(&name);
         self.symbol_to_node(sym_id)
     }
@@ -583,7 +740,7 @@ impl<'a> Reader<'a> {
 
     /// Read an atom (number or symbol)
     fn read_atom(&mut self) -> ReaderResult {
-        let s = self.read_symbol_name();
+        let s = self.read_symbol_name()?;
         self.parse_atom(&s)
     }
 
@@ -591,50 +748,147 @@ impl<'a> Reader<'a> {
     fn read_atom_with_prefix(&mut self, prefix: char) -> ReaderResult {
         let mut s = String::new();
         s.push(prefix);
-        s.push_str(&self.read_symbol_name());
+        s.push_str(&self.read_symbol_name()?);
         self.parse_atom(&s)
     }
 
     /// Read a symbol name (until delimiter)
-    /// Check if character is a delimiter (based on readtable)
-    fn is_delimiter(&self, c: char) -> bool {
-        match self.readtable.get_syntax_type(c) {
-            SyntaxType::Whitespace | SyntaxType::TerminatingMacro => true,
-            _ => false,
-        }
-    }
-
-    /// Read a symbol name (until delimiter)
-    fn read_symbol_name(&mut self) -> String {
-        let mut name = String::new();
+    fn read_token_with_case(&mut self, case_mode: ReadtableCase) -> Result<String, ReaderError> {
+        let mut chars: Vec<(char, bool)> = Vec::new();
+        let mut in_multi_escape = false;
 
         while let Some(&c) = self.input.peek() {
-            if self.is_delimiter(c) {
-                break;
+            if in_multi_escape {
+                match c {
+                    '|' => {
+                        self.input.next();
+                        in_multi_escape = false;
+                        continue;
+                    }
+                    '\\' => {
+                        self.input.next();
+                        if let Some(escaped) = self.input.next() {
+                            chars.push((escaped, true));
+                            continue;
+                        } else {
+                            return Err(ReaderError::UnexpectedEof);
+                        }
+                    }
+                    _ => {
+                        self.input.next();
+                        chars.push((c, true));
+                        continue;
+                    }
+                }
             }
-            name.push(c);
-            self.input.next();
+
+            let syntax = self.readtable.get_syntax_type(c);
+            match syntax {
+                SyntaxType::Whitespace | SyntaxType::TerminatingMacro => break,
+                SyntaxType::SingleEscape => {
+                    self.input.next();
+                    if let Some(escaped) = self.input.next() {
+                        chars.push((escaped, true));
+                    } else {
+                        return Err(ReaderError::UnexpectedEof);
+                    }
+                }
+                SyntaxType::MultiEscape => {
+                    self.input.next();
+                    in_multi_escape = true;
+                }
+                _ => {
+                    self.input.next();
+                    chars.push((c, false));
+                }
+            }
         }
 
-        name
+        if in_multi_escape {
+            return Err(ReaderError::UnexpectedEof);
+        }
+
+        let mut has_upper = false;
+        let mut has_lower = false;
+        for (ch, escaped) in &chars {
+            if *escaped {
+                continue;
+            }
+            if ch.is_uppercase() {
+                has_upper = true;
+            } else if ch.is_lowercase() {
+                has_lower = true;
+            }
+        }
+
+        let mut out = String::new();
+        let invert_to_upper = case_mode == ReadtableCase::Invert && has_lower && !has_upper;
+        let invert_to_lower = case_mode == ReadtableCase::Invert && has_upper && !has_lower;
+
+        for (ch, escaped) in chars {
+            if escaped {
+                out.push(ch);
+                continue;
+            }
+
+            let mut push_converted = |c: char, to_upper: bool| {
+                if to_upper {
+                    for uc in c.to_uppercase() {
+                        out.push(uc);
+                    }
+                } else {
+                    for lc in c.to_lowercase() {
+                        out.push(lc);
+                    }
+                }
+            };
+
+            match case_mode {
+                ReadtableCase::Preserve => out.push(ch),
+                ReadtableCase::Upcase => push_converted(ch, true),
+                ReadtableCase::Downcase => push_converted(ch, false),
+                ReadtableCase::Invert => {
+                    if invert_to_upper {
+                        push_converted(ch, true);
+                    } else if invert_to_lower {
+                        push_converted(ch, false);
+                    } else {
+                        out.push(ch);
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn read_symbol_name(&mut self) -> Result<String, ReaderError> {
+        let case_mode = self.readtable.readtable_case();
+        self.read_token_with_case(case_mode)
     }
 
     /// Parse an atom string as number or symbol
     fn parse_atom(&mut self, s: &str) -> ReaderResult {
-        let upper = s.to_uppercase();
-
         // Check for NIL
-        if upper == "NIL" {
+        if s == "NIL" {
             return Ok(self.nil_node);
         }
 
-        // Try integer
-        if let Ok(n) = s.parse::<i64>() {
+        // Try integer (respect read-base)
+        if self.read_base == 10 {
+            if let Ok(n) = s.parse::<i64>() {
+                return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n))));
+            }
+        } else if let Ok(n) = i64::from_str_radix(s, self.read_base) {
             return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n))));
         }
 
         // Try big integer
-        if let Ok(bn) = s.parse::<num_bigint::BigInt>() {
+        if self.read_base == 10 {
+            if let Ok(bn) = s.parse::<num_bigint::BigInt>() {
+                return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(bn))));
+            }
+        } else if let Some(bn) = num_bigint::BigInt::parse_bytes(s.as_bytes(), self.read_base) {
             return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(bn))));
         }
 
@@ -665,7 +919,7 @@ impl<'a> Reader<'a> {
         }
 
         // Regular symbol in current package
-        let sym_id = self.symbols.intern(&upper);
+        let sym_id = self.symbols.intern(s);
         self.symbol_to_node(sym_id)
     }
 

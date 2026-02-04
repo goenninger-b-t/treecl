@@ -165,8 +165,12 @@ pub struct Process {
     /// Array Store (Heap for Vectors/Arrays)
     pub arrays: crate::arrays::ArrayStore,
 
-    /// Readtable (Reader Macro Configuration)
-    pub readtable: crate::readtable::Readtable,
+    /// Readtable Store (Reader Macro Configuration)
+    pub readtables: crate::readtable::ReadtableStore,
+    /// Current readtable id
+    pub current_readtable: crate::readtable::ReadtableId,
+    /// Standard readtable id
+    pub standard_readtable: crate::readtable::ReadtableId,
 
     /// Hash Table Store
     pub hashtables: crate::hashtables::HashTableStore,
@@ -196,6 +200,10 @@ pub struct Process {
     /// MetaObject Protocol (CLOS)
     pub mop: crate::clos::MetaObjectProtocol,
 
+    /// Multiple values storage
+    pub values: Vec<NodeId>,
+    pub values_are_set: bool,
+
     /// Pending SysCall info (if stopped)
     pub pending_syscall: Option<crate::syscall::SysCall>,
 
@@ -219,7 +227,9 @@ impl Process {
         let dictionary = HashMap::new();
         let conditions = crate::conditions::ConditionSystem::new();
         let arrays = crate::arrays::ArrayStore::new();
-        let readtable = crate::readtable::Readtable::new();
+        let mut readtables = crate::readtable::ReadtableStore::new();
+        let standard_readtable = readtables.alloc(crate::readtable::Readtable::new());
+        let current_readtable = standard_readtable;
         let hashtables = crate::hashtables::HashTableStore::new();
 
         let mop = crate::clos::MetaObjectProtocol::new(&mut *globals.symbols.write().unwrap()); // MOP needs global symbols for class definitions
@@ -227,7 +237,7 @@ impl Process {
         // Initialize evaluation context
         let eval_context = EvalContext::new();
 
-        let proc = Self {
+        let mut proc = Self {
             pid,
             priority: Priority::Normal,
             status: Status::Runnable,
@@ -252,7 +262,9 @@ impl Process {
             fast_make_instance_ok: None,
             conditions,
             arrays,
-            readtable,
+            readtables,
+            current_readtable,
+            standard_readtable,
             hashtables,
             links: HashSet::new(),    // Initialize links
             monitors: HashMap::new(), // Initialize monitors
@@ -265,7 +277,106 @@ impl Process {
             pending_redex: None,
             pending_syscall: None,
             next_method_states: Vec::new(),
+            values: Vec::new(),
+            values_are_set: false,
         };
+
+        // Initialize standard dynamic variables
+        let intern_cl = |name: &str| -> SymbolId {
+            globals
+                .symbols
+                .write()
+                .unwrap()
+                .intern_in(name, crate::symbol::PackageId(1))
+        };
+
+        // Standard streams
+        let stdin_sym = intern_cl("*STANDARD-INPUT*");
+        let stdout_sym = intern_cl("*STANDARD-OUTPUT*");
+        let stderr_sym = intern_cl("*ERROR-OUTPUT*");
+        let trace_sym = intern_cl("*TRACE-OUTPUT*");
+        let terminal_sym = intern_cl("*TERMINAL-IO*");
+
+        let stdin_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::StreamHandle(
+            proc.streams.stdin_id().0,
+        )));
+        let stdout_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::StreamHandle(
+            proc.streams.stdout_id().0,
+        )));
+        let stderr_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::StreamHandle(
+            proc.streams.stderr_id().0,
+        )));
+
+        let terminal_id = proc.streams.alloc(crate::streams::Stream::TwoWayStream {
+            input: proc.streams.stdin_id(),
+            output: proc.streams.stdout_id(),
+        });
+        let terminal_node =
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::StreamHandle(terminal_id.0)));
+
+        proc.set_value(stdin_sym, stdin_node);
+        proc.set_value(stdout_sym, stdout_node);
+        proc.set_value(stderr_sym, stderr_node);
+        proc.set_value(trace_sym, stdout_node);
+        proc.set_value(terminal_sym, terminal_node);
+
+        // Reader control variables
+        let readtable_sym = intern_cl("*READTABLE*");
+        let read_base_sym = intern_cl("*READ-BASE*");
+        let read_eval_sym = intern_cl("*READ-EVAL*");
+        let read_suppress_sym = intern_cl("*READ-SUPPRESS*");
+        let read_default_float_sym = intern_cl("*READ-DEFAULT-FLOAT-FORMAT*");
+        let features_sym = intern_cl("*FEATURES*");
+
+        let readtable_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Readtable(
+            proc.current_readtable.0,
+        )));
+        proc.set_value(readtable_sym, readtable_node);
+
+        let read_base_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Integer(10)));
+        proc.set_value(read_base_sym, read_base_node);
+        proc.set_value(read_eval_sym, proc.t_node);
+        proc.set_value(read_suppress_sym, proc.nil_node);
+
+        // Default float format (symbol)
+        let single_float_sym = intern_cl("SINGLE-FLOAT");
+        let single_float_node =
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(single_float_sym.0)));
+        proc.set_value(read_default_float_sym, single_float_node);
+
+        // *FEATURES* list
+        let mut features = Vec::new();
+        let intern_kw = |name: &str| -> SymbolId {
+            globals
+                .symbols
+                .write()
+                .unwrap()
+                .intern_in(name, crate::symbol::PackageId(0))
+        };
+        for feat in [
+            "COMMON-LISP",
+            "ANSI-CL",
+            "TREECL",
+            "IEEE-FLOATING-POINT",
+            "LITTLE-ENDIAN",
+            "X86-64",
+        ] {
+            let sym = intern_kw(feat);
+            let node = proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)));
+            features.push(node);
+        }
+        let features_list = proc.make_list(&features);
+        proc.set_value(features_sym, features_list);
 
         // Create T and NIL in local arena
         // We use globals to get symbols, but we create nodes locally.
@@ -274,6 +385,35 @@ impl Process {
         // Optimization: Cache them?
 
         proc
+    }
+
+    pub fn current_readtable(&self) -> &crate::readtable::Readtable {
+        self.readtables
+            .get(self.current_readtable)
+            .expect("current readtable missing")
+    }
+
+    pub fn current_readtable_mut(&mut self) -> &mut crate::readtable::Readtable {
+        self.readtables
+            .get_mut(self.current_readtable)
+            .expect("current readtable missing")
+    }
+
+    pub fn readtable_by_id(&self, id: crate::readtable::ReadtableId) -> Option<&crate::readtable::Readtable> {
+        self.readtables.get(id)
+    }
+
+    pub fn readtable_by_id_mut(&mut self, id: crate::readtable::ReadtableId) -> Option<&mut crate::readtable::Readtable> {
+        self.readtables.get_mut(id)
+    }
+
+    pub fn set_current_readtable(&mut self, id: crate::readtable::ReadtableId) -> bool {
+        if self.readtables.get(id).is_some() {
+            self.current_readtable = id;
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if process has pending messages
@@ -314,6 +454,11 @@ impl Process {
             if let Some(plist) = binding.plist {
                 self.mark_node(plist, &mut marked);
             }
+        }
+
+        // Multiple values
+        for &val in &self.values {
+            self.mark_node(val, &mut marked);
         }
 
         // Mark Condition System Roots

@@ -40,6 +40,7 @@ pub enum OpaqueValue {
     Method(u32),                // Handle to Method (CLOS)
     EqlSpecializer(u32),        // Handle to EQL specializer (CLOS)
     SlotDefinition(u32, u32, bool), // (ClassId, SlotIndex, Direct?)
+    Readtable(u32),             // Handle to Readtable
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)

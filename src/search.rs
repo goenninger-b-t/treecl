@@ -471,6 +471,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
                 let tag = if *direct { ":direct" } else { "" };
                 format!("#<slot-definition:{}:{}{}>", class_id, slot_idx, tag)
             }
+            OpaqueValue::Readtable(id) => format!("#<readtable:{}>", id),
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!(

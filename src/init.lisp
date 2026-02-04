@@ -187,6 +187,8 @@
                      (progn ,@body)
                      (list ',access-fn ,@lambda-list)))))))
 
+(defsetf readtable-case set-readtable-case)
+
 (defmacro setf (&rest p)
   (if (null p)
       nil
