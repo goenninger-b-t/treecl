@@ -157,3 +157,42 @@ Progress update (Feb 5 2026, Task 2)
 - `*package*`, `*gensym-counter*`, and `*gentemp-counter*` are initialized in `Process::new`; `setq`/`defvar`/`defparameter`/`let` update `*package*` and treat `*...*` variables as special (dynamic) bindings.
 - Reader `pkg:symbol` now requires external symbols; `pkg::symbol` continues to intern internal symbols. String designators now accept character vectors with fill pointers; `make-array` preserves character vectors with fill pointers/displacement rather than collapsing to raw strings.
 - `src/init_new.lisp` now defines `defpackage`, `with-package-iterator`, `do-symbols`, `do-external-symbols`, and `do-all-symbols` macros to support ANSI package tests and ASDF bootstrapping.
+
+Progress update (Feb 5 2026, ANSI package/symbol tests attempt)
+--------------------------------------------------------------------------------
+- Attempted to run `tests/ansi-test/packages` and `tests/ansi-test/symbols` via a minimal harness (`cargo run --bin treecl -- /tmp/ansi_packages_symbols.lsp`).
+- First run failed at read time because the harness referenced `regression-test:do-tests`; TreeCL reads the entire file before evaluation, so package-prefixed symbols must already exist at read time (workaround: use `(intern "DO-TESTS" "REGRESSION-TEST")` or avoid package prefixes in the harness file).
+- After adjusting the harness to avoid package-prefixed symbols, load failed while reading `tests/ansi-test/rt-package.lsp` with `LOAD: read error: Unexpected character: ')'`. This indicates a reader incompatibility with the RT harness file before package/symbol tests can run.
+- Even if RT loads, many package/symbol tests (and aux files) rely on full ANSI `loop` syntax and condition system (`handler-case`/`signals-error`), which are not implemented yet; these are expected blockers for running the suite end-to-end.
+
+Progress update (Feb 5 2026, reader conditionals and comments)
+--------------------------------------------------------------------------------
+- Fixed reader behavior for `#+/-` inside lists and for line/block comments inside lists. Added list-depth tracking and a skip flag so `;` comments and `#+/-` false branches no longer force an immediate `read()` that trips over list-closing `)`.
+- Added a guard for conditional-read skips to tolerate unknown packages (e.g., `sb-ext:` inside `#+sbcl` blocks) by temporarily allowing unknown packages while skipping the form.
+- Updated `readtable` comment macro to use a list-aware comment handler.
+- `LOAD` now reports byte offsets on read errors to help pinpoint reader issues.
+- After these fixes, `rt-package.lsp` and the `#+sbcl` block in `rt.lsp` read successfully. The next blocker when running the package/symbol harness is evaluation of `(declaim ...)` in `rt.lsp` (currently undefined), which raises “Variable 'GET-ENTRY' is not bound”.
+
+Progress update (Feb 5 2026, RT harness blockers)
+--------------------------------------------------------------------------------
+- Added a stub `declaim` macro and ported the simple `defstruct` macro into `src/init_new.lisp` (plus helpers). `char-code-limit` is now a `defparameter` to avoid macro ordering issues during bootstrap.
+- Running the package/symbol harness now progresses past `declaim` and `defstruct` but fails in `rt.lsp` at `(make-hash-table ...)` because TreeCL currently lacks hash table primitives. This is the current hard blocker for executing the ANSI package/symbol tests end-to-end.
+
+Progress update (Feb 5 2026, hash table stubs)
+--------------------------------------------------------------------------------
+- Added minimal hash table primitives: `make-hash-table`, `gethash` (multiple values), `set-gethash` (for `(setf (gethash ...))`), `remhash`, `clrhash`, and `maphash`. Hash tables use a linear-scan store backed by `HashTableStore`.
+- Added `(defsetf gethash set-gethash)` to `src/init_new.lisp`.
+- `defstruct` now accepts `(name (:conc-name ...))` forms and honors `:conc-name nil` so accessors match RT expectations.
+- RT harness now fails later at missing `assoc` (not implemented), which is the next blocker after hash tables.
+
+Progress update (Feb 5 2026, assoc/rassoc)
+--------------------------------------------------------------------------------
+- Added minimal `assoc` and `rassoc` primitives (EQL-based, no keyword args). RT harness now progresses further but fails with `TCO Apply not fully implemented for NodeId(...)`, indicating a non-hash/reader issue in the evaluator’s TCO apply path.
+
+Progress update (Feb 5 2026, ANSI package/symbol triage)
+--------------------------------------------------------------------------------
+- Bootstrap now reads `init_new.lisp` with the current package forced to `COMMON-LISP`, then resets the reader package back to `COMMON-LISP-USER` after bootstrap. This makes init macros/functions land in CL (so exported symbols resolve correctly in CL-USER/tests).
+- `init_new.lisp` now exports the core macro/function surface and adds stubs: `eval-when`, `declare`, `handler-case`, plus test helpers (`notnot`, `notnot-mv`, `not-mv`, `eqt`/`eqlt`/`equalt`/`equalpt`, `safely-delete-package`, `+fail-count-limit+`).
+- Added `TREECL_DEBUG_DEFPACKAGE` env hook in `prim_sys_defpackage` to trace progress.
+- Updated ANSI package/symbol harness to skip `ansi-aux.lsp` (too heavy without full LOOP/conditions) and set `*package*` to `REGRESSION-TEST`/`CL-TEST` before load.
+- Current blocker: loading `packages00-aux.lsp` hangs on the first `(report-and-ignore-errors (defpackage "A" ...))`. `TREECL_DEBUG_LOAD=1` shows evaluation stops at that form; likely a `defpackage`/package-system hang that needs further investigation.

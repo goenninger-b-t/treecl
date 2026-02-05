@@ -5,6 +5,7 @@
 use crate::arena::{Arena, Node};
 use crate::context::PrimitiveFn;
 use crate::eval::{Closure, ControlSignal, Environment, EvalResult, Interpreter, ParsedLambdaList};
+use crate::hashtables::{HashTable, TestMode};
 use crate::process::Process;
 use crate::readtable::{ReadtableCase, ReadtableId};
 use crate::symbol::{PackageId, SymbolId};
@@ -34,6 +35,14 @@ fn set_multiple_values(proc: &mut Process, mut values: Vec<NodeId>) -> NodeId {
 fn node_to_symbol(proc: &Process, node: NodeId) -> Option<SymbolId> {
     if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(node) {
         Some(SymbolId(*id))
+    } else {
+        None
+    }
+}
+
+fn node_to_hash_handle(proc: &Process, node: NodeId) -> Option<crate::types::HashHandle> {
+    if let Node::Leaf(OpaqueValue::HashHandle(id)) = proc.arena.inner.get_unchecked(node) {
+        Some(crate::types::HashHandle(*id))
     } else {
         None
     }
@@ -254,6 +263,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("LISTP", cl, prim_listp);
     globals.register_primitive("NUMBERP", cl, prim_numberp);
     globals.register_primitive("CHARACTERP", cl, prim_characterp);
+    globals.register_primitive("STRINGP", cl, prim_stringp);
     globals.register_primitive("CHARACTER", cl, prim_character);
     globals.register_primitive("CHAR-CODE", cl, prim_char_code);
     globals.register_primitive("CODE-CHAR", cl, prim_code_char);
@@ -274,6 +284,8 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("EQUAL", cl, prim_equal);
     globals.register_primitive("TYPEP", cl, prim_typep);
     globals.register_primitive("SYMBOL-VALUE", cl, prim_symbol_value);
+    globals.register_primitive("ASSOC", cl, prim_assoc);
+    globals.register_primitive("RASSOC", cl, prim_rassoc);
     globals.register_primitive("GENSYM", cl, prim_gensym);
     globals.register_primitive("GENTEMP", cl, prim_gentemp);
     globals.register_primitive("MAKE-SYMBOL", cl, prim_make_symbol);
@@ -355,6 +367,14 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("SYS-MAKE-STRUCT", cl, prim_sys_make_struct);
     globals.register_primitive("SYS-STRUCT-REF", cl, prim_sys_struct_ref);
     globals.register_primitive("SYS-STRUCT-P", cl, prim_sys_struct_p);
+
+    // Hash Tables
+    globals.register_primitive("MAKE-HASH-TABLE", cl, prim_make_hash_table);
+    globals.register_primitive("GETHASH", cl, prim_gethash);
+    globals.register_primitive("SET-GETHASH", cl, prim_set_gethash);
+    globals.register_primitive("REMHASH", cl, prim_remhash);
+    globals.register_primitive("CLRHASH", cl, prim_clrhash);
+    globals.register_primitive("MAPHASH", cl, prim_maphash);
 
     // CLOS
     globals.register_primitive("FIND-CLASS", cl, prim_find_class);
@@ -1443,7 +1463,11 @@ fn prim_load(
                     Err(crate::reader::ReaderError::UnexpectedEof) => break,
                     Err(e) => {
                         crate::reader::set_read_eval_context(None);
-                        return Err(ControlSignal::Error(format!("LOAD: read error: {}", e)));
+                        let pos = reader.position();
+                        return Err(ControlSignal::Error(format!(
+                            "LOAD: read error at byte {}: {}",
+                            pos, e
+                        )));
                     }
                 }
             }
@@ -1464,6 +1488,11 @@ fn prim_load(
         let eval_result = (|| {
             let mut interpreter = Interpreter::new(proc, ctx);
             for expr in exprs {
+                if std::env::var("TREECL_DEBUG_LOAD").is_ok() {
+                    let symbols = ctx.symbols.read().unwrap();
+                    let printed = crate::printer::print_to_string(&interpreter.process.arena.inner, &symbols, expr);
+                    eprintln!("LOAD DEBUG: {}", printed);
+                }
                 interpreter.eval(expr, &env)?;
             }
             Ok::<(), ControlSignal>(())
@@ -2798,6 +2827,193 @@ fn prim_sys_struct_p(
     Ok(proc.make_nil())
 }
 
+fn parse_hash_test_mode(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> TestMode {
+    let mut name: Option<String> = None;
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .map(|s| s.to_string());
+        }
+        Node::Leaf(OpaqueValue::String(s)) => {
+            name = Some(s.clone());
+        }
+        _ => {}
+    }
+
+    match name.unwrap_or_default().to_uppercase().as_str() {
+        "EQL" => TestMode::Eql,
+        "EQUAL" => TestMode::Equal,
+        "EQUALP" => TestMode::Equalp,
+        "EQ" => TestMode::Eq,
+        _ => TestMode::Eq,
+    }
+}
+
+fn prim_make_hash_table(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    let mut test_mode = TestMode::Eq;
+
+    if args.len() % 2 != 0 {
+        return err_helper("MAKE-HASH-TABLE: odd number of keyword arguments");
+    }
+
+    let mut i = 0;
+    while i < args.len() {
+        let key_node = args[i];
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key_node) {
+            if let Some(name) = ctx.symbols.read().unwrap().symbol_name(SymbolId(*id)) {
+                if name.eq_ignore_ascii_case("TEST") {
+                    if i + 1 >= args.len() {
+                        return err_helper("MAKE-HASH-TABLE: missing :TEST value");
+                    }
+                    test_mode = parse_hash_test_mode(proc, ctx, args[i + 1]);
+                }
+            }
+        }
+        i += 2;
+    }
+
+    let handle = proc.hashtables.alloc(HashTable::new(test_mode));
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::HashHandle(handle.0))))
+}
+
+fn prim_gethash(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("GETHASH: requires key and hash-table");
+    }
+    let key = args[0];
+    let table_node = args[1];
+    let default = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    let handle = node_to_hash_handle(proc, table_node)
+        .ok_or_else(|| ControlSignal::Error("GETHASH: not a hash-table".to_string()))?;
+    let table = proc
+        .hashtables
+        .get(handle)
+        .ok_or_else(|| ControlSignal::Error("GETHASH: invalid hash-table".to_string()))?;
+
+    if let Some(val) = table.get(key, &proc.arena.inner, table.test_mode.clone()) {
+        Ok(set_multiple_values(proc, vec![val, proc.make_t(ctx)]))
+    } else {
+        Ok(set_multiple_values(proc, vec![default, proc.make_nil()]))
+    }
+}
+
+fn prim_set_gethash(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 3 {
+        return err_helper("SET-GETHASH: requires key, hash-table, value");
+    }
+    let key = args[0];
+    let table_node = args[1];
+    let value = args[2];
+
+    let handle = node_to_hash_handle(proc, table_node)
+        .ok_or_else(|| ControlSignal::Error("SET-GETHASH: not a hash-table".to_string()))?;
+    let table = proc
+        .hashtables
+        .get_mut(handle)
+        .ok_or_else(|| ControlSignal::Error("SET-GETHASH: invalid hash-table".to_string()))?;
+    table.insert(key, value, &proc.arena.inner);
+    Ok(value)
+}
+
+fn prim_remhash(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("REMHASH: requires key and hash-table");
+    }
+    let key = args[0];
+    let table_node = args[1];
+
+    let handle = node_to_hash_handle(proc, table_node)
+        .ok_or_else(|| ControlSignal::Error("REMHASH: not a hash-table".to_string()))?;
+    let table = proc
+        .hashtables
+        .get_mut(handle)
+        .ok_or_else(|| ControlSignal::Error("REMHASH: invalid hash-table".to_string()))?;
+
+    Ok(if table.remove(key, &proc.arena.inner) {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn prim_clrhash(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CLRHASH: requires hash-table");
+    }
+    let table_node = args[0];
+    let handle = node_to_hash_handle(proc, table_node)
+        .ok_or_else(|| ControlSignal::Error("CLRHASH: not a hash-table".to_string()))?;
+    let table = proc
+        .hashtables
+        .get_mut(handle)
+        .ok_or_else(|| ControlSignal::Error("CLRHASH: invalid hash-table".to_string()))?;
+    table.clear();
+    Ok(table_node)
+}
+
+fn prim_maphash(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("MAPHASH: requires function and hash-table");
+    }
+    let func = args[0];
+    let table_node = args[1];
+
+    let handle = node_to_hash_handle(proc, table_node)
+        .ok_or_else(|| ControlSignal::Error("MAPHASH: not a hash-table".to_string()))?;
+    let entries = {
+        let table = proc
+            .hashtables
+            .get(handle)
+            .ok_or_else(|| ControlSignal::Error("MAPHASH: invalid hash-table".to_string()))?;
+        table.entries.clone()
+    };
+
+    let mut interpreter = Interpreter::new(proc, ctx);
+    let env = crate::eval::Environment::new();
+    for (k, v) in entries {
+        let args_list = interpreter.list(&[k, v]);
+        interpreter.apply_function(func, args_list, &env)?;
+    }
+
+    Ok(proc.make_nil())
+}
+
 fn prim_assert(
     proc: &mut crate::process::Process,
     _ctx: &crate::context::GlobalContext,
@@ -3330,6 +3546,31 @@ fn prim_characterp(
     } else {
         Ok(proc.make_nil())
     }
+}
+
+fn prim_stringp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("STRINGP requires exactly 1 argument");
+    }
+    let node = args[0];
+    let is_string = match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::String(_)) => true,
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => proc
+            .arrays
+            .get(crate::arrays::VectorId(*id))
+            .map(|arr| arr.element_type.is_character())
+            .unwrap_or(false),
+        _ => false,
+    };
+    Ok(if is_string {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
 }
 
 fn prim_character(
@@ -3927,6 +4168,58 @@ fn prim_symbol_value(
             "SYMBOL-VALUE requires 1 argument".to_string(),
         ))
     }
+}
+
+fn prim_assoc(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("ASSOC: requires item and list");
+    }
+    let item = args[0];
+    let mut list = args[1];
+
+    while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(list).clone() {
+        if let Node::Fork(pair_car, _) = proc.arena.inner.get_unchecked(car).clone() {
+            let eq = prim_eql(proc, ctx, &[item, pair_car])?;
+            if let Node::Leaf(OpaqueValue::Nil) = proc.arena.inner.get_unchecked(eq) {
+                // continue
+            } else {
+                return Ok(car);
+            }
+        }
+        list = cdr;
+    }
+
+    Ok(proc.make_nil())
+}
+
+fn prim_rassoc(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("RASSOC: requires item and list");
+    }
+    let item = args[0];
+    let mut list = args[1];
+
+    while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(list).clone() {
+        if let Node::Fork(_, pair_cdr) = proc.arena.inner.get_unchecked(car).clone() {
+            let eq = prim_eql(proc, ctx, &[item, pair_cdr])?;
+            if let Node::Leaf(OpaqueValue::Nil) = proc.arena.inner.get_unchecked(eq) {
+                // continue
+            } else {
+                return Ok(car);
+            }
+        }
+        list = cdr;
+    }
+
+    Ok(proc.make_nil())
 }
 
 fn bigint_to_node(proc: &mut crate::process::Process, val: &BigInt) -> NodeId {
@@ -4844,6 +5137,11 @@ fn prim_sys_defpackage(
     let name = string_from_sequence(proc, ctx, args[0])
         .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid name".into()))?;
 
+    let debug = std::env::var("TREECL_DEBUG_DEFPACKAGE").is_ok();
+    if debug {
+        eprintln!("DEFPACKAGE start: {}", name);
+    }
+
     let options = list_to_vec_opt(proc, args[1])
         .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid options".into()))?;
 
@@ -4953,7 +5251,17 @@ fn prim_sys_defpackage(
         }
     }
 
-    let pkg_id = if let Some(existing) = ctx.symbols.read().unwrap().find_package(&name) {
+    if debug {
+        eprintln!("DEFPACKAGE find_package: {}", name);
+    }
+    let existing_pkg = {
+        let syms = ctx.symbols.read().unwrap();
+        syms.find_package(&name)
+    };
+    let pkg_id = if let Some(existing) = existing_pkg {
+        if debug {
+            eprintln!("DEFPACKAGE existing package: {}", name);
+        }
         if !nicknames.is_empty() {
             ctx.symbols
                 .write()
@@ -4963,12 +5271,18 @@ fn prim_sys_defpackage(
         }
         existing
     } else {
+        if debug {
+            eprintln!("DEFPACKAGE make_package: {}", name);
+        }
         ctx.symbols
             .write()
             .unwrap()
             .make_package(&name, nicknames.clone(), Vec::new(), documentation.clone())
             .map_err(|e| ControlSignal::Error(format!("DEFPACKAGE: {}", e)))?
     };
+    if debug {
+        eprintln!("DEFPACKAGE package ready: {}", name);
+    }
 
     // Documentation update
     if let Some(pkg) = ctx.symbols.write().unwrap().get_package_mut(pkg_id) {
@@ -4995,6 +5309,9 @@ fn prim_sys_defpackage(
                 .map_err(ControlSignal::Error)?;
         }
     }
+    if debug {
+        eprintln!("DEFPACKAGE use list set: {}", name);
+    }
 
     // Shadow
     if !shadow.is_empty() {
@@ -5020,6 +5337,9 @@ fn prim_sys_defpackage(
             .map_err(ControlSignal::Error)?;
         }
     }
+    if debug {
+        eprintln!("DEFPACKAGE shadow done: {}", name);
+    }
 
     // Shadowing-import-from
     for (from_pkg, names) in shadowing_import_from {
@@ -5032,18 +5352,17 @@ fn prim_sys_defpackage(
                 .map(|(s, _)| s)
                 .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: symbol not found for shadowing-import".into()))?;
             // Remove conflicts and import
-            if let Some((existing, _)) = ctx
-                .symbols
-                .read()
-                .unwrap()
-                .find_symbol_in_package(pkg_id, &name)
-            {
+            let existing = {
+                let syms = ctx.symbols.read().unwrap();
+                syms.find_symbol_in_package(pkg_id, &name).map(|(s, _)| s)
+            };
+            if let Some(existing) = existing {
                 if existing != sym_id {
                     ctx.symbols
-                    .write()
-                    .unwrap()
-                    .unintern_from_package(pkg_id, existing)
-                    .map_err(ControlSignal::Error)?;
+                        .write()
+                        .unwrap()
+                        .unintern_from_package(pkg_id, existing)
+                        .map_err(ControlSignal::Error)?;
                 }
             }
             ctx.symbols
@@ -5057,6 +5376,9 @@ fn prim_sys_defpackage(
                 .add_shadowing_symbol(pkg_id, sym_id)
                 .map_err(ControlSignal::Error)?;
         }
+    }
+    if debug {
+        eprintln!("DEFPACKAGE shadowing-import done: {}", name);
     }
 
     // Import-from
@@ -5089,10 +5411,16 @@ fn prim_sys_defpackage(
                 .map_err(ControlSignal::Error)?;
         }
     }
+    if debug {
+        eprintln!("DEFPACKAGE import done: {}", name);
+    }
 
     // Intern
     for name in intern {
         ctx.symbols.write().unwrap().intern_in_with_status(&name, pkg_id);
+    }
+    if debug {
+        eprintln!("DEFPACKAGE intern done: {}", name);
     }
 
     // Export
@@ -5108,6 +5436,9 @@ fn prim_sys_defpackage(
             .unwrap()
             .export_in_package(pkg_id, sym_id)
             .map_err(ControlSignal::Error)?;
+    }
+    if debug {
+        eprintln!("DEFPACKAGE export done: {}", name);
     }
 
     Ok(proc

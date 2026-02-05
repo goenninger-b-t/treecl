@@ -234,13 +234,13 @@ impl SymbolTable {
         // Create standard packages
         table.create_package("KEYWORD"); // PackageId(0)
         table.create_package("COMMON-LISP"); // PackageId(1)
-        table.create_package("CL-USER"); // PackageId(2)
+        table.create_package("COMMON-LISP-USER"); // PackageId(2)
 
         // CL-USER uses COMMON-LISP
         table.packages[2].use_package(PackageId(1));
         table.packages[1].add_used_by(PackageId(2));
 
-        // Set current package to CL-USER
+        // Set current package to COMMON-LISP-USER
         table.current_package = PackageId(2);
 
         table
@@ -273,6 +273,7 @@ impl SymbolTable {
         // Add standard nicknames
         match name.to_uppercase().as_str() {
             "COMMON-LISP" => pkg.nicknames.push("CL".to_string()),
+            "COMMON-LISP-USER" => pkg.nicknames.push("CL-USER".to_string()),
             _ => {}
         }
 

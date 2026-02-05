@@ -195,8 +195,7 @@ fn macro_quote(reader: &mut Reader, _c: char) -> ReaderResult {
 }
 
 fn macro_comment(reader: &mut Reader, _c: char) -> ReaderResult {
-    reader.skip_line_comment();
-    reader.read()
+    reader.handle_line_comment()
 }
 
 fn macro_quasiquote(reader: &mut Reader, _c: char) -> ReaderResult {

@@ -132,6 +132,9 @@ pub struct Reader<'a> {
     preserve_whitespace: bool,
     features: Vec<String>,
     label_map: HashMap<u64, NodeId>,
+    list_depth: usize,
+    skip_next_in_list: bool,
+    allow_unknown_packages: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -180,6 +183,9 @@ impl<'a> Reader<'a> {
                 .map(|s| s.to_uppercase())
                 .collect(),
             label_map: HashMap::new(),
+            list_depth: 0,
+            skip_next_in_list: false,
+            allow_unknown_packages: false,
         }
     }
 
@@ -238,7 +244,12 @@ impl<'a> Reader<'a> {
                             '"' => self.read_string(),
                             ';' => {
                                 self.skip_line_comment();
-                                self.read()
+                                if self.list_depth > 0 {
+                                    self.skip_next_in_list = true;
+                                    Ok(self.nil_node)
+                                } else {
+                                    self.read()
+                                }
                             }
                             '#' => self.read_dispatch(),
                             _ => Err(ReaderError::InvalidChar(format!(
@@ -324,6 +335,16 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub(crate) fn handle_line_comment(&mut self) -> ReaderResult {
+        self.skip_line_comment();
+        if self.list_depth > 0 {
+            self.skip_next_in_list = true;
+            Ok(self.nil_node)
+        } else {
+            self.read()
+        }
+    }
+
     /// Skip a possibly nested block comment (#| ... |#)
     fn skip_block_comment(&mut self) -> Result<(), ReaderError> {
         let mut depth = 1usize;
@@ -378,11 +399,19 @@ impl<'a> Reader<'a> {
 
     /// Read a list: (a b c)
     pub(crate) fn read_list(&mut self) -> ReaderResult {
+        self.list_depth += 1;
+        macro_rules! list_return {
+            ($expr:expr) => {{
+                self.list_depth = self.list_depth.saturating_sub(1);
+                return $expr;
+            }};
+        }
+
         self.skip_whitespace();
 
         if self.input.peek() == Some(')') {
             self.input.next();
-            return Ok(self.nil_node);
+            list_return!(Ok(self.nil_node));
         }
 
         let mut elements = Vec::new();
@@ -392,9 +421,11 @@ impl<'a> Reader<'a> {
             self.skip_whitespace();
 
             match self.input.peek() {
-                None => return Err(ReaderError::UnbalancedParen),
+                None => list_return!(Err(ReaderError::UnbalancedParen)),
                 Some(')') => {
                     self.input.next();
+                    // Clear any pending skip from a conditional read within this list.
+                    self.skip_next_in_list = false;
                     break;
                 }
                 Some('.') => {
@@ -407,7 +438,7 @@ impl<'a> Reader<'a> {
                             dotted_cdr = Some(self.read()?);
                             self.skip_whitespace();
                             if self.input.peek() != Some(')') {
-                                return Err(ReaderError::UnexpectedChar('.'));
+                                list_return!(Err(ReaderError::UnexpectedChar('.')));
                             }
                             self.input.next();
                             break;
@@ -419,7 +450,12 @@ impl<'a> Reader<'a> {
                     }
                 }
                 _ => {
-                    elements.push(self.read()?);
+                    let elem = self.read()?;
+                    if self.skip_next_in_list {
+                        self.skip_next_in_list = false;
+                    } else {
+                        elements.push(elem);
+                    }
                 }
             }
         }
@@ -430,6 +466,7 @@ impl<'a> Reader<'a> {
             result = self.arena.alloc(Node::Fork(elem, result));
         }
 
+        self.list_depth = self.list_depth.saturating_sub(1);
         Ok(result)
     }
 
@@ -526,7 +563,12 @@ impl<'a> Reader<'a> {
                 // #| ... |# block comment (possibly nested)
                 self.input.next();
                 self.skip_block_comment()?;
-                self.read()
+                if self.list_depth > 0 {
+                    self.skip_next_in_list = true;
+                    Ok(self.nil_node)
+                } else {
+                    self.read()
+                }
             }
             Some('(') => {
                 // #(...) -> vector
@@ -595,8 +637,17 @@ impl<'a> Reader<'a> {
                     self.read()
                 } else {
                     // Skip next form
-                    let _ = self.read()?;
-                    self.read()
+                    let old_allow = self.allow_unknown_packages;
+                    self.allow_unknown_packages = true;
+                    let skipped = self.read();
+                    self.allow_unknown_packages = old_allow;
+                    skipped?;
+                    if self.list_depth > 0 {
+                        self.skip_next_in_list = true;
+                        Ok(self.nil_node)
+                    } else {
+                        self.read()
+                    }
                 }
             }
             Some('-') => {
@@ -606,8 +657,17 @@ impl<'a> Reader<'a> {
                     self.read()
                 } else {
                     // Skip next form
-                    let _ = self.read()?;
-                    self.read()
+                    let old_allow = self.allow_unknown_packages;
+                    self.allow_unknown_packages = true;
+                    let skipped = self.read();
+                    self.allow_unknown_packages = old_allow;
+                    skipped?;
+                    if self.list_depth > 0 {
+                        self.skip_next_in_list = true;
+                        Ok(self.nil_node)
+                    } else {
+                        self.read()
+                    }
                 }
             }
             Some(c) => {
@@ -1533,6 +1593,11 @@ impl<'a> Reader<'a> {
 
                 if sym_name.is_empty() {
                     return Err(ReaderError::InvalidChar("Invalid package token".to_string()));
+                }
+
+                if self.allow_unknown_packages {
+                    let sym_id = self.symbols.intern(sym_name);
+                    return self.symbol_to_node(sym_id);
                 }
 
                 if let Some(pkg_id) = self.symbols.find_package(pkg_name) {

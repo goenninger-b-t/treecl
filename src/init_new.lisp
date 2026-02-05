@@ -1,6 +1,8 @@
 
 ;;; TreeCL Standard Library (Prelude)
 
+(in-package "COMMON-LISP")
+
 (defmacro when (test &rest body)
   `(if ,test (progn ,@body)))
 
@@ -23,8 +25,74 @@
           (car args)
           `(if ,(car args) (and ,@(cdr args)) nil))))
 
-;;; Minimal ANSI test harness helper
-(defun compile-and-load (pathspec &rest args)
+(defmacro cond (&rest clauses)
+  (if (null clauses)
+      nil
+      (let ((clause (car clauses))
+            (rest (cdr clauses)))
+        (if (null clause)
+            `(cond ,@rest)
+            (let ((test (car clause))
+                  (body (cdr clause)))
+              (if (null body)
+                  `(let ((temp ,test))
+                     (if temp temp (cond ,@rest)))
+                  `(if ,test (progn ,@body) (cond ,@rest))))))))
+
+(defmacro eval-when (situations &rest body)
+  (declare (ignore situations))
+  `(progn ,@body))
+
+(defmacro declaim (&rest decls)
+  nil)
+
+(defmacro declare (&rest decls)
+  nil)
+
+(defparameter char-code-limit 1114112)
+
+(defun %defstruct-slot-name (spec)
+  (if (consp spec) (car spec) spec))
+
+(defun %defstruct-conc-name (name)
+  (if (consp name)
+      (let* ((opts (cdr name))
+             (opt (assoc :conc-name opts)))
+        (if opt (cadr opt) (concatenate 'string (symbol-name (car name)) "-")))
+      (concatenate 'string (symbol-name name) "-")))
+
+(defun %defstruct-accessor-name (prefix slot)
+  (let ((p (cond ((null prefix) "")
+                 ((symbolp prefix) (symbol-name prefix))
+                 ((stringp prefix) prefix)
+                 (t ""))))
+    (intern (concatenate 'string p (symbol-name slot)))))
+
+(defun %defstruct-accessors (name prefix slots idx)
+  (if (null slots)
+      nil
+      (let* ((slot (car slots))
+             (acc (%defstruct-accessor-name prefix slot)))
+        (cons `(defun ,acc (obj) (sys-struct-ref obj ,idx ',name))
+              (%defstruct-accessors name prefix (cdr slots) (+ idx 1))))))
+
+(defmacro defstruct (name &rest slots)
+  (let* ((struct-name (if (consp name) (car name) name))
+         (slot-names (mapcar #'%defstruct-slot-name slots))
+         (conc-name (%defstruct-conc-name name))
+         (maker (intern (concatenate 'string "MAKE-" (symbol-name struct-name))))
+         (pred (intern (concatenate 'string (symbol-name struct-name) "-P")))
+         (accessors (%defstruct-accessors struct-name conc-name slot-names 0)))
+    `(progn
+       (defun ,maker (&rest args)
+         (apply #'sys-make-struct ',struct-name ',slot-names args))
+       (defun ,pred (obj)
+         (sys-struct-p obj ',struct-name))
+       ,@accessors
+       ',struct-name)))
+
+;;; Minimal ANSI test harness helper (keep in CL-USER for tests)
+(defun common-lisp-user::compile-and-load (pathspec &rest args)
   (declare (ignore args))
   (load-and-compile-minimal pathspec))
 
@@ -110,6 +178,40 @@
 (defun not (x) (if x nil t))
 (defun null (x) (if x nil t))
 
+(defun notnot (x) (if x t nil))
+
+(defmacro notnot-mv (form)
+  `(notnot-mv-fn (multiple-value-list ,form)))
+
+(defun notnot-mv-fn (results)
+  (if (null results)
+      (values)
+      (apply #'values
+             (notnot (first results))
+             (rest results))))
+
+(defmacro not-mv (form)
+  `(not-mv-fn (multiple-value-list ,form)))
+
+(defun not-mv-fn (results)
+  (if (null results)
+      (values)
+      (apply #'values
+             (not (first results))
+             (rest results))))
+
+(defun eqt (x y)
+  (apply #'values (mapcar #'notnot (multiple-value-list (eq x y)))))
+
+(defun eqlt (x y)
+  (apply #'values (mapcar #'notnot (multiple-value-list (eql x y)))))
+
+(defun equalt (x y)
+  (apply #'values (mapcar #'notnot (multiple-value-list (equal x y)))))
+
+(defun equalpt (x y)
+  (apply #'values (mapcar #'notnot (multiple-value-list (equal x y)))))
+
 (defun mapcar (fn list &rest more-lists)
   (if (null more-lists)
       (if (null list)
@@ -177,6 +279,15 @@
 (defun third (x) (caddr x))
 (defun fourth (x) (cadddr x))
 (defun fifth (x) (car (cddddr x)))
+
+(defun safely-delete-package (package-designator)
+  (let ((package (find-package package-designator)))
+    (when package
+      (dolist (using-package (package-used-by-list package))
+        (unuse-package package using-package))
+      (delete-package package))))
+
+(defparameter +fail-count-limit+ 20)
 
 (defmacro return (&optional val)
   `(return-from nil ,val))
@@ -386,6 +497,7 @@
 ;; (defsetf symbol-function (sym) (store)
 ;;   `(set-symbol-function ,sym ,store))
 (defsetf get put)
+(defsetf gethash set-gethash)
 
 
 
@@ -432,6 +544,11 @@
 
 (defmacro time (form)
   `(sys-time-eval (lambda () ,form)))
+
+(defmacro handler-case (form &rest cases)
+  ;; Minimal stub: ignore handlers and evaluate the form.
+  (declare (ignore cases))
+  form)
 
 (defmacro let* (bindings &rest body)
   (if (null bindings)
@@ -896,6 +1013,21 @@
       (apply #'make-instance (find-class class) initargs)))
 
 (defclass point () (x y))
+
+;;; Export CL-level macros/functions defined in this file
+(export
+ '(when unless or and cond declaim defstruct in-package defpackage with-package-iterator
+   do-symbols do-external-symbols do-all-symbols return loop multiple-value-list
+   nth-value multiple-value-prog1 with-open-stream with-input-from-string
+   with-output-to-string with-standard-io-syntax define-setf-expander defsetf setf
+   push pop incf decf assert dolist dotimes trace time handler-case let* defconstant prog1
+   defclass defgeneric define-method-combination make-method defmethod
+   not null mapcar some append reverse nreverse caar cadr cdar cddr caaar caadr
+   cadar caddr cdaar cdadr cddar cdddr caaaar caaadr caadar caaddr cadaar cadadr
+   caddar cadddr cdaaar cdaadr cdadar cdaddr cddaar cddadr cdddar cddddr first
+   second third fourth fifth get-setf-expansion notnot notnot-mv notnot-mv-fn
+   not-mv not-mv-fn eqt eqlt equalt equalpt safely-delete-package
+   +fail-count-limit+))
 
 ;; REPL convenience (no-op in non-interactive runs)
 (defun quit (&optional code)

@@ -2429,9 +2429,13 @@ impl<'a> Interpreter<'a> {
                 // Fallthrough to error
                 // Debug node type
                 let node = self.process.arena.get_unchecked(effective_func_node);
+                let printed = {
+                    let symbols = self.globals.symbols.read().unwrap();
+                    crate::printer::print_to_string(&self.process.arena.inner, &symbols, effective_func_node)
+                };
                 return Err(ControlSignal::Error(format!(
-                    "TCO Apply not fully implemented for {:?} (Node ID: {:?} - {:?})",
-                    effective_func_node, effective_func_node, node
+                    "TCO Apply not fully implemented for {:?} (Node ID: {:?} - {:?}) form={}",
+                    effective_func_node, effective_func_node, node, printed
                 )));
             }
         };

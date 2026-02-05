@@ -72,6 +72,8 @@ fn main() -> io::Result<()> {
         let mut expressions = Vec::new();
         {
             let mut symbols_guard = globals.symbols.write().unwrap();
+            // Read init forms in COMMON-LISP so symbols are interned in CL.
+            symbols_guard.set_current_package(PackageId(1));
             let readtable = interpreter.process.current_readtable().clone();
             let mut reader = treecl::reader::Reader::new(
                 INIT_LISP,
@@ -99,6 +101,20 @@ fn main() -> io::Result<()> {
                 std::process::exit(1);
             }
         }
+
+        // Restore default package to COMMON-LISP-USER for the REPL and file loads.
+        {
+            let mut symbols_guard = globals.symbols.write().unwrap();
+            symbols_guard.set_current_package(PackageId(2));
+        }
+        let pkg_node = interpreter
+            .process
+            .arena
+            .inner
+            .alloc(treecl::arena::Node::Leaf(treecl::types::OpaqueValue::Package(2)));
+        interpreter
+            .process
+            .set_value(globals.package_sym, pkg_node);
     }
 
     // Check CLI args
