@@ -220,11 +220,11 @@ impl<'a> PatternMatcher<'a> {
         let Some(val_items) = self.arrays.get(crate::arrays::VectorId(*val_vec)) else {
             return false;
         };
-        if pat_items.len() != val_items.len() {
+        if pat_items.elements.len() != val_items.elements.len() {
             return false;
         }
         let checkpoint = self.bind_stack.len();
-        for (p, v) in pat_items.iter().zip(val_items.iter()) {
+        for (p, v) in pat_items.elements.iter().zip(val_items.elements.iter()) {
             if !self.match_node(*p, *v, allow_bind) {
                 self.rollback(checkpoint);
                 return false;
@@ -389,12 +389,16 @@ fn literal_equal_internal(
                 let Some(b_items) = arrays.get(crate::arrays::VectorId(*b)) else {
                     return false;
                 };
-                if a_items.len() != b_items.len() {
+                if a_items.elements.len() != b_items.elements.len() {
                     return false;
                 }
-                a_items.iter().zip(b_items.iter()).all(|(a_item, b_item)| {
-                    literal_equal_internal(arena, arrays, hashtables, shape, *a_item, *b_item)
-                })
+                a_items
+                    .elements
+                    .iter()
+                    .zip(b_items.elements.iter())
+                    .all(|(a_item, b_item)| {
+                        literal_equal_internal(arena, arrays, hashtables, shape, *a_item, *b_item)
+                    })
             }
             (Node::Leaf(OpaqueValue::HashHandle(a)), Node::Leaf(OpaqueValue::HashHandle(b))) => {
                 let Some(a_table) = hashtables.get(crate::types::HashHandle(*a)) else {

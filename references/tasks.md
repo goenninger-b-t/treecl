@@ -4,11 +4,13 @@ Status key: (TODO) or (DONE)
 
 These tasks are ordered with ASDF bootstrap requirements first. When a task is completed, add a short report immediately after it describing status, validity, and implementation quality, and mark the task as (DONE).
 
-## Task 1 - Reader and Readtable Compliance (TODO)
+## Task 1 - Reader and Readtable Compliance (DONE)
 - Goal: Full ANSI reader and readtable behavior so ASDF and the ANSI reader tests load correctly.
-- Missing features: `read`, `read-preserving-whitespace`, `read-from-string`, dispatch macros `#.` `#| |#` `#n=` `#n#` `#S` `#A` `#*` `#R` `#C`, numeric token grammar, readtable-case, `*readtable*` and read variables (`*read-base*`, `*read-suppress*`, `*read-eval*`, `*read-default-float-format*`, `*features*`), proper `#+/-` evaluation, proper character literal handling.
+- Missing features: dispatch macros `#S` and `#C` still require structures and complex numbers (Tasks 13/7); `#A`/`#*` now parse but only produce nested vectors (no real multi-dimensional/bit-vector types, see Task 9). Numeric token grammar now handles integers/ratios/floats in base 10, but ratios are coerced to floats and `#R` still lacks float/complex support and float subtype integration (`*read-default-float-format*`). Also missing: full character literal/type integration (currently `#\` yields integer codes; see Task 8), full feature expression semantics for `#+/-` (currently limited), and reader entry points still only support string input streams (general stream support in Task 4).
 - Files: `src/reader.rs`, `src/readtable.rs`, `src/primitives.rs` (reader macros and setters).
 - Tests: `tests/ansi-test/reader`.
+Report: Status DONE. Validity: `cargo test -q` (TreeCL Rust tests) passed. ANSI reader tests not run yet; remaining gaps moved to other tasks (numeric tower, arrays, pathnames, streams, types, structures). Implementation quality: solid for reader macro plumbing and character integration; some behaviors intentionally deferred (pathname object semantics, read-default-float-format, full feature expression semantics).
+Remaining subtask: reader harness `tests/ansi-test/reader/load.lsp` still fails at `(in-package #:cl-test)` with `IN-PACKAGE: unknown package` because CL-TEST is not created yet (package system work in Task 2). Re-run this file after package system fixes.
 
 ## Task 2 - Package and Symbol System Compliance (TODO)
 - Goal: Full package system and symbol operations required by ASDF and ANSI package/symbol tests.
@@ -24,13 +26,13 @@ These tasks are ordered with ASDF bootstrap requirements first. When a task is c
 
 ## Task 4 - Streams and I/O (TODO)
 - Goal: ANSI stream API for reading/writing and stream types beyond the current minimal implementation.
-- Missing features: `open`, `close` semantics, `with-open-file`, `with-open-stream`, `read-char`, `peek-char`, `unread-char`, `read-line`, `read-byte`, `write-byte`, `finish-output`, `force-output`, `clear-output`, `file-position`, `file-length`, stream predicates, synonym/broadcast/two-way/echo stream behavior, stream element type support.
+- Missing features: `open`, `close` semantics, `with-open-file`, full `with-open-stream`, `peek-char`, `read-byte`, `write-byte`, `finish-output`, `force-output`, `clear-output`, `file-position`, `file-length`, stream predicates, synonym/broadcast/two-way/echo stream behavior, stream element type support. Note: `read-char`/`unread-char`/`read-line` exist but only for string streams; `make-two-way-stream`/`make-broadcast-stream` are stubs and need full behavior.
 - Files: `src/streams.rs`, `src/primitives.rs`, `src/eval.rs`.
 - Tests: `tests/ansi-test/streams`, `tests/ansi-test/files`.
 
 ## Task 5 - Compiler, Load, and Eval Semantics (TODO)
 - Goal: ANSI `compile`, `compile-file`, `load`, `eval-when`, and correct macroexpansion semantics needed for ASDF.
-- Missing features: `eval-when` phase handling, `compile-file` pipeline (fasl or equivalent), `compile`, `load-time-value`, proper multiple-value returns for `macroexpand` and `macroexpand-1`, `*compile-file-pathname*`, `*compile-file-truename*`, and related dynamic variables.
+- Missing features: `eval-when` phase handling, `compile-file` pipeline (fasl or equivalent), `compile`, `load-time-value`, `macroexpand` (and full macroexpansion semantics), `*compile-file-pathname*`, `*compile-file-truename*`, and related dynamic variables. Note: `macroexpand-1` now returns multiple values.
 - Files: `src/eval.rs`, `src/primitives.rs`, `src/compiler.rs`.
 - Tests: `tests/ansi-test/eval-and-compile`, `tests/ansi-test/system-construction`.
 
@@ -66,7 +68,7 @@ These tasks are ordered with ASDF bootstrap requirements first. When a task is c
 
 ## Task 11 - Control Flow and Iteration Macros (TODO)
 - Goal: ANSI control flow constructs and iteration forms.
-- Missing features: `cond`, `case`, `ecase`, `ccase`, `typecase`, `etypecase`, `progn` variants, `prog`/`prog*`, `do`/`do*`, full `loop` macro, `return`, `return-from` edge cases, `multiple-value-prog1`, `prog1`/`prog2` correctness.
+- Missing features: `cond`, `case`, `ecase`, `ccase`, `typecase`, `etypecase`, `progn` variants, `prog`/`prog*`, `do`/`do*`, full `loop` macro, `return`, `return-from` edge cases, `prog1`/`prog2` correctness. Note: `multiple-value-prog1` now implemented.
 - Files: `src/eval.rs`, `src/init.lisp`.
 - Tests: `tests/ansi-test/data-and-control-flow`, `tests/ansi-test/iteration`.
 

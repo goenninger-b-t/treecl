@@ -228,6 +228,17 @@ pub enum Continuation {
         body: NodeId,
         env: Environment,
     },
+    /// MULTIPLE-VALUE-CALL: evaluate function then forms, collecting values
+    EvMvcFunc {
+        forms: Vec<NodeId>,
+        env: Environment,
+    },
+    EvMvcArgs {
+        func: NodeId,
+        forms: Vec<NodeId>,
+        collected: Vec<NodeId>,
+        env: Environment,
+    },
     /// Assignment (SETQ)
     /// (symbol, remaining_pairs)
     EvSetq {
@@ -934,6 +945,12 @@ impl<'a> Interpreter<'a> {
 
         match mode {
             crate::process::ExecutionMode::Eval => {
+                // Each evaluation establishes a fresh values context.
+                // If a form doesn't explicitly set multiple values, we will
+                // populate a single primary value on return.
+                self.process.values_are_set = false;
+                self.process.values.clear();
+
                 let expr = self.process.program;
                 self.process.pending_redex = Some(expr);
                 let env = self.process.current_env.as_ref().unwrap().clone();
@@ -1073,6 +1090,9 @@ impl<'a> Interpreter<'a> {
             }
             if sym_id == sf.multiple_value_bind {
                 return self.step_multiple_value_bind(args, env);
+            }
+            if sym_id == sf.multiple_value_call {
+                return self.step_multiple_value_call(args, env);
             }
             if sym_id == sf.block {
                 return self.step_block(args, env);
@@ -1730,6 +1750,35 @@ impl<'a> Interpreter<'a> {
         Ok(true)
     }
 
+    fn step_multiple_value_call(
+        &mut self,
+        args: NodeId,
+        env: Environment,
+    ) -> Result<bool, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error(
+                "multiple-value-call: too few args".into(),
+            ));
+        }
+        let func_expr = args_vec[0];
+        let forms = if args_vec.len() > 1 {
+            args_vec[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        self.process.continuation_stack.push(Continuation::EvMvcFunc {
+            forms,
+            env: env.clone(),
+        });
+
+        self.process.program = func_expr;
+        self.process.current_env = Some(env);
+        self.process.execution_mode = crate::process::ExecutionMode::Eval;
+        Ok(true)
+    }
+
     fn step_progn(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
         self.process.current_env = Some(env);
         let forms = self.cons_to_vec(args);
@@ -1750,6 +1799,12 @@ impl<'a> Interpreter<'a> {
 
     fn apply_continuation(&mut self, cont: Continuation) -> Result<bool, ControlSignal> {
         let result = self.process.program;
+
+        if !self.process.values_are_set {
+            self.process.values.clear();
+            self.process.values.push(result);
+            self.process.values_are_set = true;
+        }
 
         match cont {
             Continuation::Done => Ok(false),
@@ -1785,6 +1840,109 @@ impl<'a> Interpreter<'a> {
                     self.process.program = next;
                     self.process.execution_mode = crate::process::ExecutionMode::Eval;
                 }
+                Ok(true)
+            }
+            Continuation::EvMvb { vars, body, env } => {
+                self.process.current_env = Some(env.clone());
+                let mut new_env = Environment::with_parent(env);
+
+                let mut values_iter = self.process.values.iter().copied();
+                let mut cur = vars;
+                loop {
+                    match self.process.arena.get_unchecked(cur).clone() {
+                        Node::Leaf(OpaqueValue::Nil) => break,
+                        Node::Fork(var_node, rest) => {
+                            let sym = self.node_to_symbol(var_node).ok_or_else(|| {
+                                ControlSignal::Error(
+                                    "multiple-value-bind: expected symbol".into(),
+                                )
+                            })?;
+                            let val = values_iter.next().unwrap_or_else(|| self.process.make_nil());
+                            new_env.bind(sym, val);
+                            cur = rest;
+                        }
+                        _ => {
+                            return Err(ControlSignal::Error(
+                                "multiple-value-bind: malformed variable list".into(),
+                            ))
+                        }
+                    }
+                }
+
+                if matches!(
+                    self.process.arena.get_unchecked(body),
+                    Node::Leaf(OpaqueValue::Nil)
+                ) {
+                    self.process.program = self.process.make_nil();
+                    self.process.execution_mode = crate::process::ExecutionMode::Return;
+                    return Ok(true);
+                }
+
+                let progn_sym = self.globals.special_forms.progn;
+                let progn_sym_val = crate::types::OpaqueValue::Symbol(progn_sym.0);
+                let progn_sym_node =
+                    self.process.arena.inner.alloc(Node::Leaf(progn_sym_val));
+                let progn_form = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Fork(progn_sym_node, body));
+
+                self.process.program = progn_form;
+                self.process.current_env = Some(new_env);
+                self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                Ok(true)
+            }
+            Continuation::EvMvcFunc { forms, env } => {
+                self.process.current_env = Some(env.clone());
+                let func = result;
+
+                if forms.is_empty() {
+                    self.process
+                        .continuation_stack
+                        .push(Continuation::Apply { saved_env: env.clone() });
+                    return self.step_apply(func, Vec::new(), env);
+                }
+
+                let first = forms[0];
+                let rest = forms[1..].to_vec();
+                self.process.continuation_stack.push(Continuation::EvMvcArgs {
+                    func,
+                    forms: rest,
+                    collected: Vec::new(),
+                    env: env.clone(),
+                });
+                self.process.program = first;
+                self.process.execution_mode = crate::process::ExecutionMode::Eval;
+                Ok(true)
+            }
+            Continuation::EvMvcArgs {
+                func,
+                forms,
+                mut collected,
+                env,
+            } => {
+                let mut values = self.process.values.clone();
+                collected.append(&mut values);
+
+                if forms.is_empty() {
+                    self.process.current_env = Some(env.clone());
+                    self.process
+                        .continuation_stack
+                        .push(Continuation::Apply { saved_env: env.clone() });
+                    return self.step_apply(func, collected, env);
+                }
+
+                let next = forms[0];
+                let rest = forms[1..].to_vec();
+                self.process.continuation_stack.push(Continuation::EvMvcArgs {
+                    func,
+                    forms: rest,
+                    collected,
+                    env: env.clone(),
+                });
+                self.process.program = next;
+                self.process.execution_mode = crate::process::ExecutionMode::Eval;
                 Ok(true)
             }
             Continuation::Block { name, rest } => {
@@ -2862,6 +3020,12 @@ impl<'a> Interpreter<'a> {
             if sym_id == sf.locally {
                 return self.eval_locally(args, env);
             }
+            if sym_id == sf.multiple_value_bind {
+                return self.eval_multiple_value_bind(args, env);
+            }
+            if sym_id == sf.multiple_value_call {
+                return self.eval_multiple_value_call(args, env);
+            }
 
             if let Some(func_node) = env.lookup_function(sym_id) {
                 if let Node::Leaf(OpaqueValue::CallMethod(state_idx)) =
@@ -3883,6 +4047,85 @@ impl<'a> Interpreter<'a> {
         Ok(result)
     }
 
+    fn eval_multiple_value_bind(&mut self, args: NodeId, env: &Environment) -> EvalResult {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Err(ControlSignal::Error(
+                "multiple-value-bind: too few args".into(),
+            ));
+        }
+        let vars_node = args_vec[0];
+        let values_form = args_vec[1];
+        let body = if args_vec.len() > 2 {
+            self.process.make_list(&args_vec[2..])
+        } else {
+            self.process.make_nil()
+        };
+
+        let _ = self.eval(values_form, env)?;
+        let values = if self.process.values_are_set {
+            self.process.values.clone()
+        } else {
+            vec![self.process.program]
+        };
+
+        let mut new_env = Environment::with_parent(env.clone());
+        let mut values_iter = values.into_iter();
+        let mut cur = vars_node;
+        loop {
+            match self.process.arena.get_unchecked(cur).clone() {
+                Node::Leaf(OpaqueValue::Nil) => break,
+                Node::Fork(var_node, rest) => {
+                    let sym = self.node_to_symbol(var_node).ok_or_else(|| {
+                        ControlSignal::Error(
+                            "multiple-value-bind: expected symbol".into(),
+                        )
+                    })?;
+                    let val = values_iter.next().unwrap_or_else(|| self.process.make_nil());
+                    new_env.bind(sym, val);
+                    cur = rest;
+                }
+                _ => {
+                    return Err(ControlSignal::Error(
+                        "multiple-value-bind: malformed variable list".into(),
+                    ))
+                }
+            }
+        }
+
+        self.eval_progn(body, &new_env)
+    }
+
+    fn eval_multiple_value_call(&mut self, args: NodeId, env: &Environment) -> EvalResult {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error(
+                "multiple-value-call: too few args".into(),
+            ));
+        }
+        let func_expr = args_vec[0];
+        let forms = if args_vec.len() > 1 {
+            args_vec[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let func = self.eval(func_expr, env)?;
+
+        let mut collected = Vec::new();
+        for form in forms {
+            let _ = self.eval(form, env)?;
+            if self.process.values_are_set {
+                collected.extend(self.process.values.iter().copied());
+            } else {
+                collected.push(self.process.program);
+            }
+        }
+
+        let args_list = self.process.make_list(&collected);
+        self.apply_values(func, args_list, env)
+    }
+
     /// (setq var val var val ...) -> set variable values
     fn eval_setq(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         let mut result = self.process.make_nil();
@@ -4720,6 +4963,8 @@ impl<'a> Interpreter<'a> {
                         || sym == sf.defmacro
                         || sym == sf.defclass
                         || sym == sf.defmethod
+                        || sym == sf.multiple_value_bind
+                        || sym == sf.multiple_value_call
                 };
 
                 if is_sf {

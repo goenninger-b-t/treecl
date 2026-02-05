@@ -448,6 +448,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Unbound => "#<unbound>".to_string(),
             OpaqueValue::Integer(n) => n.to_string(),
             OpaqueValue::Float(f) => format!("{:.6}", f),
+            OpaqueValue::Char(c) => format!("#\\{}", c),
             OpaqueValue::String(s) => format!("{:?}", s),
             OpaqueValue::VectorHandle(h) => format!("#<vector:{}>", h),
             OpaqueValue::ForeignPtr(p) => format!("#<foreign:{:?}>", p),
@@ -457,6 +458,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Class(id) => format!("#<class:{}>", id),
             OpaqueValue::Symbol(id) => format!("#<symbol:{}>", id),
             OpaqueValue::BigInt(n) => n.to_string(),
+            OpaqueValue::Ratio(n, d) => format!("{}/{}", n, d),
             OpaqueValue::StreamHandle(id) => format!("#<stream:{}>", id),
             OpaqueValue::Pid(pid) => format!("#<{}.{}.{}>", pid.node, pid.id, pid.serial),
             OpaqueValue::HashHandle(h) => format!("#<hash-table:{}>", h),
@@ -472,6 +474,11 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
                 format!("#<slot-definition:{}:{}{}>", class_id, slot_idx, tag)
             }
             OpaqueValue::Readtable(id) => format!("#<readtable:{}>", id),
+            OpaqueValue::Complex(real, imag) => format!(
+                "#C({} {})",
+                unparse(arena, *real, depth + 1),
+                unparse(arena, *imag, depth + 1)
+            ),
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!(

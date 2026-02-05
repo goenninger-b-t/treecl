@@ -23,6 +23,17 @@
           (car args)
           `(if ,(car args) (and ,@(cdr args)) nil))))
 
+;;; Minimal ANSI test harness helper
+(defun compile-and-load (pathspec &rest args)
+  (declare (ignore args))
+  (load-and-compile-minimal pathspec))
+
+(defmacro in-package (designator)
+  ;; Ensure the designator is not evaluated (ANSI behavior).
+  (if (and (consp designator) (eq (car designator) 'quote))
+      `(funcall 'in-package ,designator)
+      `(funcall 'in-package ',designator)))
+
 
 
 
@@ -105,6 +116,89 @@
   ;; Real loop is complex
   (let ((g (gensym)))
     `(block nil (tagbody ,g (progn ,@body) (go ,g)))))
+
+;;; Multiple values helpers
+(defmacro multiple-value-list (form)
+  `(multiple-value-call #'list ,form))
+
+(defmacro nth-value (n form)
+  `(nth ,n (multiple-value-list ,form)))
+
+(defmacro multiple-value-prog1 (first-form &rest forms)
+  `(let ((vals (multiple-value-list ,first-form)))
+     ,@forms
+     (values-list vals)))
+
+;;; Basic stream macros (minimal)
+(defmacro with-open-stream ((var stream) &rest body)
+  `(let ((,var ,stream))
+     (unwind-protect (progn ,@body)
+       (close ,var))))
+
+(defmacro with-input-from-string ((var string) &rest body)
+  (let ((stream (gensym "STREAM"))
+        (old (gensym "OLD")))
+    (if (eq var '*standard-input*)
+        `(let* ((,stream (make-string-input-stream ,string))
+                (,old *standard-input*))
+           (setf *standard-input* ,stream)
+           (unwind-protect (progn ,@body)
+             (setf *standard-input* ,old)
+             (close ,stream)))
+        `(let* ((,stream (make-string-input-stream ,string))
+                (,old *standard-input*))
+           (setf *standard-input* ,stream)
+           (unwind-protect (let ((,var ,stream)) ,@body)
+             (setf *standard-input* ,old)
+             (close ,stream))))))
+
+(defmacro with-output-to-string ((var &optional string) &rest body)
+  (declare (ignore string))
+  (let ((stream (gensym "STREAM"))
+        (old (gensym "OLD")))
+    `(let* ((,stream (make-string-output-stream))
+            (,old *standard-output*))
+       (setf *standard-output* ,stream)
+       (unwind-protect
+           (let ((,var ,stream)) ,@body)
+         (setf *standard-output* ,old))
+       (get-output-stream-string ,stream))))
+
+(defmacro with-standard-io-syntax (&rest body)
+  `(progn ,@body))
+
+;;; Reader macro placeholders (for GET-MACRO-CHARACTER)
+(defun read-left-paren (stream char)
+  (declare (ignore stream char))
+  (error "READ-LEFT-PAREN is a reader macro placeholder"))
+
+(defun read-right-paren (stream char)
+  (declare (ignore stream char))
+  (error "READ-RIGHT-PAREN is a reader macro placeholder"))
+
+(defun read-quote (stream char)
+  (declare (ignore stream char))
+  (error "READ-QUOTE is a reader macro placeholder"))
+
+(defun read-string (stream char)
+  (declare (ignore stream char))
+  (error "READ-STRING is a reader macro placeholder"))
+
+(defun read-comment (stream char)
+  (declare (ignore stream char))
+  (error "READ-COMMENT is a reader macro placeholder"))
+
+(defun read-backquote (stream char)
+  (declare (ignore stream char))
+  (error "READ-BACKQUOTE is a reader macro placeholder"))
+
+(defun read-comma (stream char)
+  (declare (ignore stream char))
+  (error "READ-COMMA is a reader macro placeholder"))
+
+(defun read-dispatch (stream char)
+  (declare (ignore stream char))
+  (error "READ-DISPATCH is a reader macro placeholder"))
 
 ;;; Generalized Place Handling
 

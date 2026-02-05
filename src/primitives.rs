@@ -14,11 +14,21 @@ use crate::tree_calculus;
 use crate::clos::GenericName;
 use libc;
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
+use num_traits::{Signed, ToPrimitive};
 use std::collections::HashMap;
 
 fn err_helper(msg: &str) -> EvalResult {
     Err(ControlSignal::Error(msg.to_string()))
+}
+
+fn set_multiple_values(proc: &mut Process, mut values: Vec<NodeId>) -> NodeId {
+    proc.values_are_set = true;
+    proc.values.clear();
+    proc.values.append(&mut values);
+    proc.values
+        .first()
+        .copied()
+        .unwrap_or_else(|| proc.make_nil())
 }
 
 fn node_to_symbol(proc: &Process, node: NodeId) -> Option<SymbolId> {
@@ -26,6 +36,95 @@ fn node_to_symbol(proc: &Process, node: NodeId) -> Option<SymbolId> {
         Some(SymbolId(*id))
     } else {
         None
+    }
+}
+
+fn node_to_char(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Option<char> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Char(c)) => Some(*c),
+        Node::Leaf(OpaqueValue::Integer(n)) => std::char::from_u32(*n as u32),
+        Node::Leaf(OpaqueValue::String(s)) => s.chars().next(),
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .and_then(|s| s.chars().next()),
+        _ => None,
+    }
+}
+
+fn list_to_vec_opt(proc: &Process, list: NodeId) -> Option<Vec<NodeId>> {
+    let mut out = Vec::new();
+    let mut cur = list;
+    loop {
+        match proc.arena.inner.get_unchecked(cur) {
+            Node::Leaf(OpaqueValue::Nil) => break,
+            Node::Fork(car, cdr) => {
+                out.push(*car);
+                cur = *cdr;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn string_from_designator(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Option<String> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::String(s)) => Some(s.clone()),
+        Node::Leaf(OpaqueValue::Char(c)) => Some(c.to_string()),
+        Node::Leaf(OpaqueValue::Integer(_)) => node_to_char(proc, ctx, node).map(|c| c.to_string()),
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn string_from_sequence(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Option<String> {
+    if let Some(s) = string_from_designator(proc, ctx, node) {
+        return Some(s);
+    }
+
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            let arr = proc.arrays.get(crate::arrays::VectorId(*id))?;
+            if !arr.element_type.is_character() {
+                return None;
+            }
+            let mut out = String::new();
+            for item in &arr.elements {
+                let ch = node_to_char(proc, ctx, *item)?;
+                out.push(ch);
+            }
+            Some(out)
+        }
+        Node::Fork(_, _) => {
+            let items = list_to_vec_opt(proc, node)?;
+            let mut out = String::new();
+            for item in items {
+                let ch = node_to_char(proc, ctx, item)?;
+                out.push(ch);
+            }
+            Some(out)
+        }
+        _ => None,
     }
 }
 
@@ -81,6 +180,8 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("NTH", cl, prim_nth);
     globals.register_primitive("RPLACA", cl, prim_rplaca);
     globals.register_primitive("RPLACD", cl, prim_rplacd);
+    globals.register_primitive("VALUES", cl, prim_values);
+    globals.register_primitive("VALUES-LIST", cl, prim_values_list);
 
     // Predicates
     globals.register_primitive("NULL", cl, prim_null);
@@ -88,13 +189,30 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("CONSP", cl, prim_consp);
     globals.register_primitive("LISTP", cl, prim_listp);
     globals.register_primitive("NUMBERP", cl, prim_numberp);
+    globals.register_primitive("CHARACTERP", cl, prim_characterp);
+    globals.register_primitive("CHARACTER", cl, prim_character);
+    globals.register_primitive("CHAR-CODE", cl, prim_char_code);
+    globals.register_primitive("CODE-CHAR", cl, prim_code_char);
+    globals.register_primitive("CHAR-NAME", cl, prim_char_name);
+    globals.register_primitive("NAME-CHAR", cl, prim_name_char);
+    globals.register_primitive("CHAR-UPCASE", cl, prim_char_upcase);
+    globals.register_primitive("CHAR-DOWNCASE", cl, prim_char_downcase);
+    globals.register_primitive("UPPER-CASE-P", cl, prim_upper_case_p);
+    globals.register_primitive("LOWER-CASE-P", cl, prim_lower_case_p);
+    globals.register_primitive("BOTH-CASE-P", cl, prim_both_case_p);
+    globals.register_primitive("ALPHANUMERICP", cl, prim_alphanumericp);
+    globals.register_primitive("DIGIT-CHAR", cl, prim_digit_char);
+    globals.register_primitive("DIGIT-CHAR-P", cl, prim_digit_char_p);
     globals.register_primitive("SYMBOLP", cl, prim_symbolp);
+    globals.register_primitive("FUNCTIONP", cl, prim_functionp);
     globals.register_primitive("EQ", cl, prim_eq);
     globals.register_primitive("EQL", cl, prim_eql);
     globals.register_primitive("EQUAL", cl, prim_equal);
+    globals.register_primitive("TYPEP", cl, prim_typep);
     globals.register_primitive("SYMBOL-VALUE", cl, prim_symbol_value);
     globals.register_primitive("GENSYM", cl, prim_gensym);
     globals.register_primitive("MAKE-SYMBOL", cl, prim_make_symbol);
+    globals.register_primitive("INTERN", cl, prim_intern);
 
     // Logic
     globals.register_primitive("NOT", cl, prim_not);
@@ -104,6 +222,50 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("PRINC", cl, prim_princ);
     globals.register_primitive("TERPRI", cl, prim_terpri);
     globals.register_primitive("FORMAT", cl, prim_format);
+    globals.register_primitive("READ", cl, prim_read);
+    globals.register_primitive(
+        "READ-PRESERVING-WHITESPACE",
+        cl,
+        prim_read_preserving_whitespace,
+    );
+    globals.register_primitive("READ-FROM-STRING", cl, prim_read_from_string);
+    globals.register_primitive("READ-DELIMITED-LIST", cl, prim_read_delimited_list);
+    globals.register_primitive("READ-CHAR", cl, prim_read_char);
+    globals.register_primitive("UNREAD-CHAR", cl, prim_unread_char);
+    globals.register_primitive("READ-LINE", cl, prim_read_line);
+
+    // Strings & Characters
+    globals.register_primitive("STRING", cl, prim_string);
+    globals.register_primitive("STRING=", cl, prim_string_eq);
+    globals.register_primitive("STRING-UPCASE", cl, prim_string_upcase);
+    globals.register_primitive("STRING-DOWNCASE", cl, prim_string_downcase);
+    globals.register_primitive("STRING-CAPITALIZE", cl, prim_string_capitalize);
+    globals.register_primitive("STRING-TRIM", cl, prim_string_trim);
+    globals.register_primitive("MAKE-STRING", cl, prim_make_string);
+    globals.register_primitive("CONCATENATE", cl, prim_concatenate);
+    globals.register_primitive("COERCE", cl, prim_coerce);
+    globals.register_primitive("SUBSEQ", cl, prim_subseq);
+
+    // Arrays
+    globals.register_primitive("ARRAYP", cl, prim_arrayp);
+    globals.register_primitive("VECTORP", cl, prim_vectorp);
+    globals.register_primitive("SIMPLE-VECTOR-P", cl, prim_simple_vector_p);
+    globals.register_primitive("SIMPLE-BIT-VECTOR-P", cl, prim_simple_bit_vector_p);
+    globals.register_primitive("ARRAY-RANK", cl, prim_array_rank);
+    globals.register_primitive("ARRAY-DIMENSIONS", cl, prim_array_dimensions);
+    globals.register_primitive("ARRAY-TOTAL-SIZE", cl, prim_array_total_size);
+    globals.register_primitive("ARRAY-HAS-FILL-POINTER-P", cl, prim_array_has_fill_pointer_p);
+    globals.register_primitive("ARRAY-ELEMENT-TYPE", cl, prim_array_element_type);
+    globals.register_primitive(
+        "UPGRADED-ARRAY-ELEMENT-TYPE",
+        cl,
+        prim_upgraded_array_element_type,
+    );
+    globals.register_primitive("ROW-MAJOR-AREF", cl, prim_row_major_aref);
+    globals.register_primitive("COMPLEX", cl, prim_complex);
+    globals.register_primitive("SYS-MAKE-STRUCT", cl, prim_sys_make_struct);
+    globals.register_primitive("SYS-STRUCT-REF", cl, prim_sys_struct_ref);
+    globals.register_primitive("SYS-STRUCT-P", cl, prim_sys_struct_p);
 
     // CLOS
     globals.register_primitive("FIND-CLASS", cl, prim_find_class);
@@ -322,6 +484,11 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     // System
     globals.register_primitive("GC", cl, prim_gc);
     globals.register_primitive("ROOM", cl, prim_room);
+    globals.register_primitive(
+        "LOAD-AND-COMPILE-MINIMAL",
+        cl,
+        prim_load_and_compile_minimal,
+    );
 
     // Arrays
     globals.register_primitive("MAKE-ARRAY", cl, prim_make_array);
@@ -336,6 +503,21 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("COPY-READTABLE", cl, prim_copy_readtable);
     globals.register_primitive("READTABLE-CASE", cl, prim_readtable_case);
     globals.register_primitive("SET-READTABLE-CASE", cl, prim_set_readtable_case);
+    globals.register_primitive(
+        "MAKE-DISPATCH-MACRO-CHARACTER",
+        cl,
+        prim_make_dispatch_macro_character,
+    );
+    globals.register_primitive(
+        "SET-DISPATCH-MACRO-CHARACTER",
+        cl,
+        prim_set_dispatch_macro_character,
+    );
+    globals.register_primitive(
+        "GET-DISPATCH-MACRO-CHARACTER",
+        cl,
+        prim_get_dispatch_macro_character,
+    );
 
     // Tools
     globals.register_primitive("COMPILE", cl, prim_compile);
@@ -377,6 +559,8 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
         cl,
         prim_make_string_input_stream,
     );
+    globals.register_primitive("MAKE-TWO-WAY-STREAM", cl, prim_make_two_way_stream);
+    globals.register_primitive("MAKE-BROADCAST-STREAM", cl, prim_make_broadcast_stream);
     globals.register_primitive("CLOSE", cl, prim_close);
     globals.register_primitive("WRITE-STRING", cl, prim_write_string);
     globals.register_primitive("WRITE-CHAR", cl, prim_write_char);
@@ -395,6 +579,7 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("LOAD", cl, prim_load);
     globals.register_primitive("MAPC", cl, prim_mapc);
     globals.register_primitive("MAKE-PATHNAME", cl, prim_make_pathname);
+    globals.register_primitive("PATHNAME-DIRECTORY", cl, prim_pathname_directory);
     globals.register_primitive("PATHNAME-TYPE", cl, prim_pathname_type);
     globals.register_primitive("DIRECTORY", cl, prim_directory);
     globals.register_primitive("DELETE-FILE", cl, prim_delete_file);
@@ -998,34 +1183,17 @@ fn prim_macroexpand_1(
                         let mut interpreter = Interpreter::new(proc, ctx);
                         let expanded = interpreter._apply_macro(&closure, args_node)?;
 
-                        // Return (values expansion t) -> For now just list (expansion t)
-                        // Or just expansion if we don't have multiple values.
-                        // The user asked for VALUES support. If not present, we return list for now?
-                        // Or we assume single value return for MVP if acceptable.
-                        // Standard macroexpand-1 returns 2 values.
-                        // Let's return list (expansion t) to be safe for now or single value?
-                        // Actually, if I can't return values, (macroexpand-1) is hard to use correctly.
-                        // Let's return list (expansion t) and let Lisp wrapper handle it?
-                        // Or just return expansion.
-                        // Issue: If it's not a macro, we return the form.
-                        // If it IS a macro, we return expansion.
-                        // How to distinguish? "Expanded-p".
-                        // Let's implement values support later?
-                        // I'll return a LIST of two elements: (expansion expanded-p)
-                        // This is non-standard but functional for my lisp code.
-                        // Wait, I can fix `macroexpand` in lisp to handle this.
-
                         let t_val = interpreter.process.make_t(ctx);
-                        let result_list = interpreter.process.make_list(&[expanded, t_val]);
-                        return Ok(result_list);
+                        let primary = set_multiple_values(proc, vec![expanded, t_val]);
+                        return Ok(primary);
                     }
                 }
             }
         }
         // Not a macro form or not a cons
         let nil_val = proc.make_nil();
-        let result_list = proc.make_list(&[form, nil_val]);
-        Ok(result_list)
+        let primary = set_multiple_values(proc, vec![form, nil_val]);
+        Ok(primary)
     } else {
         err_helper("MACROEXPAND-1: missing argument")
     }
@@ -1039,7 +1207,7 @@ fn prim_load(
     if let Some(&arg) = args.first() {
         // Extract filename string
         // Arg should be evaluated (string or symbol)
-        let filename = match proc.arena.inner.get_unchecked(arg) {
+        let mut filename = match proc.arena.inner.get_unchecked(arg) {
             Node::Leaf(OpaqueValue::String(s)) => s.clone(),
             // If it's a symbol, use name?
             Node::Leaf(OpaqueValue::Symbol(id)) => ctx
@@ -1051,6 +1219,35 @@ fn prim_load(
                 .to_string(),
             _ => return err_helper("LOAD: filename must be string or symbol"),
         };
+
+        // If relative with no explicit directory, try default pathname defaults or load pathname.
+        if !filename.contains('/') && !filename.contains('\\') {
+            let default_sym = ctx
+                .symbols
+                .write()
+                .unwrap()
+                .intern_in("*DEFAULT-PATHNAME-DEFAULTS*", crate::symbol::PackageId(1));
+            if let Some(base_node) = proc.get_value(default_sym) {
+                if let Some(base_str) = string_from_designator(proc, ctx, base_node) {
+                    let candidate = std::path::Path::new(&base_str).join(&filename);
+                    filename = candidate.to_string_lossy().to_string();
+                }
+            } else {
+                let load_pn_sym = ctx
+                    .symbols
+                    .write()
+                    .unwrap()
+                    .intern_in("*LOAD-PATHNAME*", crate::symbol::PackageId(1));
+                if let Some(base_node) = proc.get_value(load_pn_sym) {
+                    if let Some(base_str) = string_from_designator(proc, ctx, base_node) {
+                        if let Some(parent) = std::path::Path::new(&base_str).parent() {
+                            let candidate = parent.join(&filename);
+                            filename = candidate.to_string_lossy().to_string();
+                        }
+                    }
+                }
+            }
+        }
 
         let path = std::path::Path::new(&filename);
         if !path.exists() {
@@ -1104,13 +1301,12 @@ fn prim_load(
 
         // Parse and Eval loop
         // We need to use Reader and Interpreter
-        let mut interpreter = Interpreter::new(proc, ctx);
         let env = crate::eval::Environment::new();
 
         let mut exprs = Vec::new();
         // Scope for reader
         let read_result: Result<(), ControlSignal> = {
-            let mut symbols_guard = ctx.symbols.write().unwrap();
+            let mut interpreter = Interpreter::new(proc, ctx);
             let options = build_reader_options(&interpreter.process, ctx, false);
             let rt_id = current_readtable_id(&interpreter.process, ctx);
             let readtable = interpreter
@@ -1118,6 +1314,7 @@ fn prim_load(
                 .readtable_by_id(rt_id)
                 .expect("readtable missing")
                 .clone();
+            let mut symbols_guard = ctx.symbols.write().unwrap();
             // Enable read-time eval for #. while loading
             crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
                 proc_ptr: interpreter.process as *mut _,
@@ -1149,9 +1346,30 @@ fn prim_load(
         read_result?;
         crate::reader::set_read_eval_context(None);
 
-        for expr in exprs {
-            interpreter.eval(expr, &env)?;
-        }
+        // Preserve caller state so LOAD doesn't clobber it.
+        let saved_program = proc.program;
+        let saved_mode = proc.execution_mode.clone();
+        let saved_env = proc.current_env.clone();
+        let saved_stack = std::mem::take(&mut proc.continuation_stack);
+        let saved_pending = proc.pending_redex;
+        let saved_next_methods = std::mem::take(&mut proc.next_method_states);
+
+        let eval_result = (|| {
+            let mut interpreter = Interpreter::new(proc, ctx);
+            for expr in exprs {
+                interpreter.eval(expr, &env)?;
+            }
+            Ok::<(), ControlSignal>(())
+        })();
+
+        proc.program = saved_program;
+        proc.execution_mode = saved_mode;
+        proc.current_env = saved_env;
+        proc.continuation_stack = saved_stack;
+        proc.pending_redex = saved_pending;
+        proc.next_method_states = saved_next_methods;
+
+        eval_result?;
 
         // Restore bindings
         if let Some(v) = old_pn {
@@ -1171,6 +1389,60 @@ fn prim_load(
     }
 }
 
+fn translate_logical_path_minimal(path: &str) -> String {
+    let upper = path.to_uppercase();
+    let prefix = "ANSI-TESTS:";
+    if upper.starts_with(prefix) {
+        let rest = &path[prefix.len()..];
+        let rest_upper = rest.to_uppercase();
+        let mut mapped = if rest_upper.starts_with("AUX;") && rest.len() >= 4 {
+            format!("tests/ansi-test/auxiliary/{}", &rest[4..])
+        } else {
+            format!("tests/ansi-test/{}", rest)
+        };
+        mapped = mapped.replace(';', "/");
+        return mapped.to_lowercase();
+    }
+    path.to_string()
+}
+
+fn prim_load_and_compile_minimal(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("LOAD-AND-COMPILE-MINIMAL requires a pathspec");
+    }
+
+    let mut path = string_from_designator(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("LOAD-AND-COMPILE-MINIMAL: invalid pathspec".to_string())
+    })?;
+
+    path = translate_logical_path_minimal(&path);
+
+    if !path.contains('/') && !path.contains('\\') {
+        let load_pn_sym = ctx
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("*LOAD-PATHNAME*", crate::symbol::PackageId(1));
+        if let Some(base_node) = proc.get_value(load_pn_sym) {
+            if let Some(base_str) = string_from_designator(proc, ctx, base_node) {
+                if let Some(parent) = std::path::Path::new(&base_str).parent() {
+                    path = parent.join(&path).to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+
+    let path_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::String(path)));
+    prim_load(proc, ctx, &[path_node])
+}
+
 fn build_reader_options(
     proc: &crate::process::Process,
     ctx: &crate::context::GlobalContext,
@@ -1186,8 +1458,17 @@ fn build_reader_options(
             .intern_in(name, crate::symbol::PackageId(1))
     };
 
+    let lookup_env_or_global = |sym: crate::symbol::SymbolId| -> Option<NodeId> {
+        if let Some(env) = &proc.current_env {
+            if let Some(val) = env.lookup(sym) {
+                return Some(val);
+            }
+        }
+        proc.get_value(sym)
+    };
+
     let read_base_sym = get_sym("*READ-BASE*");
-    if let Some(val) = proc.get_value(read_base_sym) {
+    if let Some(val) = lookup_env_or_global(read_base_sym) {
         if let Node::Leaf(OpaqueValue::Integer(n)) = proc.arena.inner.get_unchecked(val) {
             if *n >= 2 && *n <= 36 {
                 opts.read_base = *n as u32;
@@ -1196,18 +1477,18 @@ fn build_reader_options(
     }
 
     let read_eval_sym = get_sym("*READ-EVAL*");
-    if let Some(val) = proc.get_value(read_eval_sym) {
+    if let Some(val) = lookup_env_or_global(read_eval_sym) {
         opts.read_eval = !matches!(proc.arena.inner.get_unchecked(val), Node::Leaf(OpaqueValue::Nil));
     }
 
     let read_suppress_sym = get_sym("*READ-SUPPRESS*");
-    if let Some(val) = proc.get_value(read_suppress_sym) {
+    if let Some(val) = lookup_env_or_global(read_suppress_sym) {
         opts.read_suppress =
             !matches!(proc.arena.inner.get_unchecked(val), Node::Leaf(OpaqueValue::Nil));
     }
 
     let features_sym = get_sym("*FEATURES*");
-    if let Some(val) = proc.get_value(features_sym) {
+    if let Some(val) = lookup_env_or_global(features_sym) {
         let mut feats = Vec::new();
         let mut cur = val;
         while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(cur) {
@@ -1223,9 +1504,7 @@ fn build_reader_options(
             }
             cur = *cdr;
         }
-        if !feats.is_empty() {
-            opts.features = feats;
-        }
+        opts.features = feats;
     }
 
     opts
@@ -1287,6 +1566,7 @@ fn prim_make_pathname(
     // Basic parser for :name "foo" :type "lisp"
     let mut name = String::new();
     let mut type_ext = String::new();
+    let mut directory: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -1310,28 +1590,60 @@ fn prim_make_pathname(
                     i += 2;
                     continue;
                 }
+                if s == "DIRECTORY" && i + 1 < args.len() {
+                    if let Node::Leaf(OpaqueValue::String(val)) =
+                        proc.arena.inner.get_unchecked(args[i + 1])
+                    {
+                        directory = Some(val.clone());
+                    }
+                    i += 2;
+                    continue;
+                }
             }
         }
         i += 1;
     }
 
-    let res = if !type_ext.is_empty() {
+    let mut res = if !type_ext.is_empty() {
         format!("{}.{}", name, type_ext)
     } else {
         name
     };
 
-    // Fallback to "dummy" if empty?
-    let final_res = if res.is_empty() {
-        "dummy".to_string()
-    } else {
-        res
-    };
+    if let Some(dir) = directory {
+        if !res.is_empty() {
+            res = std::path::Path::new(&dir)
+                .join(res)
+                .to_string_lossy()
+                .to_string();
+        } else {
+            res = dir;
+        }
+    }
+
+    let final_res = if res.is_empty() { "dummy".to_string() } else { res };
 
     Ok(proc
         .arena
         .inner
         .alloc(Node::Leaf(OpaqueValue::String(final_res))))
+}
+
+fn prim_pathname_directory(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("PATHNAME-DIRECTORY requires exactly 1 argument");
+    }
+    let path = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("PATHNAME-DIRECTORY: invalid path".to_string()))?;
+    let dir = std::path::Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(String::new);
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(dir))))
 }
 
 fn prim_merge_pathnames(
@@ -1417,13 +1729,966 @@ fn prim_compile_file_pathname(
         .alloc(Node::Leaf(OpaqueValue::String("out.fasl".to_string()))))
 }
 
+fn prim_string(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("STRING requires exactly 1 argument");
+    }
+    let s = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING: invalid designator".to_string()))?;
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(s))))
+}
+
+fn prim_string_eq(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return Ok(proc.make_t(ctx));
+    }
+    let s1 = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING=: invalid string designator".to_string()))?;
+    let s2 = string_from_designator(proc, ctx, args[1])
+        .ok_or_else(|| ControlSignal::Error("STRING=: invalid string designator".to_string()))?;
+    Ok(if s1 == s2 { proc.make_t(ctx) } else { proc.make_nil() })
+}
+
 fn prim_string_equal(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    args: &[NodeId],
 ) -> EvalResult {
-    // Basic stub
-    Ok(proc.make_t(ctx))
+    if args.len() < 2 {
+        return Ok(proc.make_t(ctx));
+    }
+    let s1 = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING-EQUAL: invalid designator".to_string()))?;
+    let s2 = string_from_designator(proc, ctx, args[1])
+        .ok_or_else(|| ControlSignal::Error("STRING-EQUAL: invalid designator".to_string()))?;
+    Ok(if s1.eq_ignore_ascii_case(&s2) {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn prim_string_upcase(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("STRING-UPCASE requires exactly 1 argument");
+    }
+    let s = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING-UPCASE: invalid designator".to_string()))?;
+    let out: String = s.chars().flat_map(|c| c.to_uppercase()).collect();
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_string_downcase(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("STRING-DOWNCASE requires exactly 1 argument");
+    }
+    let s = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING-DOWNCASE: invalid designator".to_string()))?;
+    let out: String = s.chars().flat_map(|c| c.to_lowercase()).collect();
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_string_capitalize(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("STRING-CAPITALIZE requires exactly 1 argument");
+    }
+    let s = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING-CAPITALIZE: invalid designator".to_string()))?;
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            if at_word_start {
+                out.extend(ch.to_uppercase());
+                at_word_start = false;
+            } else {
+                out.extend(ch.to_lowercase());
+            }
+        } else {
+            at_word_start = true;
+            out.push(ch);
+        }
+    }
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_string_trim(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("STRING-TRIM requires exactly 2 arguments");
+    }
+    let bag = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("STRING-TRIM: invalid bag".to_string()))?;
+    let s = string_from_designator(proc, ctx, args[1])
+        .ok_or_else(|| ControlSignal::Error("STRING-TRIM: invalid string".to_string()))?;
+    let bag_chars: Vec<char> = bag.chars().collect();
+    let mut start = 0usize;
+    let mut end = s.chars().count();
+    let chars: Vec<char> = s.chars().collect();
+    while start < end && bag_chars.contains(&chars[start]) {
+        start += 1;
+    }
+    while end > start && bag_chars.contains(&chars[end - 1]) {
+        end -= 1;
+    }
+    let out: String = chars[start..end].iter().collect();
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_make_string(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("MAKE-STRING requires at least 1 argument");
+    }
+    let len = match extract_number(&proc.arena.inner, args[0]) {
+        NumVal::Int(n) if n >= 0 => n as usize,
+        _ => return err_helper("MAKE-STRING: length must be a non-negative integer"),
+    };
+    let mut initial = ' ';
+    let mut i = 1;
+    while i + 1 < args.len() {
+        let key = args[i];
+        let val = args[i + 1];
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key) {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            if name == "INITIAL-ELEMENT" {
+                if let Some(ch) = node_to_char(proc, ctx, val) {
+                    initial = ch;
+                }
+            }
+        }
+        i += 2;
+    }
+    let out: String = std::iter::repeat(initial).take(len).collect();
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_concatenate(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("CONCATENATE requires at least 1 argument");
+    }
+    let type_spec = args[0];
+    let type_name = match proc.arena.inner.get_unchecked(type_spec) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .unwrap_or("")
+            .to_uppercase(),
+        _ => "".to_string(),
+    };
+    if !matches!(
+        type_name.as_str(),
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING"
+    ) {
+        return err_helper("CONCATENATE: only string result supported");
+    }
+    let mut out = String::new();
+    for &arg in &args[1..] {
+        let part = string_from_sequence(proc, ctx, arg)
+            .ok_or_else(|| ControlSignal::Error("CONCATENATE: invalid sequence".to_string()))?;
+        out.push_str(&part);
+    }
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_coerce(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("COERCE requires exactly 2 arguments");
+    }
+    let obj = args[0];
+    let type_spec = args[1];
+    let type_name = match proc.arena.inner.get_unchecked(type_spec) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .unwrap_or("")
+            .to_uppercase(),
+        _ => "".to_string(),
+    };
+    match type_name.as_str() {
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
+            let s = string_from_sequence(proc, ctx, obj)
+                .ok_or_else(|| ControlSignal::Error("COERCE: invalid string source".to_string()))?;
+            Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(s))))
+        }
+        "SHORT-FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" | "LONG-FLOAT" | "FLOAT" => {
+            let num = extract_number(&proc.arena.inner, obj);
+            match num {
+                NumVal::Int(n) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(n as f64)))),
+                NumVal::Big(n) => Ok(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Float(n.to_f64().unwrap_or(0.0))))),
+                NumVal::Float(f) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(f)))),
+                _ => err_helper("COERCE: cannot convert to float"),
+            }
+        }
+        _ => err_helper("COERCE: unsupported target type"),
+    }
+}
+
+fn prim_subseq(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return err_helper("SUBSEQ requires 2 or 3 arguments");
+    }
+    let s = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("SUBSEQ: only strings supported".to_string()))?;
+    let start = match extract_number(&proc.arena.inner, args[1]) {
+        NumVal::Int(n) if n >= 0 => n as usize,
+        _ => return err_helper("SUBSEQ: start must be non-negative integer"),
+    };
+    let end = if args.len() == 3 {
+        match extract_number(&proc.arena.inner, args[2]) {
+            NumVal::Int(n) if n >= 0 => n as usize,
+            _ => return err_helper("SUBSEQ: end must be non-negative integer"),
+        }
+    } else {
+        s.chars().count()
+    };
+    let chars: Vec<char> = s.chars().collect();
+    if start > end || end > chars.len() {
+        return err_helper("SUBSEQ: invalid bounds");
+    }
+    let out: String = chars[start..end].iter().collect();
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(out))))
+}
+
+fn prim_arrayp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::VectorHandle(_)) | Node::Leaf(OpaqueValue::String(_)) => {
+                Ok(proc.make_t(ctx))
+            }
+            _ => Ok(proc.make_nil()),
+        }
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_vectorp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::String(_)) => Ok(proc.make_t(ctx)),
+            Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+                if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                    if arr.rank() == 1 {
+                        return Ok(proc.make_t(ctx));
+                    }
+                }
+                Ok(proc.make_nil())
+            }
+            _ => Ok(proc.make_nil()),
+        }
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_simple_vector_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+                if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                    if arr.is_simple_vector() {
+                        return Ok(proc.make_t(ctx));
+                    }
+                }
+                Ok(proc.make_nil())
+            }
+            _ => Ok(proc.make_nil()),
+        }
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_simple_bit_vector_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+                if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                    if arr.is_simple_bit_vector() {
+                        return Ok(proc.make_t(ctx));
+                    }
+                }
+                Ok(proc.make_nil())
+            }
+            _ => Ok(proc.make_nil()),
+        }
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_array_rank(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ARRAY-RANK requires exactly 1 argument");
+    }
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(_)) => Ok(proc.make_integer(1)),
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                Ok(proc.make_integer(arr.rank() as i64))
+            } else {
+                err_helper("ARRAY-RANK: invalid array")
+            }
+        }
+        _ => err_helper("ARRAY-RANK: not an array"),
+    }
+}
+
+fn prim_array_dimensions(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ARRAY-DIMENSIONS requires exactly 1 argument");
+    }
+    let dims: Vec<usize> = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(s)) => vec![s.chars().count()],
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                arr.dimensions.clone()
+            } else {
+                return err_helper("ARRAY-DIMENSIONS: invalid array");
+            }
+        }
+        _ => return err_helper("ARRAY-DIMENSIONS: not an array"),
+    };
+    let mut list = proc.make_nil();
+    for d in dims.into_iter().rev() {
+        let node = proc.make_integer(d as i64);
+        list = proc.arena.inner.alloc(Node::Fork(node, list));
+    }
+    Ok(list)
+}
+
+fn prim_array_total_size(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ARRAY-TOTAL-SIZE requires exactly 1 argument");
+    }
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(s)) => Ok(proc.make_integer(s.chars().count() as i64)),
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                Ok(proc.make_integer(arr.total_size() as i64))
+            } else {
+                err_helper("ARRAY-TOTAL-SIZE: invalid array")
+            }
+        }
+        _ => err_helper("ARRAY-TOTAL-SIZE: not an array"),
+    }
+}
+
+fn prim_array_has_fill_pointer_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ARRAY-HAS-FILL-POINTER-P requires exactly 1 argument");
+    }
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(_)) => Ok(proc.make_nil()),
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                if arr.fill_pointer.is_some() {
+                    Ok(proc.make_t(ctx))
+                } else {
+                    Ok(proc.make_nil())
+                }
+            } else {
+                err_helper("ARRAY-HAS-FILL-POINTER-P: invalid array")
+            }
+        }
+        _ => err_helper("ARRAY-HAS-FILL-POINTER-P: not an array"),
+    }
+}
+
+fn array_element_type_symbol_id(
+    ctx: &crate::context::GlobalContext,
+    element_type: crate::arrays::ArrayElementType,
+) -> SymbolId {
+    let name = match element_type {
+        crate::arrays::ArrayElementType::Bit => "BIT",
+        crate::arrays::ArrayElementType::Character => "CHARACTER",
+        crate::arrays::ArrayElementType::T => "T",
+    };
+    ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in(name, PackageId(1))
+}
+
+fn prim_array_element_type(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ARRAY-ELEMENT-TYPE requires exactly 1 argument");
+    }
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(_)) => {
+            let sym = array_element_type_symbol_id(ctx, crate::arrays::ArrayElementType::Character);
+            Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))))
+        }
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                let sym = array_element_type_symbol_id(ctx, arr.element_type);
+                Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))))
+            } else {
+                err_helper("ARRAY-ELEMENT-TYPE: invalid array")
+            }
+        }
+        _ => err_helper("ARRAY-ELEMENT-TYPE: not an array"),
+    }
+}
+
+fn prim_upgraded_array_element_type(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("UPGRADED-ARRAY-ELEMENT-TYPE requires exactly 1 argument");
+    }
+    let elem_type = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            match name.as_str() {
+                "BIT" => crate::arrays::ArrayElementType::Bit,
+                "CHARACTER" | "BASE-CHAR" => crate::arrays::ArrayElementType::Character,
+                _ => crate::arrays::ArrayElementType::T,
+            }
+        }
+        Node::Fork(car, _) => {
+            if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(*car) {
+                let name = ctx
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(SymbolId(*id))
+                    .unwrap_or("")
+                    .to_uppercase();
+                if name == "UNSIGNED-BYTE" || name == "SIGNED-BYTE" {
+                    crate::arrays::ArrayElementType::T
+                } else {
+                    crate::arrays::ArrayElementType::T
+                }
+            } else {
+                crate::arrays::ArrayElementType::T
+            }
+        }
+        _ => crate::arrays::ArrayElementType::T,
+    };
+    let sym = array_element_type_symbol_id(ctx, elem_type);
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))))
+}
+
+fn prim_row_major_aref(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("ROW-MAJOR-AREF requires exactly 2 arguments");
+    }
+    let index = match extract_number(&proc.arena.inner, args[1]) {
+        NumVal::Int(n) if n >= 0 => n as usize,
+        _ => return err_helper("ROW-MAJOR-AREF: index must be non-negative integer"),
+    };
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(s)) => {
+            let ch = s.chars().nth(index).ok_or_else(|| {
+                ControlSignal::Error("ROW-MAJOR-AREF: index out of bounds".to_string())
+            })?;
+            Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(ch))))
+        }
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            let vec_id = crate::arrays::VectorId(*id);
+            if let Some(val) = proc.arrays.aref(vec_id, index) {
+                Ok(val)
+            } else {
+                err_helper("ROW-MAJOR-AREF: index out of bounds")
+            }
+        }
+        _ => err_helper("ROW-MAJOR-AREF: not an array"),
+    }
+}
+
+fn prim_complex(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("COMPLEX requires 1 or 2 arguments");
+    }
+    let real = args[0];
+    let imag = if args.len() == 2 { args[1] } else { proc.make_integer(0) };
+    let is_zero = match proc.arena.inner.get_unchecked(imag) {
+        Node::Leaf(OpaqueValue::Integer(n)) => *n == 0,
+        Node::Leaf(OpaqueValue::BigInt(n)) => n == &num_bigint::BigInt::from(0),
+        Node::Leaf(OpaqueValue::Float(f)) => *f == 0.0,
+        _ => false,
+    };
+    if is_zero {
+        return Ok(real);
+    }
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Complex(real, imag))))
+}
+
+fn prim_typep(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("TYPEP requires exactly 2 arguments");
+    }
+    let obj = args[0];
+    let type_spec = args[1];
+
+    let type_name = match proc.arena.inner.get_unchecked(type_spec) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .unwrap_or("")
+            .to_uppercase(),
+        Node::Fork(car, _) => {
+            if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(*car) {
+                ctx.symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(SymbolId(*id))
+                    .unwrap_or("")
+                    .to_uppercase()
+            } else {
+                "".to_string()
+            }
+        }
+        _ => "".to_string(),
+    };
+
+    let result = match type_name.as_str() {
+        "T" => true,
+        "NIL" => false,
+        "SYMBOL" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Symbol(_)) | Node::Leaf(OpaqueValue::Nil)
+        ),
+        "INTEGER" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Integer(_)) | Node::Leaf(OpaqueValue::BigInt(_))
+        ),
+        "RATIONAL" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Integer(_))
+                | Node::Leaf(OpaqueValue::BigInt(_))
+                | Node::Leaf(OpaqueValue::Ratio(_, _))
+        ),
+        "RATIO" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Ratio(_, _))
+        ),
+        "REAL" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Integer(_))
+                | Node::Leaf(OpaqueValue::BigInt(_))
+                | Node::Leaf(OpaqueValue::Ratio(_, _))
+                | Node::Leaf(OpaqueValue::Float(_))
+        ),
+        "FLOAT" | "SHORT-FLOAT" | "SINGLE-FLOAT" | "DOUBLE-FLOAT" | "LONG-FLOAT" => {
+            matches!(proc.arena.inner.get_unchecked(obj), Node::Leaf(OpaqueValue::Float(_)))
+        }
+        "NUMBER" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Integer(_))
+                | Node::Leaf(OpaqueValue::BigInt(_))
+                | Node::Leaf(OpaqueValue::Ratio(_, _))
+                | Node::Leaf(OpaqueValue::Float(_))
+                | Node::Leaf(OpaqueValue::Complex(_, _))
+        ),
+        "COMPLEX" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Complex(_, _))
+        ),
+        "CHARACTER" | "BASE-CHAR" => {
+            matches!(proc.arena.inner.get_unchecked(obj), Node::Leaf(OpaqueValue::Char(_)))
+        }
+        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
+            matches!(proc.arena.inner.get_unchecked(obj), Node::Leaf(OpaqueValue::String(_)))
+        }
+        "ARRAY" | "SIMPLE-ARRAY" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::VectorHandle(_)) | Node::Leaf(OpaqueValue::String(_))
+        ),
+        "VECTOR" => {
+            if let Node::Leaf(OpaqueValue::String(_)) = proc.arena.inner.get_unchecked(obj) {
+                true
+            } else if let Node::Leaf(OpaqueValue::VectorHandle(id)) =
+                proc.arena.inner.get_unchecked(obj)
+            {
+                proc.arrays
+                    .get(crate::arrays::VectorId(*id))
+                    .map(|a| a.rank() == 1)
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        "SIMPLE-VECTOR" => {
+            if let Node::Leaf(OpaqueValue::VectorHandle(id)) = proc.arena.inner.get_unchecked(obj) {
+                proc.arrays
+                    .get(crate::arrays::VectorId(*id))
+                    .map(|a| a.is_simple_vector())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        "BIT-VECTOR" | "SIMPLE-BIT-VECTOR" => {
+            if let Node::Leaf(OpaqueValue::VectorHandle(id)) = proc.arena.inner.get_unchecked(obj) {
+                proc.arrays
+                    .get(crate::arrays::VectorId(*id))
+                    .map(|a| a.is_simple_bit_vector())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+        "READTABLE" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Readtable(_))
+        ),
+        other => {
+            // Structure types: vector with tag symbol in slot 0
+            if let Node::Leaf(OpaqueValue::VectorHandle(id)) = proc.arena.inner.get_unchecked(obj) {
+                if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+                    if let Some(first) = arr.elements.first() {
+                        if let Node::Leaf(OpaqueValue::Symbol(sym_id)) =
+                            proc.arena.inner.get_unchecked(*first)
+                        {
+                            if let Some(name) = ctx
+                                .symbols
+                                .read()
+                                .unwrap()
+                                .symbol_name(SymbolId(*sym_id))
+                            {
+                                return Ok(if name.eq_ignore_ascii_case(other) {
+                                    proc.make_t(ctx)
+                                } else {
+                                    proc.make_nil()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+    };
+
+    Ok(if result {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn prim_sys_make_struct(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 {
+        return err_helper("SYS-MAKE-STRUCT requires type and slot list");
+    }
+    let type_sym = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => SymbolId(*id),
+        _ => return err_helper("SYS-MAKE-STRUCT: type must be a symbol"),
+    };
+
+    let slot_nodes = list_to_vec_opt(proc, args[1])
+        .ok_or_else(|| ControlSignal::Error("SYS-MAKE-STRUCT: invalid slot list".into()))?;
+    let mut slot_names: Vec<String> = Vec::new();
+    for node in &slot_nodes {
+        match proc.arena.inner.get_unchecked(*node) {
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                let name = ctx
+                    .symbols
+                    .read()
+                    .unwrap()
+                    .symbol_name(SymbolId(*id))
+                    .unwrap_or("")
+                    .to_uppercase();
+                slot_names.push(name);
+            }
+            _ => return err_helper("SYS-MAKE-STRUCT: slot name must be a symbol"),
+        }
+    }
+
+    let mut allow_other_keys = false;
+    if (args.len() - 2) % 2 != 0 {
+        return err_helper("SYS-MAKE-STRUCT: odd number of initargs");
+    }
+    let mut i = 2;
+    while i + 1 < args.len() {
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(args[i]) {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            if name == "ALLOW-OTHER-KEYS"
+                && !matches!(
+                    proc.arena.inner.get_unchecked(args[i + 1]),
+                    Node::Leaf(OpaqueValue::Nil)
+                )
+            {
+                allow_other_keys = true;
+            }
+        }
+        i += 2;
+    }
+
+    let type_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(type_sym.0)));
+    let mut elements = vec![proc.make_nil(); slot_names.len() + 1];
+    elements[0] = type_node;
+    let mut set_flags = vec![false; slot_names.len()];
+
+    i = 2;
+    while i + 1 < args.len() {
+        let key = args[i];
+        let val = args[i + 1];
+        let key_name = if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key)
+        {
+            ctx.symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase()
+        } else {
+            String::new()
+        };
+
+        if key_name == "ALLOW-OTHER-KEYS" {
+            i += 2;
+            continue;
+        }
+
+        if let Some(pos) = slot_names.iter().position(|s| s == &key_name) {
+            if !set_flags[pos] {
+                elements[pos + 1] = val;
+                set_flags[pos] = true;
+            }
+        } else if !allow_other_keys {
+            return err_helper("SYS-MAKE-STRUCT: invalid initarg");
+        }
+
+        i += 2;
+    }
+
+    let vec_id = proc.arrays.alloc_array(
+        vec![elements.len()],
+        elements,
+        crate::arrays::ArrayElementType::T,
+        None,
+    );
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
+}
+
+fn prim_sys_struct_ref(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 3 {
+        return err_helper("SYS-STRUCT-REF requires object, index, type");
+    }
+    let obj = args[0];
+    let idx = match extract_number(&proc.arena.inner, args[1]) {
+        NumVal::Int(n) if n >= 0 => n as usize,
+        _ => return err_helper("SYS-STRUCT-REF: invalid index"),
+    };
+    let type_name = match proc.arena.inner.get_unchecked(args[2]) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .unwrap_or("")
+            .to_uppercase(),
+        _ => return err_helper("SYS-STRUCT-REF: invalid type"),
+    };
+
+    let vec_id = match proc.arena.inner.get_unchecked(obj) {
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => crate::arrays::VectorId(*id),
+        _ => return err_helper("SYS-STRUCT-REF: not a structure"),
+    };
+    let arr = proc
+        .arrays
+        .get(vec_id)
+        .ok_or_else(|| ControlSignal::Error("SYS-STRUCT-REF: invalid structure".into()))?;
+    if arr.elements.is_empty() {
+        return err_helper("SYS-STRUCT-REF: invalid structure");
+    }
+    if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(arr.elements[0]) {
+        if let Some(name) = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+        {
+            if !name.eq_ignore_ascii_case(&type_name) {
+                return err_helper("SYS-STRUCT-REF: type mismatch");
+            }
+        }
+    }
+    let slot_index = idx + 1;
+    if slot_index >= arr.elements.len() {
+        return err_helper("SYS-STRUCT-REF: slot index out of bounds");
+    }
+    Ok(arr.elements[slot_index])
+}
+
+fn prim_sys_struct_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("SYS-STRUCT-P requires object and type");
+    }
+    let type_name = match proc.arena.inner.get_unchecked(args[1]) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .unwrap_or("")
+            .to_uppercase(),
+        _ => return err_helper("SYS-STRUCT-P: invalid type"),
+    };
+    if let Node::Leaf(OpaqueValue::VectorHandle(id)) = proc.arena.inner.get_unchecked(args[0]) {
+        if let Some(arr) = proc.arrays.get(crate::arrays::VectorId(*id)) {
+            if let Some(first) = arr.elements.first() {
+                if let Node::Leaf(OpaqueValue::Symbol(sym_id)) =
+                    proc.arena.inner.get_unchecked(*first)
+                {
+                    if let Some(name) = ctx
+                        .symbols
+                        .read()
+                        .unwrap()
+                        .symbol_name(SymbolId(*sym_id))
+                    {
+                        return Ok(if name.eq_ignore_ascii_case(&type_name) {
+                            proc.make_t(ctx)
+                        } else {
+                            proc.make_nil()
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(proc.make_nil())
 }
 
 fn prim_assert(
@@ -1484,6 +2749,7 @@ fn prim_sub(
                     .alloc(Node::Leaf(OpaqueValue::Float(-(n as f64))))),
             },
             NumVal::Big(n) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::BigInt(-n)))),
+            NumVal::Ratio(n, d) => Ok(ratio_from_bigints(-n, d).to_node(&mut proc.arena.inner)),
             NumVal::Float(f) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Float(-f)))),
             NumVal::None => return err_helper("Arithmetic error: non-numeric argument"),
             // GlobalContext holds nil_sym, but nil_node is in process arena?
@@ -1536,17 +2802,8 @@ fn prim_div(
 
     if args.len() == 1 {
         // Reciprocal
-        match first {
-            NumVal::Int(n) if n != 0 => Ok(proc
-                .arena
-                .inner
-                .alloc(Node::Leaf(OpaqueValue::Float(1.0 / n as f64)))),
-            NumVal::Float(f) => Ok(proc
-                .arena
-                .inner
-                .alloc(Node::Leaf(OpaqueValue::Float(1.0 / f)))),
-            _ => Ok(make_nil(proc)),
-        }
+        let result = NumVal::Int(1).div(first);
+        Ok(result.to_node(&mut proc.arena.inner))
     } else {
         let mut result = first;
         for &arg in &args[1..] {
@@ -1763,6 +3020,20 @@ fn prim_length(
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::String(s)) => {
+                return Ok(proc.make_integer(s.chars().count() as i64))
+            }
+            Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+                if let Some(len) = proc.arrays.length(crate::arrays::VectorId(*id)) {
+                    return Ok(proc.make_integer(len as i64));
+                }
+                return Err(ControlSignal::Error(
+                    "LENGTH: argument is not a sequence".to_string(),
+                ));
+            }
+            _ => {}
+        }
         let mut len = 0;
         let mut current = arg;
         while let Node::Fork(_, cdr) = proc.arena.inner.get_unchecked(current).clone() {
@@ -1925,7 +3196,11 @@ fn prim_numberp(
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
         match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::Integer(_)) | Node::Leaf(OpaqueValue::Float(_)) => {
+            Node::Leaf(OpaqueValue::Integer(_))
+            | Node::Leaf(OpaqueValue::Float(_))
+            | Node::Leaf(OpaqueValue::BigInt(_))
+            | Node::Leaf(OpaqueValue::Ratio(_, _))
+            | Node::Leaf(OpaqueValue::Complex(_, _)) => {
                 Ok(proc.make_t(ctx))
             }
             _ => Ok(proc.make_nil()),
@@ -1933,6 +3208,309 @@ fn prim_numberp(
     } else {
         Ok(proc.make_nil())
     }
+}
+
+fn prim_characterp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::Char(_)) => Ok(proc.make_t(ctx)),
+            _ => Ok(proc.make_nil()),
+        }
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_character(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CHARACTER requires exactly 1 argument");
+    }
+    if let Some(ch) = node_to_char(proc, ctx, args[0]) {
+        return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(ch))));
+    }
+    err_helper("CHARACTER: invalid character designator")
+}
+
+fn prim_char_code(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CHAR-CODE requires exactly 1 argument");
+    }
+    match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Char(c)) => Ok(proc.make_integer(*c as i64)),
+        _ => err_helper("CHAR-CODE: argument must be a character"),
+    }
+}
+
+fn prim_code_char(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CODE-CHAR requires exactly 1 argument");
+    }
+    let n = match extract_number(&proc.arena.inner, args[0]) {
+        NumVal::Int(i) if i >= 0 => i as u32,
+        _ => return Ok(proc.make_nil()),
+    };
+    if let Some(ch) = std::char::from_u32(n) {
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(ch))))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn char_name_str(ch: char) -> Option<&'static str> {
+    match ch {
+        ' ' => Some("SPACE"),
+        '\n' => Some("NEWLINE"),
+        '\t' => Some("TAB"),
+        '\r' => Some("RETURN"),
+        '\x0c' => Some("PAGE"),
+        '\x7f' => Some("RUBOUT"),
+        '\x08' => Some("BACKSPACE"),
+        '\0' => Some("NULL"),
+        _ => None,
+    }
+}
+
+fn name_char_str(name: &str) -> Option<char> {
+    match name {
+        "SPACE" => Some(' '),
+        "NEWLINE" => Some('\n'),
+        "TAB" => Some('\t'),
+        "RETURN" => Some('\r'),
+        "LINEFEED" => Some('\n'),
+        "PAGE" => Some('\x0c'),
+        "RUBOUT" => Some('\x7f'),
+        "BACKSPACE" => Some('\x08'),
+        "NULL" => Some('\0'),
+        _ if name.chars().count() == 1 => name.chars().next(),
+        _ => None,
+    }
+}
+
+fn prim_char_name(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CHAR-NAME requires exactly 1 argument");
+    }
+    let ch = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Char(c)) => *c,
+        _ => return err_helper("CHAR-NAME: argument must be a character"),
+    };
+    if let Some(name) = char_name_str(ch) {
+        Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(name.to_string()))))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_name_char(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("NAME-CHAR requires exactly 1 argument");
+    }
+    let s = match string_from_designator(proc, ctx, args[0]) {
+        Some(s) => s,
+        None => return err_helper("NAME-CHAR: argument must be a string designator"),
+    };
+    let upper = s.to_uppercase();
+    if let Some(ch) = name_char_str(upper.as_str()) {
+        Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(ch))))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_char_upcase(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CHAR-UPCASE requires exactly 1 argument");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("CHAR-UPCASE: argument must be a character".to_string())
+    })?;
+    let up = ch.to_uppercase().next().unwrap_or(ch);
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(up))))
+}
+
+fn prim_char_downcase(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("CHAR-DOWNCASE requires exactly 1 argument");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("CHAR-DOWNCASE: argument must be a character".to_string())
+    })?;
+    let down = ch.to_lowercase().next().unwrap_or(ch);
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(down))))
+}
+
+fn prim_upper_case_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("UPPER-CASE-P requires exactly 1 argument");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("UPPER-CASE-P: argument must be a character".to_string())
+    })?;
+    Ok(if ch.is_uppercase() {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn prim_lower_case_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("LOWER-CASE-P requires exactly 1 argument");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("LOWER-CASE-P: argument must be a character".to_string())
+    })?;
+    Ok(if ch.is_lowercase() {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn prim_both_case_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("BOTH-CASE-P requires exactly 1 argument");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("BOTH-CASE-P: argument must be a character".to_string())
+    })?;
+    Ok(if ch.is_uppercase() || ch.is_lowercase() {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn prim_alphanumericp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ALPHANUMERICP requires exactly 1 argument");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("ALPHANUMERICP: argument must be a character".to_string())
+    })?;
+    Ok(if ch.is_alphanumeric() {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
+fn digit_value(ch: char) -> Option<u32> {
+    match ch {
+        '0'..='9' => Some((ch as u8 - b'0') as u32),
+        'A'..='Z' => Some((ch as u8 - b'A') as u32 + 10),
+        'a'..='z' => Some((ch as u8 - b'a') as u32 + 10),
+        _ => None,
+    }
+}
+
+fn prim_digit_char(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("DIGIT-CHAR requires 1 or 2 arguments");
+    }
+    let weight = match extract_number(&proc.arena.inner, args[0]) {
+        NumVal::Int(n) if n >= 0 => n as u32,
+        _ => return Ok(proc.make_nil()),
+    };
+    let radix = if args.len() > 1 {
+        match extract_number(&proc.arena.inner, args[1]) {
+            NumVal::Int(n) if n >= 2 && n <= 36 => n as u32,
+            _ => return Ok(proc.make_nil()),
+        }
+    } else {
+        10
+    };
+    if weight >= radix {
+        return Ok(proc.make_nil());
+    }
+    let ch = if weight < 10 {
+        (b'0' + weight as u8) as char
+    } else {
+        (b'A' + (weight - 10) as u8) as char
+    };
+    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(ch))))
+}
+
+fn prim_digit_char_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("DIGIT-CHAR-P requires 1 or 2 arguments");
+    }
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("DIGIT-CHAR-P: argument must be a character".to_string())
+    })?;
+    let radix = if args.len() > 1 {
+        match extract_number(&proc.arena.inner, args[1]) {
+            NumVal::Int(n) if n >= 2 && n <= 36 => n as u32,
+            _ => return Ok(proc.make_nil()),
+        }
+    } else {
+        10
+    };
+    if let Some(val) = digit_value(ch) {
+        if val < radix {
+            return Ok(proc.make_integer(val as i64));
+        }
+    }
+    Ok(proc.make_nil())
 }
 
 fn prim_symbolp(
@@ -2023,6 +3601,32 @@ fn prim_eq(
     Ok(proc.make_nil())
 }
 
+fn prim_functionp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("FUNCTIONP requires exactly 1 argument");
+    }
+
+    let is_func = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Closure(_))
+        | Node::Leaf(OpaqueValue::Generic(_))
+        | Node::Leaf(OpaqueValue::MethodWrapper(_, _))
+        | Node::Leaf(OpaqueValue::NextMethod(_))
+        | Node::Leaf(OpaqueValue::NextMethodP(_))
+        | Node::Leaf(OpaqueValue::CallMethod(_)) => true,
+        _ => false,
+    };
+
+    Ok(if is_func {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    })
+}
+
 fn prim_eql(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
@@ -2041,6 +3645,30 @@ fn prim_eql(
     let b = extract_number(&proc.arena.inner, args[1]);
     if a.eq(&b) {
         return Ok(proc.make_t(ctx));
+    }
+
+    // Character equality
+    if let (Node::Leaf(OpaqueValue::Char(a)), Node::Leaf(OpaqueValue::Char(b))) = (
+        proc.arena.inner.get_unchecked(args[0]),
+        proc.arena.inner.get_unchecked(args[1]),
+    ) {
+        if a == b {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+
+    // Complex equality (compare parts numerically)
+    if let (Node::Leaf(OpaqueValue::Complex(ar, ai)), Node::Leaf(OpaqueValue::Complex(br, bi))) = (
+        proc.arena.inner.get_unchecked(args[0]),
+        proc.arena.inner.get_unchecked(args[1]),
+    ) {
+        let ra = extract_number(&proc.arena.inner, *ar);
+        let rb = extract_number(&proc.arena.inner, *br);
+        let ia = extract_number(&proc.arena.inner, *ai);
+        let ib = extract_number(&proc.arena.inner, *bi);
+        if ra.eq(&rb) && ia.eq(&ib) {
+            return Ok(proc.make_t(ctx));
+        }
     }
 
     // Fallback to EQ semantics for non-numeric objects
@@ -2278,6 +3906,45 @@ fn prim_make_symbol(
     }
 }
 
+fn prim_intern(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("INTERN requires a string and optional package");
+    }
+    let name = string_from_designator(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("INTERN: name must be a string designator".into()))?;
+    let pkg_id = if args.len() == 2 {
+        match proc.arena.inner.get_unchecked(args[1]) {
+            Node::Leaf(OpaqueValue::Package(id)) => PackageId(*id),
+            Node::Leaf(OpaqueValue::String(s)) => ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_package(s)
+                .ok_or_else(|| ControlSignal::Error("INTERN: unknown package".into()))?,
+            Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_package(SymbolId(*id))
+                .unwrap_or_else(|| ctx.symbols.read().unwrap().current_package()),
+            Node::Leaf(OpaqueValue::Nil) => ctx.symbols.read().unwrap().current_package(),
+            _ => return err_helper("INTERN: invalid package designator"),
+        }
+    } else {
+        ctx.symbols.read().unwrap().current_package()
+    };
+
+    let sym_id = ctx.symbols.write().unwrap().intern_in(&name, pkg_id);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))))
+}
+
 // ============================================================================
 // I/O Primitives
 // ============================================================================
@@ -2306,6 +3973,113 @@ fn get_current_output_stream(
     }
     // Fallback to the fixed stdout (1)
     crate::streams::StreamId(1)
+}
+
+fn get_current_input_stream(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+) -> crate::streams::StreamId {
+    use crate::symbol::PackageId;
+
+    if let Some(pkg) = ctx.symbols.read().unwrap().get_package(PackageId(1)) {
+        if let Some(sym) = pkg.find_symbol("*STANDARD-INPUT*") {
+            if let Some(bind) = proc.dictionary.get(&sym) {
+                if let Some(val) = bind.value {
+                    if let Node::Leaf(OpaqueValue::StreamHandle(id)) =
+                        proc.arena.inner.get_unchecked(val)
+                    {
+                        return crate::streams::StreamId(*id);
+                    }
+                }
+            }
+        }
+    }
+    crate::streams::StreamId(0)
+}
+
+fn get_terminal_io_stream(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+) -> Option<crate::streams::StreamId> {
+    let sym = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in("*TERMINAL-IO*", PackageId(1));
+    if let Some(val) = proc.get_value(sym) {
+        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(val) {
+            return Some(crate::streams::StreamId(*id));
+        }
+    }
+    None
+}
+
+fn resolve_input_stream(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    arg: Option<NodeId>,
+) -> Result<crate::streams::StreamId, ControlSignal> {
+    let stream_id = match arg {
+        None => get_current_input_stream(proc, ctx),
+        Some(node) => match proc.arena.inner.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Nil) => get_current_input_stream(proc, ctx),
+            Node::Leaf(OpaqueValue::Symbol(id))
+                if crate::symbol::SymbolId(*id) == ctx.t_sym =>
+            {
+                get_terminal_io_stream(proc, ctx)
+                    .ok_or_else(|| ControlSignal::Error("TERMINAL-IO not bound".into()))?
+            }
+            Node::Leaf(OpaqueValue::StreamHandle(id)) => crate::streams::StreamId(*id),
+            _ => {
+                return Err(ControlSignal::Error(
+                    "Invalid input stream designator".into(),
+                ))
+            }
+        },
+    };
+
+    Ok(stream_id)
+}
+
+fn resolve_input_stream_id(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    stream_id: crate::streams::StreamId,
+) -> Result<crate::streams::StreamId, ControlSignal> {
+    use crate::streams::Stream;
+
+    let mut current = stream_id;
+    for _ in 0..8 {
+        let next = match proc.streams.get(current) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            Some(Stream::EchoStream { input, .. }) => Some(*input),
+            Some(Stream::SynonymStream { symbol_id }) => {
+                let sym = crate::symbol::SymbolId(*symbol_id);
+                if let Some(val) = proc.get_value(sym) {
+                    if let Node::Leaf(OpaqueValue::StreamHandle(id)) =
+                        proc.arena.inner.get_unchecked(val)
+                    {
+                        Some(crate::streams::StreamId(*id))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(next_id) = next {
+            current = next_id;
+        } else {
+            return Ok(current);
+        }
+    }
+
+    Err(ControlSignal::Error(
+        "Too many nested synonym/two-way streams".into(),
+    ))
 }
 
 fn prim_print(
@@ -2351,6 +4125,39 @@ fn prim_terpri(
     let out_id = get_current_output_stream(proc, ctx);
     let _ = proc.streams.write_newline(out_id);
     Ok(proc.make_nil())
+}
+
+fn prim_values(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    Ok(set_multiple_values(proc, args.to_vec()))
+}
+
+fn prim_values_list(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("VALUES-LIST requires exactly 1 argument");
+    }
+
+    let mut values = Vec::new();
+    let mut cur = args[0];
+    loop {
+        match proc.arena.inner.get_unchecked(cur) {
+            Node::Leaf(OpaqueValue::Nil) => break,
+            Node::Fork(car, cdr) => {
+                values.push(*car);
+                cur = *cdr;
+            }
+            _ => return err_helper("VALUES-LIST requires a proper list"),
+        }
+    }
+
+    Ok(set_multiple_values(proc, values))
 }
 
 /// (format destination control-string &rest args)
@@ -2562,6 +4369,9 @@ fn prim_format(
                     let arg = format_args[arg_index];
                     arg_index += 1;
                     match proc.arena.inner.get_unchecked(arg) {
+                        Node::Leaf(OpaqueValue::Char(c)) => {
+                            result.push(*c);
+                        }
                         Node::Leaf(OpaqueValue::Integer(n)) => {
                             if let Some(c) = char::from_u32(*n as u32) {
                                 result.push(c);
@@ -2766,6 +4576,478 @@ fn prim_sys_time_eval(
     Ok(result)
 }
 
+fn read_one_from_str(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    input: &str,
+    preserve_whitespace: bool,
+) -> Result<(Option<NodeId>, usize), ControlSignal> {
+    let options = build_reader_options(proc, ctx, preserve_whitespace);
+    let rt_id = current_readtable_id(proc, ctx);
+    let readtable = proc
+        .readtable_by_id(rt_id)
+        .ok_or_else(|| ControlSignal::Error("READ: missing readtable".to_string()))?
+        .clone();
+
+    let env = Environment::new();
+    let proc_ptr = proc as *mut Process;
+    let globals_ptr = ctx as *const _;
+    let mut symbols_guard = ctx.symbols.write().unwrap();
+    let mut reader = crate::reader::Reader::new_with_options(
+        input,
+        &mut proc.arena.inner,
+        &mut *symbols_guard,
+        &readtable,
+        Some(&mut proc.arrays),
+        options,
+    );
+
+    crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
+        proc_ptr,
+        globals_ptr,
+        env_ptr: &env as *const _,
+    }));
+
+    let result = if reader.eof_after_whitespace() {
+        Ok((None, reader.position()))
+    } else {
+        reader.read().map(|v| (Some(v), reader.position()))
+    };
+
+    crate::reader::set_read_eval_context(None);
+
+    result.map_err(|e| ControlSignal::Error(format!("READ: read error: {}", e)))
+}
+
+fn prim_read(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 4 {
+        return err_helper("READ accepts at most 4 arguments");
+    }
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let eof_error_p = args
+        .get(1)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    let preserve_whitespace = false;
+    let (buffer, start_pos) = match proc.streams.get(stream_id) {
+        Some(crate::streams::Stream::StringInputStream { buffer, position }) => {
+            (buffer.clone(), *position)
+        }
+        _ => {
+            return Err(ControlSignal::Error(
+                "READ currently supports only string input streams".into(),
+            ))
+        }
+    };
+    let remaining: String = buffer.chars().skip(start_pos).collect();
+    let result = read_one_from_str(proc, ctx, &remaining, preserve_whitespace)?;
+    let (value_opt, consumed) = (result.0, (start_pos, result.1));
+
+    if let Some(crate::streams::Stream::StringInputStream { position, .. }) =
+        proc.streams.get_mut(stream_id)
+    {
+        *position = consumed.0 + consumed.1;
+    }
+
+    match value_opt {
+        Some(val) => Ok(val),
+        None => {
+            if eof_error_p {
+                Err(ControlSignal::Error("READ: end of file".into()))
+            } else {
+                Ok(eof_value)
+            }
+        }
+    }
+}
+
+fn prim_read_preserving_whitespace(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 4 {
+        return err_helper("READ-PRESERVING-WHITESPACE accepts at most 4 arguments");
+    }
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let eof_error_p = args
+        .get(1)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    let preserve_whitespace = true;
+    let (buffer, start_pos) = match proc.streams.get(stream_id) {
+        Some(crate::streams::Stream::StringInputStream { buffer, position }) => {
+            (buffer.clone(), *position)
+        }
+        _ => {
+            return Err(ControlSignal::Error(
+                "READ-PRESERVING-WHITESPACE currently supports only string input streams".into(),
+            ))
+        }
+    };
+    let remaining: String = buffer.chars().skip(start_pos).collect();
+    let result = read_one_from_str(proc, ctx, &remaining, preserve_whitespace)?;
+    let (value_opt, consumed) = (result.0, (start_pos, result.1));
+
+    if let Some(crate::streams::Stream::StringInputStream { position, .. }) =
+        proc.streams.get_mut(stream_id)
+    {
+        *position = consumed.0 + consumed.1;
+    }
+
+    match value_opt {
+        Some(val) => Ok(val),
+        None => {
+            if eof_error_p {
+                Err(ControlSignal::Error(
+                    "READ-PRESERVING-WHITESPACE: end of file".into(),
+                ))
+            } else {
+                Ok(eof_value)
+            }
+        }
+    }
+}
+
+fn prim_read_from_string(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("READ-FROM-STRING requires a string argument");
+    }
+
+    let input_string = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+        _ => return err_helper("READ-FROM-STRING: first argument must be a string"),
+    };
+
+    let eof_error_p = args
+        .get(1)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    let mut start: Option<usize> = None;
+    let mut end: Option<usize> = None;
+    let mut preserve_whitespace = false;
+    let mut allow_other_keys = false;
+
+    // First pass: resolve ALLOW-OTHER-KEYS (last occurrence wins)
+    let mut i = 3;
+    while i < args.len() {
+        if i + 1 >= args.len() {
+            return err_helper("READ-FROM-STRING: odd number of keyword args");
+        }
+        let key = args[i];
+        let val = args[i + 1];
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key) {
+            let key_name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            if key_name == "ALLOW-OTHER-KEYS" {
+                if !matches!(
+                    proc.arena.inner.get_unchecked(val),
+                    Node::Leaf(OpaqueValue::Nil)
+                ) {
+                    allow_other_keys = true;
+                }
+            }
+        }
+        i += 2;
+    }
+
+    // Second pass: parse all keys
+    i = 3;
+    while i < args.len() {
+        let key = args[i];
+        let val = args[i + 1];
+        let key_name = match proc.arena.inner.get_unchecked(key) {
+            Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase(),
+            _ => {
+                return err_helper("READ-FROM-STRING: keyword must be a symbol");
+            }
+        };
+
+        match key_name.as_str() {
+            "START" => {
+                let n = extract_number(&proc.arena.inner, val);
+                if let NumVal::Int(v) = n {
+                    if v < 0 {
+                        return err_helper("READ-FROM-STRING: START must be >= 0");
+                    }
+                    start = Some(v as usize);
+                } else {
+                    return err_helper("READ-FROM-STRING: START must be an integer");
+                }
+            }
+            "END" => {
+                if matches!(
+                    proc.arena.inner.get_unchecked(val),
+                    Node::Leaf(OpaqueValue::Nil)
+                ) {
+                    end = None;
+                } else if let NumVal::Int(v) = extract_number(&proc.arena.inner, val) {
+                    if v < 0 {
+                        return err_helper("READ-FROM-STRING: END must be >= 0");
+                    }
+                    end = Some(v as usize);
+                } else {
+                    return err_helper("READ-FROM-STRING: END must be an integer");
+                }
+            }
+            "PRESERVE-WHITESPACE" => {
+                preserve_whitespace = !matches!(
+                    proc.arena.inner.get_unchecked(val),
+                    Node::Leaf(OpaqueValue::Nil)
+                );
+            }
+            "ALLOW-OTHER-KEYS" => {}
+            _ => {
+                if !allow_other_keys {
+                    return err_helper("READ-FROM-STRING: unknown keyword");
+                }
+            }
+        }
+        i += 2;
+    }
+
+    let chars: Vec<char> = input_string.chars().collect();
+    let len = chars.len();
+    let start_idx = start.unwrap_or(0);
+    let end_idx = end.unwrap_or(len);
+
+    if start_idx > end_idx || start_idx > len || end_idx > len {
+        return err_helper("READ-FROM-STRING: invalid start/end");
+    }
+
+    if start_idx == end_idx {
+        let index_node = proc.make_integer(start_idx as i64);
+        let primary = if eof_error_p {
+            return err_helper("READ-FROM-STRING: end of file");
+        } else {
+            eof_value
+        };
+        let primary = set_multiple_values(proc, vec![primary, index_node]);
+        return Ok(primary);
+    }
+
+    let slice: String = chars[start_idx..end_idx].iter().collect();
+    let (value_opt, consumed) = read_one_from_str(proc, ctx, &slice, preserve_whitespace)?;
+    let index = start_idx + consumed;
+    let index_node = proc.make_integer(index as i64);
+
+    match value_opt {
+        Some(val) => {
+            let primary = set_multiple_values(proc, vec![val, index_node]);
+            Ok(primary)
+        }
+        None => {
+            if eof_error_p {
+                err_helper("READ-FROM-STRING: end of file")
+            } else {
+                let primary = set_multiple_values(proc, vec![eof_value, index_node]);
+                Ok(primary)
+            }
+        }
+    }
+}
+
+fn prim_read_delimited_list(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("READ-DELIMITED-LIST requires a delimiter char");
+    }
+    if args.len() > 3 {
+        return err_helper("READ-DELIMITED-LIST accepts at most 3 arguments");
+    }
+
+    let delim = node_to_char(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("READ-DELIMITED-LIST: invalid delimiter".into()))?;
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(1).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let preserve_whitespace = false;
+    let (buffer, start_pos) = match proc.streams.get(stream_id) {
+        Some(crate::streams::Stream::StringInputStream { buffer, position }) => {
+            (buffer.clone(), *position)
+        }
+        _ => {
+            return Err(ControlSignal::Error(
+                "READ-DELIMITED-LIST currently supports only string input streams".into(),
+            ))
+        }
+    };
+    let remaining: String = buffer.chars().skip(start_pos).collect();
+    let options = build_reader_options(proc, ctx, preserve_whitespace);
+    let rt_id = current_readtable_id(proc, ctx);
+    let readtable = proc
+        .readtable_by_id(rt_id)
+        .ok_or_else(|| ControlSignal::Error("READ-DELIMITED-LIST: missing readtable".to_string()))?
+        .clone();
+    let env = Environment::new();
+    let proc_ptr = proc as *mut Process;
+    let globals_ptr = ctx as *const _;
+    let mut symbols_guard = ctx.symbols.write().unwrap();
+    let mut reader = crate::reader::Reader::new_with_options(
+        &remaining,
+        &mut proc.arena.inner,
+        &mut *symbols_guard,
+        &readtable,
+        Some(&mut proc.arrays),
+        options,
+    );
+    crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
+        proc_ptr,
+        globals_ptr,
+        env_ptr: &env as *const _,
+    }));
+    let result = reader.read_delimited_list(delim).map(|v| (Some(v), reader.position()));
+    crate::reader::set_read_eval_context(None);
+    let result = result.map_err(|e| {
+        ControlSignal::Error(format!("READ-DELIMITED-LIST: read error: {}", e))
+    })?;
+    let (value_opt, consumed) = (result.0, (start_pos, result.1));
+
+    if let Some(crate::streams::Stream::StringInputStream { position, .. }) =
+        proc.streams.get_mut(stream_id)
+    {
+        *position = consumed.0 + consumed.1;
+    }
+
+    Ok(value_opt.unwrap_or_else(|| proc.make_nil()))
+}
+
+fn prim_read_char(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 4 {
+        return err_helper("READ-CHAR accepts at most 4 arguments");
+    }
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let eof_error_p = args
+        .get(1)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    match proc.streams.read_char(stream_id) {
+        Ok(Some(c)) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(c)))),
+        Ok(None) => {
+            if eof_error_p {
+                Err(ControlSignal::Error("READ-CHAR: end of file".into()))
+            } else {
+                Ok(eof_value)
+            }
+        }
+        Err(e) => Err(ControlSignal::Error(format!("READ-CHAR: {}", e))),
+    }
+}
+
+fn prim_unread_char(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("UNREAD-CHAR requires 1 or 2 arguments");
+    }
+
+    let ch = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Char(c)) => *c,
+        Node::Leaf(OpaqueValue::Integer(n)) => std::char::from_u32(*n as u32)
+            .ok_or_else(|| ControlSignal::Error("UNREAD-CHAR: invalid char".into()))?,
+        _ => return err_helper("UNREAD-CHAR: invalid character"),
+    };
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(1).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    proc.streams
+        .unread_char(stream_id, ch)
+        .map_err(|e| ControlSignal::Error(format!("UNREAD-CHAR: {}", e)))?;
+
+    Ok(proc.make_nil())
+}
+
+fn prim_read_line(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 4 {
+        return err_helper("READ-LINE accepts at most 4 arguments");
+    }
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let eof_error_p = args
+        .get(1)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    match proc.streams.read_line(stream_id) {
+        Ok(Some(mut line)) => {
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+            }
+            let line_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(line)));
+            let eof_flag = proc.make_nil();
+            let primary = set_multiple_values(proc, vec![line_node, eof_flag]);
+            Ok(primary)
+        }
+        Ok(None) => {
+            if eof_error_p {
+                Err(ControlSignal::Error("READ-LINE: end of file".into()))
+            } else {
+                let eof_flag = proc.make_t(ctx);
+                let primary = set_multiple_values(proc, vec![eof_value, eof_flag]);
+                Ok(primary)
+            }
+        }
+        Err(e) => Err(ControlSignal::Error(format!("READ-LINE: {}", e))),
+    }
+}
+
 // ============================================================================
 // Stream Primitives
 // ============================================================================
@@ -2829,6 +5111,64 @@ fn prim_make_string_input_stream(
         }
     }
     err_helper("MAKE-STRING-INPUT-STREAM requires a string argument")
+}
+
+/// (make-two-way-stream input output) -> stream
+fn prim_make_two_way_stream(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    use crate::streams::Stream;
+
+    if args.len() != 2 {
+        return err_helper("MAKE-TWO-WAY-STREAM requires input and output streams");
+    }
+
+    let input_id = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::StreamHandle(id)) => crate::streams::StreamId(*id),
+        _ => return err_helper("MAKE-TWO-WAY-STREAM: input must be a stream"),
+    };
+    let output_id = match proc.arena.inner.get_unchecked(args[1]) {
+        Node::Leaf(OpaqueValue::StreamHandle(id)) => crate::streams::StreamId(*id),
+        _ => return err_helper("MAKE-TWO-WAY-STREAM: output must be a stream"),
+    };
+
+    let stream = Stream::TwoWayStream {
+        input: input_id,
+        output: output_id,
+    };
+    let id = proc.streams.alloc(stream);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))))
+}
+
+/// (make-broadcast-stream &rest streams) -> stream
+fn prim_make_broadcast_stream(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    use crate::streams::Stream;
+
+    let mut targets = Vec::new();
+    for &arg in args {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::StreamHandle(id)) => {
+                targets.push(crate::streams::StreamId(*id))
+            }
+            _ => return err_helper("MAKE-BROADCAST-STREAM: args must be streams"),
+        }
+    }
+
+    let stream = Stream::BroadcastStream { targets };
+    let id = proc.streams.alloc(stream);
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))))
 }
 
 /// (close stream) -> t
@@ -2903,6 +5243,7 @@ fn prim_write_char(
     };
 
     let c = match proc.arena.inner.get_unchecked(char_arg) {
+        Node::Leaf(OpaqueValue::Char(c)) => *c,
         Node::Leaf(OpaqueValue::Integer(n)) => char::from_u32(*n as u32).unwrap_or('?'),
         Node::Leaf(OpaqueValue::String(s)) => s.chars().next().unwrap_or('?'),
         _ => '?',
@@ -7842,30 +10183,210 @@ fn prim_make_array(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    // (make-array size [initial-element])
     if args.is_empty() {
         return Err(crate::eval::ControlSignal::Error(
-            "make-array requires at least 1 argument".to_string(),
+            "MAKE-ARRAY requires at least 1 argument".to_string(),
         ));
     }
 
-    let size_val = extract_number(&proc.arena.inner, args[0]);
-    let size = match size_val {
-        NumVal::Int(n) if n >= 0 => n as usize,
-        _ => {
-            return Err(crate::eval::ControlSignal::Error(
-                "Invalid array size".to_string(),
-            ))
+    let parse_dims = |proc: &Process, node: NodeId| -> Result<Vec<usize>, ControlSignal> {
+        match proc.arena.inner.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Nil) => Ok(Vec::new()),
+            Node::Leaf(OpaqueValue::Integer(n)) if *n >= 0 => Ok(vec![*n as usize]),
+            Node::Fork(_, _) => {
+                let items = list_to_vec_opt(proc, node)
+                    .ok_or_else(|| ControlSignal::Error("MAKE-ARRAY: invalid dimensions".into()))?;
+                let mut dims = Vec::new();
+                for item in items {
+                    match extract_number(&proc.arena.inner, item) {
+                        NumVal::Int(n) if n >= 0 => dims.push(n as usize),
+                        _ => {
+                            return Err(ControlSignal::Error(
+                                "MAKE-ARRAY: invalid dimension".to_string(),
+                            ))
+                        }
+                    }
+                }
+                Ok(dims)
+            }
+            _ => Err(ControlSignal::Error("MAKE-ARRAY: invalid dimensions".into())),
         }
     };
 
-    let initial = if args.len() > 1 {
-        args[1]
+    let dims = parse_dims(proc, args[0])?;
+
+    let mut element_type = crate::arrays::ArrayElementType::T;
+    let mut initial_element = proc.make_nil();
+    let mut initial_contents: Option<NodeId> = None;
+    let mut fill_pointer: Option<usize> = None;
+    let mut displaced_to: Option<NodeId> = None;
+    let mut displaced_offset: usize = 0;
+
+    // Backward-compatible positional initial-element
+    if args.len() == 2 {
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(args[1]) {
+            let is_kw = _ctx
+                .symbols
+                .read()
+                .unwrap()
+                .get_symbol(SymbolId(*id))
+                .map(|s| s.is_keyword())
+                .unwrap_or(false);
+            if !is_kw {
+                initial_element = args[1];
+            }
+        } else {
+            initial_element = args[1];
+        }
+    }
+
+    let mut i = 1;
+    while i + 1 < args.len() {
+        let key = args[i];
+        let val = args[i + 1];
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key) {
+            let name = _ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            match name.as_str() {
+                "ELEMENT-TYPE" => {
+                    if let Node::Leaf(OpaqueValue::Symbol(tid)) = proc.arena.inner.get_unchecked(val)
+                    {
+                        let tname = _ctx
+                            .symbols
+                            .read()
+                            .unwrap()
+                            .symbol_name(SymbolId(*tid))
+                            .unwrap_or("")
+                            .to_uppercase();
+                        element_type = match tname.as_str() {
+                            "BIT" => crate::arrays::ArrayElementType::Bit,
+                            "CHARACTER" | "BASE-CHAR" => crate::arrays::ArrayElementType::Character,
+                            _ => crate::arrays::ArrayElementType::T,
+                        };
+                    }
+                }
+                "INITIAL-ELEMENT" => {
+                    initial_element = val;
+                }
+                "INITIAL-CONTENTS" => {
+                    initial_contents = Some(val);
+                }
+                "FILL-POINTER" => {
+                    match extract_number(&proc.arena.inner, val) {
+                        NumVal::Int(n) if n >= 0 => fill_pointer = Some(n as usize),
+                        _ => {
+                            if !matches!(proc.arena.inner.get_unchecked(val), Node::Leaf(OpaqueValue::Nil))
+                            {
+                                // Non-nil => full length if rank 1
+                                if dims.len() == 1 {
+                                    fill_pointer = Some(dims[0]);
+                                }
+                            }
+                        }
+                    }
+                }
+                "DISPLACED-TO" => {
+                    displaced_to = Some(val);
+                }
+                "DISPLACED-INDEX-OFFSET" => {
+                    if let NumVal::Int(n) = extract_number(&proc.arena.inner, val) {
+                        if n >= 0 {
+                            displaced_offset = n as usize;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 2;
+    }
+
+    let total_size = if dims.is_empty() {
+        1
     } else {
-        proc.make_nil()
+        dims.iter().product::<usize>()
     };
 
-    let vec_id = proc.arrays.alloc(size, initial);
+    fn build_sequence(proc: &mut Process, node: NodeId) -> Result<Vec<NodeId>, ControlSignal> {
+        let node_val = proc.arena.inner.get_unchecked(node).clone();
+        match node_val {
+            Node::Leaf(OpaqueValue::String(s)) => Ok(s
+                .chars()
+                .map(|c| proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(c))))
+                .collect()),
+            Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+                let arr = proc
+                    .arrays
+                    .get(crate::arrays::VectorId(id))
+                    .ok_or_else(|| ControlSignal::Error("MAKE-ARRAY: invalid array".into()))?;
+                Ok(arr.elements_for_sequence())
+            }
+            Node::Fork(_, _) => Ok(list_to_vec_opt(proc, node).ok_or_else(|| {
+                ControlSignal::Error("MAKE-ARRAY: invalid initial contents".into())
+            })?),
+            _ => Err(ControlSignal::Error(
+                "MAKE-ARRAY: invalid initial contents".to_string(),
+            )),
+        }
+    }
+
+    fn fill_from_contents(
+        proc: &mut Process,
+        dims: &[usize],
+        node: NodeId,
+    ) -> Result<Vec<NodeId>, ControlSignal> {
+        if dims.is_empty() {
+            return Ok(vec![node]);
+        }
+        let seq = build_sequence(proc, node)?;
+        if dims.len() == 1 {
+            return Ok(seq);
+        }
+        if seq.len() != dims[0] {
+            return Err(ControlSignal::Error(
+                "MAKE-ARRAY: initial contents shape mismatch".to_string(),
+            ));
+        }
+        let mut out = Vec::new();
+        for item in seq {
+            out.extend(fill_from_contents(proc, &dims[1..], item)?);
+        }
+        Ok(out)
+    }
+
+    let mut elements: Vec<NodeId> = Vec::new();
+    if let Some(base) = displaced_to {
+        let base_seq = build_sequence(proc, base)?;
+        let slice = base_seq
+            .into_iter()
+            .skip(displaced_offset)
+            .take(total_size);
+        elements.extend(slice);
+    } else if let Some(contents) = initial_contents {
+        elements = fill_from_contents(proc, &dims, contents)?;
+    } else {
+        elements = vec![initial_element; total_size];
+    }
+
+    if element_type == crate::arrays::ArrayElementType::Character && dims.len() == 1 {
+        let mut s = String::new();
+        for node in &elements {
+            let ch = node_to_char(proc, _ctx, *node).ok_or_else(|| {
+                ControlSignal::Error("MAKE-ARRAY: invalid character element".into())
+            })?;
+            s.push(ch);
+        }
+        return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(s))));
+    }
+
+    let vec_id = proc
+        .arrays
+        .alloc_array(dims, elements, element_type, fill_pointer);
 
     Ok(proc
         .arena
@@ -7878,37 +10399,85 @@ fn prim_aref(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    // (aref array index)
-    if args.len() != 2 {
+    if args.is_empty() {
         return Err(crate::eval::ControlSignal::Error(
-            "aref requires 2 arguments".to_string(),
+            "AREF requires at least 1 argument".to_string(),
         ));
     }
 
-    // Check if array
-    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = proc.arena.inner.get_unchecked(args[0]) {
-        let vec_id = crate::arrays::VectorId(*idx);
+    let array = args[0];
+    let indices = &args[1..];
 
-        // Parse index
-        let idx_val = extract_number(&proc.arena.inner, args[1]);
-        if let NumVal::Int(i) = idx_val {
-            if i >= 0 {
-                if let Some(val) = proc.arrays.aref(vec_id, i as usize) {
-                    return Ok(val);
-                }
-                return Err(crate::eval::ControlSignal::Error(format!(
-                    "Array index out of bounds: {}",
-                    i
-                )));
+    match proc.arena.inner.get_unchecked(array) {
+        Node::Leaf(OpaqueValue::String(s)) => {
+            if indices.len() != 1 {
+                return Err(crate::eval::ControlSignal::Error(
+                    "AREF: string requires exactly 1 index".to_string(),
+                ));
             }
+            let idx = match extract_number(&proc.arena.inner, indices[0]) {
+                NumVal::Int(i) if i >= 0 => i as usize,
+                _ => {
+                    return Err(crate::eval::ControlSignal::Error(
+                        "AREF: invalid index".to_string(),
+                    ))
+                }
+            };
+            let ch = s.chars().nth(idx).ok_or_else(|| {
+                crate::eval::ControlSignal::Error("AREF: index out of bounds".to_string())
+            })?;
+            return Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(ch))));
         }
-        return Err(crate::eval::ControlSignal::Error(
-            "Invalid array index".to_string(),
-        ));
+        Node::Leaf(OpaqueValue::VectorHandle(idx)) => {
+            let vec_id = crate::arrays::VectorId(*idx);
+            let arr = proc.arrays.get(vec_id).ok_or_else(|| {
+                crate::eval::ControlSignal::Error("AREF: invalid array".to_string())
+            })?;
+            if indices.len() != arr.rank() {
+                return Err(crate::eval::ControlSignal::Error(
+                    "AREF: wrong number of indices".to_string(),
+                ));
+            }
+            let mut idxs = Vec::with_capacity(indices.len());
+            for &idx_node in indices {
+                let i = match extract_number(&proc.arena.inner, idx_node) {
+                    NumVal::Int(n) if n >= 0 => n as usize,
+                    _ => {
+                        return Err(crate::eval::ControlSignal::Error(
+                            "AREF: invalid index".to_string(),
+                        ))
+                    }
+                };
+                idxs.push(i);
+            }
+            let mut linear = 0usize;
+            let mut stride = 1usize;
+            for (dim, idx) in arr
+                .dimensions
+                .iter()
+                .rev()
+                .zip(idxs.iter().rev())
+            {
+                if *idx >= *dim {
+                    return Err(crate::eval::ControlSignal::Error(
+                        "AREF: index out of bounds".to_string(),
+                    ));
+                }
+                linear += idx * stride;
+                stride *= *dim;
+            }
+            if let Some(val) = proc.arrays.aref(vec_id, linear) {
+                return Ok(val);
+            }
+            return Err(crate::eval::ControlSignal::Error(
+                "AREF: index out of bounds".to_string(),
+            ));
+        }
+        _ => {}
     }
 
     Err(crate::eval::ControlSignal::Error(
-        "Not an array".to_string(),
+        "AREF: not an array".to_string(),
     ))
 }
 
@@ -7917,36 +10486,64 @@ fn prim_set_aref(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    // (set-aref array index value)
-    if args.len() != 3 {
+    if args.len() < 3 {
         return Err(crate::eval::ControlSignal::Error(
-            "set-aref requires 3 arguments".to_string(),
+            "SET-AREF requires at least 3 arguments".to_string(),
         ));
     }
 
-    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = proc.arena.inner.get_unchecked(args[0]) {
-        let vec_id = crate::arrays::VectorId(*idx);
+    let array = args[0];
+    let value = *args.last().unwrap();
+    let indices = &args[1..args.len() - 1];
 
-        let idx_val = extract_number(&proc.arena.inner, args[1]);
-        if let NumVal::Int(i) = idx_val {
-            if i >= 0 {
-                let val = args[2];
-                if proc.arrays.set_aref(vec_id, i as usize, val) {
-                    return Ok(val);
+    if let Node::Leaf(OpaqueValue::VectorHandle(idx)) = proc.arena.inner.get_unchecked(array) {
+        let vec_id = crate::arrays::VectorId(*idx);
+        let arr = proc.arrays.get(vec_id).ok_or_else(|| {
+            crate::eval::ControlSignal::Error("SET-AREF: invalid array".to_string())
+        })?;
+        if indices.len() != arr.rank() {
+            return Err(crate::eval::ControlSignal::Error(
+                "SET-AREF: wrong number of indices".to_string(),
+            ));
+        }
+        let mut idxs = Vec::with_capacity(indices.len());
+        for &idx_node in indices {
+            let i = match extract_number(&proc.arena.inner, idx_node) {
+                NumVal::Int(n) if n >= 0 => n as usize,
+                _ => {
+                    return Err(crate::eval::ControlSignal::Error(
+                        "SET-AREF: invalid index".to_string(),
+                    ))
                 }
-                return Err(crate::eval::ControlSignal::Error(format!(
-                    "Array index out of bounds: {}",
-                    i
-                )));
+            };
+            idxs.push(i);
+        }
+        let mut linear = 0usize;
+        let mut stride = 1usize;
+        for (dim, idx) in arr
+            .dimensions
+            .iter()
+            .rev()
+            .zip(idxs.iter().rev())
+        {
+            if *idx >= *dim {
+                return Err(crate::eval::ControlSignal::Error(
+                    "SET-AREF: index out of bounds".to_string(),
+                ));
             }
+            linear += idx * stride;
+            stride *= *dim;
+        }
+        if proc.arrays.set_aref(vec_id, linear, value) {
+            return Ok(value);
         }
         return Err(crate::eval::ControlSignal::Error(
-            "Invalid array index".to_string(),
+            "SET-AREF: index out of bounds".to_string(),
         ));
     }
 
     Err(crate::eval::ControlSignal::Error(
-        "Not an array".to_string(),
+        "SET-AREF: not an array".to_string(),
     ))
 }
 
@@ -7956,7 +10553,6 @@ fn prim_set_macro_character(
     args: &[NodeId],
 ) -> EvalResult {
     // (set-macro-character char function [non-terminating-p])
-    // function: currently only accepts a SYMBOL naming a built-in macro.
     if args.len() < 2 || args.len() > 4 {
         return Err(crate::eval::ControlSignal::Error(
             "SET-MACRO-CHARACTER requires 2 to 4 arguments".to_string(),
@@ -7964,38 +10560,28 @@ fn prim_set_macro_character(
     }
 
     // 1. Character
-    let char_val = extract_number(&proc.arena.inner, args[0]);
-    let ch = match char_val {
-        NumVal::Int(n) => std::char::from_u32(n as u32).ok_or(
-            crate::eval::ControlSignal::Error("Invalid character code".to_string()),
-        )?,
-        _ => {
-            return Err(crate::eval::ControlSignal::Error(
-                "Character argument must be an integer (code point)".to_string(),
-            ))
-        }
-    };
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        crate::eval::ControlSignal::Error("SET-MACRO-CHARACTER: invalid character".to_string())
+    })?;
 
-    // 2. Function (Symbol)
-    // We expect a symbol.
-    let func_name = if let Some(sym_id) = node_to_symbol(proc, args[1]) {
-        ctx.symbols
+    // 2. Function designator (symbol or function)
+    if matches!(proc.arena.inner.get_unchecked(args[1]), Node::Leaf(OpaqueValue::Nil)) {
+        return Err(crate::eval::ControlSignal::Error(
+            "SET-MACRO-CHARACTER: function designator required".to_string(),
+        ));
+    }
+    let macro_fn = if let Some(sym_id) = node_to_symbol(proc, args[1]) {
+        let func_name = ctx
+            .symbols
             .read()
             .unwrap()
             .get_symbol(sym_id)
-            .unwrap()
-            .name
-            .clone()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        get_reader_macro(&func_name)
     } else {
-        return Err(crate::eval::ControlSignal::Error(
-            "Function argument must be a symbol naming a built-in macro".to_string(),
-        ));
+        None
     };
-
-    // Look up built-in
-    let macro_fn = get_reader_macro(&func_name).ok_or_else(|| {
-        crate::eval::ControlSignal::Error(format!("Unknown built-in reader macro: {}", func_name))
-    })?;
 
     // 3. Non-terminating?
     let non_terminating = if args.len() > 2 {
@@ -8023,7 +10609,12 @@ fn prim_set_macro_character(
     };
 
     rt.set_syntax_type(ch, syntax);
-    rt.set_macro_character(ch, Some(macro_fn));
+    if let Some(f) = macro_fn {
+        rt.set_macro_character(ch, Some(f));
+    } else {
+        rt.set_macro_character(ch, None);
+    }
+    rt.set_lisp_macro(ch, Some(args[1]));
 
     Ok(proc.make_t(ctx))
 }
@@ -8166,16 +10757,8 @@ fn prim_get_macro_character(
         return err_helper("GET-MACRO-CHARACTER requires 1 or 2 arguments");
     }
 
-    let ch_code = if let Node::Leaf(OpaqueValue::Integer(n)) =
-        proc.arena.inner.get_unchecked(args[0]).clone()
-    {
-        n as u32
-    } else {
-        return err_helper("get-macro-character: char code must be an integer");
-    };
-
-    let ch = std::char::from_u32(ch_code)
-        .ok_or_else(|| ControlSignal::Error(format!("Invalid char code: {}", ch_code)))?;
+    let ch = node_to_char(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("GET-MACRO-CHARACTER: invalid character".to_string()))?;
 
     let rt_id = if args.len() > 1 {
         readtable_from_node(proc, args[1])?
@@ -8186,14 +10769,42 @@ fn prim_get_macro_character(
         .readtable_by_id(rt_id)
         .ok_or_else(|| ControlSignal::Error("GET-MACRO-CHARACTER: invalid readtable".to_string()))?;
 
-    if let Some(_func) = rt.get_macro_character(ch) {
-        // We can't return the Rust function pointer directly as a Lisp object yet
-        // For Phase 10, let's just return T if a macro is set, or NIL.
-        // In next phases, we would return a special OpaqueValue for read-macros.
-        Ok(proc.make_t(ctx))
-    } else {
-        Ok(proc.make_nil())
+    let lisp_macro = rt.get_lisp_macro(ch);
+    let has_macro = rt.get_macro_character(ch).is_some();
+    let syntax = rt.get_syntax_type(ch);
+
+    let mut func_node = lisp_macro;
+    if func_node.is_none() && has_macro {
+        let name = match ch {
+            '(' => Some("READ-LEFT-PAREN"),
+            ')' => Some("READ-RIGHT-PAREN"),
+            '\'' => Some("READ-QUOTE"),
+            '"' => Some("READ-STRING"),
+            ';' => Some("READ-COMMENT"),
+            '`' => Some("READ-BACKQUOTE"),
+            ',' => Some("READ-COMMA"),
+            '#' => Some("READ-DISPATCH"),
+            _ => None,
+        };
+        if let Some(n) = name {
+            let sym_id = ctx.symbols.write().unwrap().intern_in(n, PackageId(2));
+            func_node = Some(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))));
+        }
     }
+
+    let non_term = if func_node.is_some() {
+        matches!(syntax, crate::readtable::SyntaxType::NonTerminatingMacro)
+    } else {
+        false
+    };
+    let func_node = func_node.unwrap_or_else(|| proc.make_nil());
+    let non_term_node = if non_term {
+        proc.make_t(ctx)
+    } else {
+        proc.make_nil()
+    };
+    let primary = set_multiple_values(proc, vec![func_node, non_term_node]);
+    Ok(primary)
 }
 
 fn prim_set_syntax_from_char(
@@ -8205,26 +10816,10 @@ fn prim_set_syntax_from_char(
         return err_helper("SET-SYNTAX-FROM-CHAR requires 2 to 4 arguments");
     }
 
-    let to_code = if let Node::Leaf(OpaqueValue::Integer(n)) =
-        proc.arena.inner.get_unchecked(args[0]).clone()
-    {
-        n as u32
-    } else {
-        return err_helper("set-syntax-from-char: to-char code must be an integer");
-    };
-
-    let from_code = if let Node::Leaf(OpaqueValue::Integer(n)) =
-        proc.arena.inner.get_unchecked(args[1]).clone()
-    {
-        n as u32
-    } else {
-        return err_helper("set-syntax-from-char: from-char code must be an integer");
-    };
-
-    let to_ch = std::char::from_u32(to_code)
-        .ok_or_else(|| ControlSignal::Error(format!("Invalid to-char code: {}", to_code)))?;
-    let from_ch = std::char::from_u32(from_code)
-        .ok_or_else(|| ControlSignal::Error(format!("Invalid from-char code: {}", from_code)))?;
+    let to_ch = node_to_char(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("SET-SYNTAX-FROM-CHAR: invalid to-char".into()))?;
+    let from_ch = node_to_char(proc, ctx, args[1])
+        .ok_or_else(|| ControlSignal::Error("SET-SYNTAX-FROM-CHAR: invalid from-char".into()))?;
 
     let to_rt_id = if args.len() > 2 {
         readtable_from_node(proc, args[2])?
@@ -8242,6 +10837,8 @@ fn prim_set_syntax_from_char(
         .ok_or_else(|| ControlSignal::Error("SET-SYNTAX-FROM-CHAR: invalid from readtable".to_string()))?;
     let syntax = from_rt.get_syntax_type(from_ch);
     let macro_fn = from_rt.get_macro_character(from_ch);
+    let lisp_macro = from_rt.get_lisp_macro(from_ch);
+    let dispatch_table = from_rt.get_dispatch_table(from_ch).cloned();
 
     let to_rt = proc
         .readtable_by_id_mut(to_rt_id)
@@ -8252,8 +10849,130 @@ fn prim_set_syntax_from_char(
     } else {
         to_rt.set_macro_character(to_ch, None);
     }
+    to_rt.set_lisp_macro(to_ch, lisp_macro);
+    to_rt.set_dispatch_table(to_ch, dispatch_table);
 
     Ok(proc.make_t(ctx))
+}
+
+fn prim_make_dispatch_macro_character(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 3 {
+        return err_helper("MAKE-DISPATCH-MACRO-CHARACTER requires 1 to 3 arguments");
+    }
+
+    let ch = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("MAKE-DISPATCH-MACRO-CHARACTER: invalid character".to_string())
+    })?;
+
+    let non_terminating = if args.len() > 1 {
+        args[1] != proc.make_nil()
+    } else {
+        false
+    };
+
+    let rt_id = if args.len() > 2 {
+        readtable_from_node(proc, args[2])?
+    } else {
+        current_readtable_id(proc, ctx)
+    };
+    let rt = proc
+        .readtable_by_id_mut(rt_id)
+        .ok_or_else(|| ControlSignal::Error("MAKE-DISPATCH-MACRO-CHARACTER: invalid readtable".to_string()))?;
+
+    use crate::readtable::SyntaxType;
+    let syntax = if non_terminating {
+        SyntaxType::NonTerminatingMacro
+    } else {
+        SyntaxType::TerminatingMacro
+    };
+    rt.set_syntax_type(ch, syntax);
+    rt.make_dispatch_macro_character(ch);
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_set_dispatch_macro_character(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 3 || args.len() > 4 {
+        return err_helper("SET-DISPATCH-MACRO-CHARACTER requires 3 or 4 arguments");
+    }
+
+    let disp = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("SET-DISPATCH-MACRO-CHARACTER: invalid dispatch char".to_string())
+    })?;
+    let sub = node_to_char(proc, ctx, args[1]).ok_or_else(|| {
+        ControlSignal::Error("SET-DISPATCH-MACRO-CHARACTER: invalid sub char".to_string())
+    })?;
+
+    let func = if matches!(proc.arena.inner.get_unchecked(args[2]), Node::Leaf(OpaqueValue::Nil))
+    {
+        None
+    } else {
+        Some(args[2])
+    };
+    let rt_id = if args.len() > 3 {
+        readtable_from_node(proc, args[3])?
+    } else {
+        current_readtable_id(proc, ctx)
+    };
+    let rt = proc
+        .readtable_by_id_mut(rt_id)
+        .ok_or_else(|| {
+            ControlSignal::Error("SET-DISPATCH-MACRO-CHARACTER: invalid readtable".to_string())
+        })?;
+    if !rt.is_dispatch_macro_character(disp) {
+        return Err(ControlSignal::Error(
+            "SET-DISPATCH-MACRO-CHARACTER: not a dispatch macro character".into(),
+        ));
+    }
+    rt.set_dispatch_macro_character(disp, sub, func);
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_get_dispatch_macro_character(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return err_helper("GET-DISPATCH-MACRO-CHARACTER requires 2 or 3 arguments");
+    }
+
+    let disp = node_to_char(proc, ctx, args[0]).ok_or_else(|| {
+        ControlSignal::Error("GET-DISPATCH-MACRO-CHARACTER: invalid dispatch char".to_string())
+    })?;
+    let sub = node_to_char(proc, ctx, args[1]).ok_or_else(|| {
+        ControlSignal::Error("GET-DISPATCH-MACRO-CHARACTER: invalid sub char".to_string())
+    })?;
+
+    let rt_id = if args.len() > 2 {
+        readtable_from_node(proc, args[2])?
+    } else {
+        current_readtable_id(proc, ctx)
+    };
+    let rt = proc
+        .readtable_by_id(rt_id)
+        .ok_or_else(|| ControlSignal::Error("GET-DISPATCH-MACRO-CHARACTER: invalid readtable".to_string()))?;
+
+    if !rt.is_dispatch_macro_character(disp) {
+        return Err(ControlSignal::Error(
+            "GET-DISPATCH-MACRO-CHARACTER: not a dispatch macro character".into(),
+        ));
+    }
+
+    if let Some(func) = rt.get_dispatch_macro_character(disp, sub) {
+        Ok(func)
+    } else {
+        Ok(proc.make_nil())
+    }
 }
 
 fn get_reader_macro(name: &str) -> Option<crate::readtable::ReaderMacroFn> {
@@ -8324,8 +11043,54 @@ fn wrap_read_right_bracket(
 enum NumVal {
     Int(i64),
     Big(BigInt),
+    Ratio(BigInt, BigInt),
     Float(f64),
     None,
+}
+
+fn normalize_ratio(mut num: BigInt, mut den: BigInt) -> Option<(BigInt, BigInt)> {
+    if den == BigInt::from(0) {
+        return None;
+    }
+    if den.is_negative() {
+        num = -num;
+        den = -den;
+    }
+    let mut a = num.abs();
+    let mut b = den.abs();
+    while b != BigInt::from(0) {
+        let r = &a % &b;
+        a = b;
+        b = r;
+    }
+    if a != BigInt::from(0) {
+        num /= &a;
+        den /= &a;
+    }
+    Some((num, den))
+}
+
+fn ratio_from_bigints(num: BigInt, den: BigInt) -> NumVal {
+    match normalize_ratio(num, den) {
+        None => NumVal::None,
+        Some((n, d)) => {
+            if d == BigInt::from(1) {
+                if let Some(v) = n.to_i64() {
+                    NumVal::Int(v)
+                } else {
+                    NumVal::Big(n)
+                }
+            } else {
+                NumVal::Ratio(n, d)
+            }
+        }
+    }
+}
+
+fn ratio_to_f64(num: &BigInt, den: &BigInt) -> Option<f64> {
+    let n = num.to_f64()?;
+    let d = den.to_f64()?;
+    Some(n / d)
 }
 
 impl NumVal {
@@ -8338,6 +11103,27 @@ impl NumVal {
             (NumVal::Big(a), NumVal::Big(b)) => NumVal::Big(a + b),
             (NumVal::Int(a), NumVal::Big(b)) => NumVal::Big(BigInt::from(a) + b),
             (NumVal::Big(a), NumVal::Int(b)) => NumVal::Big(a + BigInt::from(b)),
+            (NumVal::Ratio(a, b), NumVal::Ratio(c, d)) => {
+                ratio_from_bigints(a * d.clone() + c * b.clone(), b * d)
+            }
+            (NumVal::Ratio(a, b), NumVal::Int(n)) => {
+                ratio_from_bigints(a + BigInt::from(n) * b.clone(), b)
+            }
+            (NumVal::Int(n), NumVal::Ratio(a, b)) => {
+                ratio_from_bigints(BigInt::from(n) * b.clone() + a, b)
+            }
+            (NumVal::Ratio(a, b), NumVal::Big(c)) => {
+                ratio_from_bigints(a + c * b.clone(), b)
+            }
+            (NumVal::Big(c), NumVal::Ratio(a, b)) => {
+                ratio_from_bigints(c * b.clone() + a, b)
+            }
+            (NumVal::Ratio(a, b), NumVal::Float(f)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(v + f))
+                .unwrap_or(NumVal::None),
+            (NumVal::Float(f), NumVal::Ratio(a, b)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(f + v))
+                .unwrap_or(NumVal::None),
 
             (NumVal::Float(a), NumVal::Float(b)) => NumVal::Float(a + b),
             (NumVal::Int(a), NumVal::Float(b)) => NumVal::Float(a as f64 + b),
@@ -8361,6 +11147,27 @@ impl NumVal {
             (NumVal::Big(a), NumVal::Big(b)) => NumVal::Big(a - b),
             (NumVal::Int(a), NumVal::Big(b)) => NumVal::Big(BigInt::from(a) - b),
             (NumVal::Big(a), NumVal::Int(b)) => NumVal::Big(a - BigInt::from(b)),
+            (NumVal::Ratio(a, b), NumVal::Ratio(c, d)) => {
+                ratio_from_bigints(a * d.clone() - c * b.clone(), b * d)
+            }
+            (NumVal::Ratio(a, b), NumVal::Int(n)) => {
+                ratio_from_bigints(a - BigInt::from(n) * b.clone(), b)
+            }
+            (NumVal::Int(n), NumVal::Ratio(a, b)) => {
+                ratio_from_bigints(BigInt::from(n) * b.clone() - a, b)
+            }
+            (NumVal::Ratio(a, b), NumVal::Big(c)) => {
+                ratio_from_bigints(a - c * b.clone(), b)
+            }
+            (NumVal::Big(c), NumVal::Ratio(a, b)) => {
+                ratio_from_bigints(c * b.clone() - a, b)
+            }
+            (NumVal::Ratio(a, b), NumVal::Float(f)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(v - f))
+                .unwrap_or(NumVal::None),
+            (NumVal::Float(f), NumVal::Ratio(a, b)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(f - v))
+                .unwrap_or(NumVal::None),
 
             (NumVal::Float(a), NumVal::Float(b)) => NumVal::Float(a - b),
             (NumVal::Int(a), NumVal::Float(b)) => NumVal::Float(a as f64 - b),
@@ -8384,6 +11191,23 @@ impl NumVal {
             (NumVal::Big(a), NumVal::Big(b)) => NumVal::Big(a * b),
             (NumVal::Int(a), NumVal::Big(b)) => NumVal::Big(BigInt::from(a) * b),
             (NumVal::Big(a), NumVal::Int(b)) => NumVal::Big(a * BigInt::from(b)),
+            (NumVal::Ratio(a, b), NumVal::Ratio(c, d)) => {
+                ratio_from_bigints(a * c, b * d)
+            }
+            (NumVal::Ratio(a, b), NumVal::Int(n)) => {
+                ratio_from_bigints(a * BigInt::from(n), b)
+            }
+            (NumVal::Int(n), NumVal::Ratio(a, b)) => {
+                ratio_from_bigints(BigInt::from(n) * a, b)
+            }
+            (NumVal::Ratio(a, b), NumVal::Big(c)) => ratio_from_bigints(a * c, b),
+            (NumVal::Big(c), NumVal::Ratio(a, b)) => ratio_from_bigints(c * a, b),
+            (NumVal::Ratio(a, b), NumVal::Float(f)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(v * f))
+                .unwrap_or(NumVal::None),
+            (NumVal::Float(f), NumVal::Ratio(a, b)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(f * v))
+                .unwrap_or(NumVal::None),
 
             (NumVal::Float(a), NumVal::Float(b)) => NumVal::Float(a * b),
             (NumVal::Int(a), NumVal::Float(b)) => NumVal::Float(a as f64 * b),
@@ -8400,13 +11224,37 @@ impl NumVal {
 
     fn div(self, other: NumVal) -> NumVal {
         match (self, other) {
-            (NumVal::Int(a), NumVal::Int(b)) if b != 0 => {
-                // Use float division to match CL semantics
-                NumVal::Float(a as f64 / b as f64)
+            (NumVal::Int(a), NumVal::Int(b)) => {
+                ratio_from_bigints(BigInt::from(a), BigInt::from(b))
             }
-            (NumVal::Big(a), NumVal::Big(b)) if b != BigInt::from(0) => NumVal::Float(
-                a.to_f64().unwrap_or(f64::INFINITY) / b.to_f64().unwrap_or(f64::INFINITY),
-            ),
+            (NumVal::Big(a), NumVal::Big(b)) => ratio_from_bigints(a, b),
+            (NumVal::Big(a), NumVal::Int(b)) => ratio_from_bigints(a, BigInt::from(b)),
+            (NumVal::Int(a), NumVal::Big(b)) => ratio_from_bigints(BigInt::from(a), b),
+            (NumVal::Ratio(a, b), NumVal::Ratio(c, d)) => {
+                ratio_from_bigints(a * d, b * c)
+            }
+            (NumVal::Ratio(a, b), NumVal::Int(n)) => {
+                ratio_from_bigints(a, b * BigInt::from(n))
+            }
+            (NumVal::Int(n), NumVal::Ratio(a, b)) => {
+                ratio_from_bigints(BigInt::from(n) * b, a)
+            }
+            (NumVal::Ratio(a, b), NumVal::Big(c)) => ratio_from_bigints(a, b * c),
+            (NumVal::Big(c), NumVal::Ratio(a, b)) => ratio_from_bigints(c * b, a),
+            (NumVal::Ratio(a, b), NumVal::Float(f)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(v / f))
+                .unwrap_or(NumVal::None),
+            (NumVal::Float(f), NumVal::Ratio(a, b)) => ratio_to_f64(&a, &b)
+                .map(|v| NumVal::Float(f / v))
+                .unwrap_or(NumVal::None),
+            (NumVal::Int(a), NumVal::Float(b)) => NumVal::Float(a as f64 / b),
+            (NumVal::Big(a), NumVal::Float(b)) => {
+                NumVal::Float(a.to_f64().unwrap_or(f64::INFINITY) / b)
+            }
+            (NumVal::Float(a), NumVal::Int(b)) => NumVal::Float(a / b as f64),
+            (NumVal::Float(a), NumVal::Big(b)) => {
+                NumVal::Float(a / b.to_f64().unwrap_or(f64::INFINITY))
+            }
             (NumVal::Float(a), NumVal::Float(b)) => NumVal::Float(a / b),
             _ => NumVal::None,
         }
@@ -8420,6 +11268,17 @@ impl PartialEq for NumVal {
             (NumVal::Big(a), NumVal::Big(b)) => a == b,
             (NumVal::Int(a), NumVal::Big(b)) => &BigInt::from(*a) == b,
             (NumVal::Big(a), NumVal::Int(b)) => a == &BigInt::from(*b),
+            (NumVal::Ratio(a, b), NumVal::Ratio(c, d)) => a * d == c * b,
+            (NumVal::Ratio(a, b), NumVal::Int(n)) => a == &(BigInt::from(*n) * b),
+            (NumVal::Int(n), NumVal::Ratio(a, b)) => BigInt::from(*n) * b == *a,
+            (NumVal::Ratio(a, b), NumVal::Big(c)) => a == &(c * b),
+            (NumVal::Big(c), NumVal::Ratio(a, b)) => c * b == *a,
+            (NumVal::Ratio(a, b), NumVal::Float(f)) => ratio_to_f64(a, b)
+                .map(|v| v == *f)
+                .unwrap_or(false),
+            (NumVal::Float(f), NumVal::Ratio(a, b)) => ratio_to_f64(a, b)
+                .map(|v| *f == v)
+                .unwrap_or(false),
             (NumVal::Float(a), NumVal::Float(b)) => a == b,
             (NumVal::Int(a), NumVal::Float(b)) => (*a as f64) == *b,
             (NumVal::Float(a), NumVal::Int(b)) => *a == (*b as f64),
@@ -8437,6 +11296,19 @@ impl PartialOrd for NumVal {
             (NumVal::Big(a), NumVal::Big(b)) => a.partial_cmp(b),
             (NumVal::Int(a), NumVal::Big(b)) => BigInt::from(*a).partial_cmp(b),
             (NumVal::Big(a), NumVal::Int(b)) => a.partial_cmp(&BigInt::from(*b)),
+            (NumVal::Ratio(a, b), NumVal::Ratio(c, d)) => Some((a * d).cmp(&(c * b))),
+            (NumVal::Ratio(a, b), NumVal::Int(n)) => {
+                Some(a.cmp(&(BigInt::from(*n) * b)))
+            }
+            (NumVal::Int(n), NumVal::Ratio(a, b)) => {
+                Some((BigInt::from(*n) * b).cmp(a))
+            }
+            (NumVal::Ratio(a, b), NumVal::Big(c)) => Some(a.cmp(&(c * b))),
+            (NumVal::Big(c), NumVal::Ratio(a, b)) => Some((c * b).cmp(a)),
+            (NumVal::Ratio(a, b), NumVal::Float(f)) => ratio_to_f64(a, b)
+                .and_then(|v| v.partial_cmp(f)),
+            (NumVal::Float(f), NumVal::Ratio(a, b)) => ratio_to_f64(a, b)
+                .and_then(|v| f.partial_cmp(&v)),
             (NumVal::Float(a), NumVal::Float(b)) => a.partial_cmp(b),
             (NumVal::Int(a), NumVal::Float(b)) => (*a as f64).partial_cmp(b),
             (NumVal::Float(a), NumVal::Int(b)) => a.partial_cmp(&(*b as f64)),
@@ -8456,6 +11328,7 @@ impl NumVal {
         match self {
             NumVal::Int(n) => arena.alloc(Node::Leaf(OpaqueValue::Integer(n))),
             NumVal::Big(n) => arena.alloc(Node::Leaf(OpaqueValue::BigInt(n))),
+            NumVal::Ratio(n, d) => arena.alloc(Node::Leaf(OpaqueValue::Ratio(n, d))),
             NumVal::Float(f) => arena.alloc(Node::Leaf(OpaqueValue::Float(f))),
             NumVal::None => arena.alloc(Node::Leaf(OpaqueValue::Nil)),
         }
@@ -8466,6 +11339,7 @@ fn extract_number(arena: &Arena, node: NodeId) -> NumVal {
     match arena.get_unchecked(node) {
         Node::Leaf(OpaqueValue::Integer(n)) => NumVal::Int(*n),
         Node::Leaf(OpaqueValue::BigInt(n)) => NumVal::Big(n.clone()),
+        Node::Leaf(OpaqueValue::Ratio(n, d)) => NumVal::Ratio(n.clone(), d.clone()),
         Node::Leaf(OpaqueValue::Float(f)) => NumVal::Float(*f),
         _ => NumVal::None,
     }
@@ -9106,8 +11980,9 @@ mod tests {
         let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(4)));
         let result = prim_div(&mut proc, &globals, &[a, b]).unwrap();
         match proc.arena.inner.get_unchecked(result) {
-            Node::Leaf(OpaqueValue::Float(f)) if (*f - 5.0).abs() < 0.001 => {}
-            _ => panic!("Expected 5.0"),
+            Node::Leaf(OpaqueValue::Integer(5)) => {}
+            Node::Leaf(OpaqueValue::BigInt(n)) if n == &num_bigint::BigInt::from(5) => {}
+            _ => panic!("Expected integer 5"),
         }
     }
 
@@ -9127,8 +12002,10 @@ mod tests {
         let b = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(19)));
         let result = prim_div(&mut proc, &globals, &[a, b]).unwrap();
         match proc.arena.inner.get_unchecked(result) {
-            Node::Leaf(OpaqueValue::Float(f)) if (*f - 0.2631578947368421).abs() < 0.0001 => {}
-            other => panic!("Expected ~0.263, got {:?}", other),
+            Node::Leaf(OpaqueValue::Ratio(n, d))
+                if n == &num_bigint::BigInt::from(5)
+                    && d == &num_bigint::BigInt::from(19) => {}
+            other => panic!("Expected 5/19, got {:?}", other),
         }
     }
 

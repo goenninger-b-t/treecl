@@ -552,9 +552,9 @@ impl Process {
                         // Trace complex leaves
                         match val {
                             OpaqueValue::VectorHandle(id) => {
-                                // Trace vector content
-                                if let Some(vec) = self.arrays.get(crate::arrays::VectorId(*id)) {
-                                    for &child in vec {
+                                // Trace array content
+                                if let Some(arr) = self.arrays.get(crate::arrays::VectorId(*id)) {
+                                    for &child in &arr.elements {
                                         stack.push(child);
                                     }
                                 }

@@ -5,12 +5,49 @@
 use crate::arena::{Arena, Node};
 use crate::arrays::ArrayStore;
 use crate::readtable::{Readtable, ReadtableCase, SyntaxType};
-use crate::symbol::{SymbolId, SymbolTable};
+use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
+use num_traits::{Signed, ToPrimitive};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::iter::Peekable;
-use std::str::Chars;
+
+struct ReaderInput {
+    chars: Vec<char>,
+    index: usize,
+}
+
+impl ReaderInput {
+    fn new(input: &str) -> Self {
+        Self {
+            chars: input.chars().collect(),
+            index: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.index).copied()
+    }
+
+    fn next(&mut self) -> Option<char> {
+        if self.index < self.chars.len() {
+            let c = self.chars[self.index];
+            self.index += 1;
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    fn unread(&mut self) {
+        if self.index > 0 {
+            self.index -= 1;
+        }
+    }
+
+    fn position(&self) -> usize {
+        self.index
+    }
+}
 
 /// Reader error types
 #[derive(Debug, Clone)]
@@ -20,6 +57,7 @@ pub enum ReaderError {
     UnbalancedParen,
     InvalidNumber(String),
     InvalidChar(String),
+    Unsuppressible(String),
 }
 
 impl std::fmt::Display for ReaderError {
@@ -30,6 +68,7 @@ impl std::fmt::Display for ReaderError {
             Self::UnbalancedParen => write!(f, "Unbalanced parentheses"),
             Self::InvalidNumber(s) => write!(f, "Invalid number: {}", s),
             Self::InvalidChar(s) => write!(f, "Invalid character: {}", s),
+            Self::Unsuppressible(s) => write!(f, "Reader error: {}", s),
         }
     }
 }
@@ -81,7 +120,7 @@ pub fn set_read_eval_context(ctx: Option<ReadEvalContext>) {
 
 /// The TreeCL Reader
 pub struct Reader<'a> {
-    input: Peekable<Chars<'a>>,
+    input: ReaderInput,
     arena: &'a mut Arena,
     symbols: &'a mut SymbolTable,
     readtable: &'a Readtable,
@@ -92,7 +131,7 @@ pub struct Reader<'a> {
     read_suppress: bool,
     preserve_whitespace: bool,
     features: Vec<String>,
-    label_map: HashMap<u32, NodeId>,
+    label_map: HashMap<u64, NodeId>,
 }
 
 impl<'a> Reader<'a> {
@@ -125,7 +164,7 @@ impl<'a> Reader<'a> {
         let nil_node = arena.alloc(Node::Leaf(OpaqueValue::Nil));
 
         Self {
-            input: input.chars().peekable(),
+            input: ReaderInput::new(input),
             arena,
             symbols,
             readtable,
@@ -144,13 +183,17 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn position(&self) -> usize {
+        self.input.position()
+    }
+
     /// Read a single expression
     pub fn read(&mut self) -> ReaderResult {
         self.skip_whitespace();
 
         match self.input.peek() {
             None => Err(ReaderError::UnexpectedEof),
-            Some(&c) => {
+            Some(c) => {
                 let syntax = self.readtable.get_syntax_type(c);
                 let result = match syntax {
                     SyntaxType::TerminatingMacro | SyntaxType::NonTerminatingMacro => {
@@ -176,6 +219,16 @@ impl<'a> Reader<'a> {
                         // For Phase 10, let's keep hardcoded dispatch for standard macros,
                         // but use the SyntaxType to Decide.
 
+                        if let Some(func) = self.readtable.get_macro_character(ch) {
+                            return func(self, ch);
+                        }
+                        if let Some(func) = self.readtable.get_lisp_macro(ch) {
+                            return self.read_lisp_macro(func, ch);
+                        }
+                        if ch != '#' && self.readtable.is_dispatch_macro_character(ch) {
+                            return self.read_dispatch_table(ch);
+                        }
+
                         match ch {
                             '(' => self.read_list(),
                             ')' => Err(ReaderError::UnexpectedChar(')')),
@@ -188,17 +241,10 @@ impl<'a> Reader<'a> {
                                 self.read()
                             }
                             '#' => self.read_dispatch(),
-                            _ => {
-                                // Look up user macro
-                                if let Some(func) = self.readtable.get_macro_character(ch) {
-                                    func(self, ch)
-                                } else {
-                                    Err(ReaderError::InvalidChar(format!(
-                                        "Macro not implemented: {}",
-                                        ch
-                                    )))
-                                }
-                            }
+                            _ => Err(ReaderError::InvalidChar(format!(
+                                "Macro not implemented: {}",
+                                ch
+                            ))),
                         }
                     }
                     SyntaxType::Whitespace => {
@@ -208,14 +254,23 @@ impl<'a> Reader<'a> {
                     _ => self.read_atom(), // Constituent, Escape
                 };
 
-                let mut out = result?;
+                let mut out = match result {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if self.read_suppress {
+                            let unsuppressible = matches!(e, ReaderError::Unsuppressible(_))
+                                || matches!(e, ReaderError::UnexpectedChar(')'));
+                            if !unsuppressible {
+                                while self.input.next().is_some() {}
+                                return Ok(self.nil_node);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
 
                 if self.read_suppress {
                     out = self.nil_node;
-                }
-
-                if !self.preserve_whitespace {
-                    self.skip_whitespace();
                 }
 
                 Ok(out)
@@ -223,9 +278,35 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn eof_after_whitespace(&mut self) -> bool {
+        self.skip_whitespace();
+        self.input.peek().is_none()
+    }
+
+    pub fn read_delimited_list(&mut self, delim: char) -> ReaderResult {
+        let mut elements = Vec::new();
+        loop {
+            self.skip_whitespace();
+            match self.input.peek() {
+                None => return Err(ReaderError::UnexpectedEof),
+                Some(c) if c == delim => {
+                    self.input.next();
+                    break;
+                }
+                _ => elements.push(self.read()?),
+            }
+        }
+
+        let mut result = self.nil_node;
+        for elem in elements.into_iter().rev() {
+            result = self.arena.alloc(Node::Fork(elem, result));
+        }
+        Ok(result)
+    }
+
     /// Skip whitespace and comments
     fn skip_whitespace(&mut self) {
-        while let Some(&c) = self.input.peek() {
+        while let Some(c) = self.input.peek() {
             if self.readtable.is_whitespace(c) {
                 self.input.next();
             } else {
@@ -235,7 +316,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Skip line comment (;...)
-    fn skip_line_comment(&mut self) {
+    pub(crate) fn skip_line_comment(&mut self) {
         while let Some(c) = self.input.next() {
             if c == '\n' {
                 break;
@@ -249,13 +330,13 @@ impl<'a> Reader<'a> {
         while let Some(c) = self.input.next() {
             match c {
                 '#' => {
-                    if self.input.peek() == Some(&'|') {
+                    if self.input.peek() == Some('|') {
                         self.input.next();
                         depth += 1;
                     }
                 }
                 '|' => {
-                    if self.input.peek() == Some(&'#') {
+                    if self.input.peek() == Some('#') {
                         self.input.next();
                         if depth == 0 {
                             break;
@@ -296,10 +377,10 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a list: (a b c)
-    fn read_list(&mut self) -> ReaderResult {
+    pub(crate) fn read_list(&mut self) -> ReaderResult {
         self.skip_whitespace();
 
-        if let Some(&')') = self.input.peek() {
+        if self.input.peek() == Some(')') {
             self.input.next();
             return Ok(self.nil_node);
         }
@@ -312,20 +393,20 @@ impl<'a> Reader<'a> {
 
             match self.input.peek() {
                 None => return Err(ReaderError::UnbalancedParen),
-                Some(&')') => {
+                Some(')') => {
                     self.input.next();
                     break;
                 }
-                Some(&'.') => {
+                Some('.') => {
                     // Check for dotted pair
                     self.input.next();
-                    if let Some(&c) = self.input.peek() {
+                    if let Some(c) = self.input.peek() {
                         if c.is_whitespace() || c == ')' {
                             // Dotted pair
                             self.skip_whitespace();
                             dotted_cdr = Some(self.read()?);
                             self.skip_whitespace();
-                            if self.input.peek() != Some(&')') {
+                            if self.input.peek() != Some(')') {
                                 return Err(ReaderError::UnexpectedChar('.'));
                             }
                             self.input.next();
@@ -353,22 +434,22 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a quoted expression: 'x -> (quote x)
-    fn read_quote(&mut self) -> ReaderResult {
+    pub(crate) fn read_quote(&mut self) -> ReaderResult {
         let expr = self.read()?;
         let quote_sym = self.make_symbol("QUOTE");
         Ok(self.list(&[quote_sym, expr]))
     }
 
     /// Read a quasiquoted expression: `x -> (quasiquote x)
-    fn read_quasiquote(&mut self) -> ReaderResult {
+    pub(crate) fn read_quasiquote(&mut self) -> ReaderResult {
         let expr = self.read()?;
         let qq_sym = self.make_symbol("QUASIQUOTE");
         Ok(self.list(&[qq_sym, expr]))
     }
 
     /// Read an unquoted expression: ,x or ,@x
-    fn read_unquote(&mut self) -> ReaderResult {
-        let splice = self.input.peek() == Some(&'@');
+    pub(crate) fn read_unquote(&mut self) -> ReaderResult {
+        let splice = self.input.peek() == Some('@');
         if splice {
             self.input.next();
         }
@@ -383,7 +464,7 @@ impl<'a> Reader<'a> {
     }
 
     /// Read a string: "hello"
-    fn read_string(&mut self) -> ReaderResult {
+    pub(crate) fn read_string(&mut self) -> ReaderResult {
         let mut s = String::new();
 
         loop {
@@ -411,22 +492,22 @@ impl<'a> Reader<'a> {
     }
 
     /// Read dispatch macro: #...
-    fn read_dispatch(&mut self) -> ReaderResult {
+    pub(crate) fn read_dispatch(&mut self) -> ReaderResult {
         match self.input.peek() {
             None => Err(ReaderError::UnexpectedEof),
-            Some(&'\'') => {
+            Some('\'') => {
                 // #'fn -> (function fn)
                 self.input.next();
                 let name = self.read()?;
                 let func_sym = self.make_symbol("FUNCTION");
                 Ok(self.list(&[func_sym, name]))
             }
-            Some(&'\\') => {
+            Some('\\') => {
                 // #\char
                 self.input.next();
                 self.read_character()
             }
-            Some(&'.') => {
+            Some('.') => {
                 // #. read-time eval
                 self.input.next();
                 if self.read_suppress {
@@ -441,37 +522,37 @@ impl<'a> Reader<'a> {
                 let form = self.read()?;
                 self.read_eval_form(form)
             }
-            Some(&'|') => {
+            Some('|') => {
                 // #| ... |# block comment (possibly nested)
                 self.input.next();
                 self.skip_block_comment()?;
                 self.read()
             }
-            Some(&'(') => {
+            Some('(') => {
                 // #(...) -> vector
                 self.read_vector()
             }
-            Some(&':') => {
+            Some(':') => {
                 // #:uninterned-symbol
                 self.input.next();
                 self.read_uninterned_symbol()
             }
-            Some(&'x') | Some(&'X') => {
+            Some('x') | Some('X') => {
                 // #x... Hex
                 self.input.next();
                 self.read_radix(16)
             }
-            Some(&'o') | Some(&'O') => {
+            Some('o') | Some('O') => {
                 // #o... Octal
                 self.input.next();
                 self.read_radix(8)
             }
-            Some(&'b') | Some(&'B') => {
+            Some('b') | Some('B') => {
                 // #b... Binary
                 self.input.next();
                 self.read_radix(2)
             }
-            Some(&'p') | Some(&'P') => {
+            Some('p') | Some('P') => {
                 // #P"..." Pathname
                 self.input.next();
                 // Expect string
@@ -481,11 +562,33 @@ impl<'a> Reader<'a> {
                 // If we return the string, (truename "foo") usually works.
                 Ok(form)
             }
-            Some(&c) if c.is_ascii_digit() => {
+            Some('*') => {
+                // #* bit-vector
+                self.input.next();
+                self.read_bit_vector(None)
+            }
+            Some('a') | Some('A') => {
+                // #A requires a numeric prefix
+                self.input.next();
+                Err(ReaderError::InvalidChar(
+                    "Missing rank for #A".to_string(),
+                ))
+            }
+            Some('c') | Some('C') => {
+                // #C complex
+                self.input.next();
+                self.read_complex()
+            }
+            Some('s') | Some('S') => {
+                // #S structure
+                self.input.next();
+                self.read_structure()
+            }
+            Some(c) if c.is_ascii_digit() => {
                 // #nA, #nR, etc.
                 self.read_number_dispatch()
             }
-            Some(&'+') => {
+            Some('+') => {
                 // #+ feature-expr form
                 self.input.next();
                 if self.read_feature_check()? {
@@ -496,7 +599,7 @@ impl<'a> Reader<'a> {
                     self.read()
                 }
             }
-            Some(&'-') => {
+            Some('-') => {
                 // #- feature-expr form
                 self.input.next();
                 if !self.read_feature_check()? {
@@ -507,7 +610,443 @@ impl<'a> Reader<'a> {
                     self.read()
                 }
             }
-            Some(&c) => Err(ReaderError::UnexpectedChar(c)),
+            Some(c) => {
+                if self.read_suppress && (c.is_whitespace() || c == ')' || c == '<') {
+                    Err(ReaderError::Unsuppressible(format!(
+                        "Invalid dispatch macro: #{}",
+                        c
+                    )))
+                } else {
+                    let sub = self.input.next().unwrap();
+                    if let Some(func) = self.readtable.get_dispatch_macro_character('#', sub) {
+                        return self.read_lisp_dispatch_macro(func, sub, None);
+                    }
+                    Err(ReaderError::UnexpectedChar(sub))
+                }
+            }
+        }
+    }
+
+    fn read_dispatch_table(&mut self, disp: char) -> ReaderResult {
+        let mut num_str = String::new();
+        while let Some(c) = self.input.peek() {
+            if c.is_ascii_digit() {
+                num_str.push(c);
+                self.input.next();
+            } else {
+                break;
+            }
+        }
+        let num_arg = if num_str.is_empty() {
+            None
+        } else {
+            let n: i64 = num_str
+                .parse()
+                .map_err(|_| ReaderError::InvalidNumber(num_str.clone()))?;
+            Some(n)
+        };
+
+        let sub = self.input.next().ok_or(ReaderError::UnexpectedEof)?;
+        if let Some(func) = self.readtable.get_dispatch_macro_character(disp, sub) {
+            self.read_lisp_dispatch_macro(func, sub, num_arg)
+        } else {
+            Err(ReaderError::UnexpectedChar(sub))
+        }
+    }
+
+    fn read_lisp_macro(&mut self, func: NodeId, ch: char) -> ReaderResult {
+        let char_node = self
+            .arena
+            .alloc(Node::Leaf(OpaqueValue::Char(ch)));
+        let args_list = self.list(&[self.nil_node, char_node]);
+
+        let result = READ_EVAL_CONTEXT.with(|cell| {
+            cell.borrow().as_ref().map(|ctx| unsafe {
+                let proc = &mut *ctx.proc_ptr;
+                let globals = &*ctx.globals_ptr;
+                let env = &*ctx.env_ptr;
+                let mut interp = crate::eval::Interpreter::new(proc, globals);
+                interp.apply_values(func, args_list, env)
+            })
+        });
+
+        match result {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(ReaderError::InvalidChar(format!(
+                "Reader macro error: {:?}",
+                e
+            ))),
+            None => Err(ReaderError::InvalidChar(
+                "Reader macro context not available".to_string(),
+            )),
+        }
+    }
+
+    fn read_lisp_dispatch_macro(
+        &mut self,
+        func: NodeId,
+        ch: char,
+        num_arg: Option<i64>,
+    ) -> ReaderResult {
+        let char_node = self
+            .arena
+            .alloc(Node::Leaf(OpaqueValue::Char(ch)));
+        let num_node = if let Some(n) = num_arg {
+            self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n)))
+        } else {
+            self.nil_node
+        };
+        let args_list = self.list(&[self.nil_node, char_node, num_node]);
+
+        let result = READ_EVAL_CONTEXT.with(|cell| {
+            cell.borrow().as_ref().map(|ctx| unsafe {
+                let proc = &mut *ctx.proc_ptr;
+                let globals = &*ctx.globals_ptr;
+                let env = &*ctx.env_ptr;
+                let mut interp = crate::eval::Interpreter::new(proc, globals);
+                interp.apply_values(func, args_list, env)
+            })
+        });
+
+        match result {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(ReaderError::InvalidChar(format!(
+                "Reader macro error: {:?}",
+                e
+            ))),
+            None => Err(ReaderError::InvalidChar(
+                "Reader macro context not available".to_string(),
+            )),
+        }
+    }
+
+    fn apply_read_function(&mut self, func: NodeId, args: &[NodeId]) -> ReaderResult {
+        let args_list = self.list(args);
+        let result = READ_EVAL_CONTEXT.with(|cell| {
+            cell.borrow().as_ref().map(|ctx| unsafe {
+                let proc = &mut *ctx.proc_ptr;
+                let globals = &*ctx.globals_ptr;
+                let env = &*ctx.env_ptr;
+                let mut interp = crate::eval::Interpreter::new(proc, globals);
+                interp.apply_values(func, args_list, env)
+            })
+        });
+
+        match result {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(ReaderError::InvalidChar(format!(
+                "Reader macro error: {:?}",
+                e
+            ))),
+            None => Err(ReaderError::InvalidChar(
+                "Reader macro context not available".to_string(),
+            )),
+        }
+    }
+
+    fn read_bit_vector(&mut self, len_opt: Option<usize>) -> ReaderResult {
+        let mut bits: Vec<char> = Vec::new();
+        while let Some(c) = self.input.peek() {
+            if c == '0' || c == '1' {
+                self.input.next();
+                bits.push(c);
+            } else {
+                break;
+            }
+        }
+
+        if let Some(len) = len_opt {
+            if len == 0 {
+                if !bits.is_empty() {
+                    return Err(ReaderError::InvalidChar(
+                        "Too many bits for #0*".to_string(),
+                    ));
+                }
+            } else {
+                if bits.is_empty() {
+                    return Err(ReaderError::InvalidChar(
+                        "Bit vector literal requires at least one bit".to_string(),
+                    ));
+                }
+                if bits.len() > len {
+                    return Err(ReaderError::InvalidChar(
+                        "Too many bits for bit-vector length".to_string(),
+                    ));
+                }
+                if bits.len() < len {
+                    let fill = *bits.last().unwrap();
+                    while bits.len() < len {
+                        bits.push(fill);
+                    }
+                }
+            }
+        }
+
+        if let Some(store) = self.arrays.as_mut() {
+            let mut nodes = Vec::with_capacity(bits.len());
+            for b in bits {
+                let val = if b == '1' { 1 } else { 0 };
+                nodes.push(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(val))));
+            }
+            let dims = vec![nodes.len()];
+            let vec_id = store.alloc_array(dims, nodes, crate::arrays::ArrayElementType::Bit, None);
+            Ok(self
+                .arena
+                .alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
+        } else {
+            Err(ReaderError::InvalidChar(
+                "Bit-vectors not supported without ArrayStore".to_string(),
+            ))
+        }
+    }
+
+    fn read_array(&mut self, rank: usize) -> ReaderResult {
+        if self.arrays.is_none() {
+            return Err(ReaderError::InvalidChar(
+                "Arrays not supported without ArrayStore".to_string(),
+            ));
+        }
+        let contents = self.read()?;
+        self.array_from_contents(rank, contents)
+    }
+
+    fn array_from_contents(&mut self, rank: usize, contents: NodeId) -> ReaderResult {
+        let (dims, elements) = self.collect_array_elements(rank, contents)?;
+        let store = self.arrays.as_mut().ok_or_else(|| {
+            ReaderError::InvalidChar("Arrays not supported without ArrayStore".to_string())
+        })?;
+        let vec_id = store.alloc_array(dims, elements, crate::arrays::ArrayElementType::T, None);
+        Ok(self
+            .arena
+            .alloc(Node::Leaf(OpaqueValue::VectorHandle(vec_id.0))))
+    }
+
+    fn collect_array_elements(
+        &mut self,
+        rank: usize,
+        contents: NodeId,
+    ) -> Result<(Vec<usize>, Vec<NodeId>), ReaderError> {
+        if rank == 0 {
+            return Ok((Vec::new(), vec![contents]));
+        }
+
+        let elements = self.sequence_to_vec(contents)?;
+        if rank == 1 {
+            return Ok((vec![elements.len()], elements));
+        }
+
+        if elements.is_empty() {
+            return Ok((vec![0; rank], Vec::new()));
+        }
+
+        let outer_len = elements.len();
+        let mut all_elements = Vec::new();
+        let mut sub_dims: Option<Vec<usize>> = None;
+        for elem in elements {
+            let (dims, sub) = self.collect_array_elements(rank - 1, elem)?;
+            if let Some(existing) = &sub_dims {
+                if *existing != dims {
+                    return Err(ReaderError::InvalidChar(
+                        "Non-rectangular #A contents".to_string(),
+                    ));
+                }
+            } else {
+                sub_dims = Some(dims);
+            }
+            all_elements.extend(sub);
+        }
+        let mut dims = Vec::with_capacity(rank);
+        dims.push(outer_len);
+        dims.extend(sub_dims.unwrap_or_default());
+        Ok((dims, all_elements))
+    }
+
+    fn sequence_to_vec(&mut self, node: NodeId) -> Result<Vec<NodeId>, ReaderError> {
+        match self.arena.get_unchecked(node).clone() {
+            Node::Leaf(OpaqueValue::Nil) => Ok(Vec::new()),
+            Node::Fork(_, _) => {
+                let mut out = Vec::new();
+                let mut current = node;
+                loop {
+                    match self.arena.get_unchecked(current).clone() {
+                        Node::Fork(h, t) => {
+                            out.push(h);
+                            current = t;
+                        }
+                        Node::Leaf(OpaqueValue::Nil) => break,
+                        _ => {
+                            return Err(ReaderError::InvalidChar(
+                                "Improper list in #A initial contents".to_string(),
+                            ))
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+                let store = self.arrays.as_ref().ok_or_else(|| {
+                    ReaderError::InvalidChar("Arrays not supported without ArrayStore".to_string())
+                })?;
+                let arr = store
+                    .get(crate::arrays::VectorId(id))
+                    .ok_or_else(|| {
+                        ReaderError::InvalidChar("Invalid vector handle".to_string())
+                    })?;
+                Ok(arr.elements_for_sequence())
+            }
+            Node::Leaf(OpaqueValue::String(s)) => {
+                let mut out = Vec::new();
+                for ch in s.chars() {
+                    out.push(self.arena.alloc(Node::Leaf(OpaqueValue::Char(ch))));
+                }
+                Ok(out)
+            }
+            _ => Err(ReaderError::InvalidChar(
+                "Invalid initial contents for #A".to_string(),
+            )),
+        }
+    }
+
+    fn read_complex(&mut self) -> ReaderResult {
+        let form = self.read()?;
+        let (real, imag) = self.expect_pair(form)?;
+        if self.is_zero_number(imag) {
+            return Ok(real);
+        }
+
+        let sym_id = self.symbols.intern_in("COMPLEX", PackageId(1));
+        let func = self
+            .arena
+            .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0)));
+        self.apply_read_function(func, &[real, imag])
+    }
+
+    fn read_structure(&mut self) -> ReaderResult {
+        let form = self.read()?;
+        let (name, rest) = self.expect_list_head(form)?;
+        let struct_sym = self.symbol_from_designator(name)?;
+        let struct_name = self
+            .symbols
+            .symbol_name(struct_sym)
+            .ok_or_else(|| ReaderError::InvalidChar("Invalid structure name".to_string()))?
+            .to_string();
+        let pkg_id = self
+            .symbols
+            .symbol_package(struct_sym)
+            .unwrap_or_else(|| self.symbols.current_package());
+
+        let mut args = Vec::new();
+        if !matches!(self.arena.get_unchecked(rest), Node::Leaf(OpaqueValue::Nil)) {
+            let elems = self.sequence_to_vec(rest)?;
+            if elems.len() % 2 != 0 {
+                return Err(ReaderError::InvalidChar(
+                    "Odd number of slot/value pairs in #S".to_string(),
+                ));
+            }
+            for chunk in elems.chunks(2) {
+                let key = chunk[0];
+                let val = chunk[1];
+                let kw = self.keyword_from_designator(key)?;
+                args.push(kw);
+                args.push(val);
+            }
+        }
+
+        let ctor_name = format!("MAKE-{}", struct_name);
+        let ctor_sym = self.symbols.intern_in(&ctor_name, pkg_id);
+        let ctor_node = self
+            .arena
+            .alloc(Node::Leaf(OpaqueValue::Symbol(ctor_sym.0)));
+        self.apply_read_function(ctor_node, &args)
+    }
+
+    fn expect_pair(&mut self, node: NodeId) -> Result<(NodeId, NodeId), ReaderError> {
+        match self.arena.get_unchecked(node).clone() {
+            Node::Fork(a, rest) => match self.arena.get_unchecked(rest).clone() {
+                Node::Fork(b, tail) => match self.arena.get_unchecked(tail).clone() {
+                    Node::Leaf(OpaqueValue::Nil) => Ok((a, b)),
+                    _ => Err(ReaderError::InvalidChar(
+                        "Complex literal must have exactly two elements".to_string(),
+                    )),
+                },
+                _ => Err(ReaderError::InvalidChar(
+                    "Complex literal must be a list".to_string(),
+                )),
+            },
+            _ => Err(ReaderError::InvalidChar(
+                "Complex literal must be a list".to_string(),
+            )),
+        }
+    }
+
+    fn expect_list_head(&mut self, node: NodeId) -> Result<(NodeId, NodeId), ReaderError> {
+        match self.arena.get_unchecked(node).clone() {
+            Node::Fork(head, tail) => Ok((head, tail)),
+            _ => Err(ReaderError::InvalidChar(
+                "Structure literal must be a list".to_string(),
+            )),
+        }
+    }
+
+    fn symbol_from_designator(&mut self, node: NodeId) -> Result<SymbolId, ReaderError> {
+        match self.arena.get_unchecked(node).clone() {
+            Node::Leaf(OpaqueValue::Symbol(id)) => Ok(SymbolId(id)),
+            Node::Leaf(OpaqueValue::String(s)) => Ok(self.symbols.intern(&s)),
+            Node::Leaf(OpaqueValue::Char(ch)) => Ok(self.symbols.intern(&ch.to_string())),
+            Node::Leaf(OpaqueValue::Integer(n)) => {
+                let ch = std::char::from_u32(n as u32).ok_or_else(|| {
+                    ReaderError::InvalidChar("Invalid character designator".to_string())
+                })?;
+                Ok(self.symbols.intern(&ch.to_string()))
+            }
+            _ => Err(ReaderError::InvalidChar(
+                "Invalid structure name".to_string(),
+            )),
+        }
+    }
+
+    fn keyword_from_designator(&mut self, node: NodeId) -> Result<NodeId, ReaderError> {
+        let sym_id = match self.arena.get_unchecked(node).clone() {
+            Node::Leaf(OpaqueValue::Symbol(id)) => {
+                let (is_keyword, name) = {
+                    let sym = self
+                        .symbols
+                        .get_symbol(SymbolId(id))
+                        .ok_or_else(|| ReaderError::InvalidChar("Invalid symbol".to_string()))?;
+                    (sym.is_keyword(), sym.name.clone())
+                };
+                if is_keyword {
+                    SymbolId(id)
+                } else {
+                    self.symbols.intern_keyword(&name)
+                }
+            }
+            Node::Leaf(OpaqueValue::String(s)) => self.symbols.intern_keyword(&s),
+            Node::Leaf(OpaqueValue::Char(ch)) => self.symbols.intern_keyword(&ch.to_string()),
+            Node::Leaf(OpaqueValue::Integer(n)) => {
+                let ch = std::char::from_u32(n as u32).ok_or_else(|| {
+                    ReaderError::InvalidChar("Invalid character designator".to_string())
+                })?;
+                self.symbols.intern_keyword(&ch.to_string())
+            }
+            _ => {
+                return Err(ReaderError::InvalidChar(
+                    "Invalid slot name designator".to_string(),
+                ))
+            }
+        };
+        Ok(self
+            .arena
+            .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))))
+    }
+
+    fn is_zero_number(&self, node: NodeId) -> bool {
+        match self.arena.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Integer(n)) => *n == 0,
+            Node::Leaf(OpaqueValue::BigInt(n)) => n == &num_bigint::BigInt::from(0),
+            Node::Leaf(OpaqueValue::Ratio(n, _d)) => n == &num_bigint::BigInt::from(0),
+            Node::Leaf(OpaqueValue::Float(f)) => *f == 0.0,
+            _ => false,
         }
     }
 
@@ -515,19 +1054,24 @@ impl<'a> Reader<'a> {
     fn read_radix(&mut self, radix: u32) -> ReaderResult {
         // Read token
         let s = self.read_symbol_name()?;
-        // We can reuse read_symbol_name which reads until delimiter
-        // Then parse with radix
-
-        if let Ok(n) = i64::from_str_radix(&s, radix) {
-            Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n))))
-        } else if let Some(bn) = num_bigint::BigInt::parse_bytes(s.as_bytes(), radix) {
-            Ok(self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(bn))))
-        } else {
-            Err(ReaderError::InvalidNumber(format!(
-                "Invalid radix {} number: {}",
-                radix, s
-            )))
+        if let Some((num_str, denom_str)) = Self::split_ratio(&s) {
+            return match self.parse_ratio(num_str, denom_str, radix)? {
+                Some(node) => Ok(node),
+                None => Err(ReaderError::InvalidNumber(format!(
+                    "Invalid radix {} number: {}",
+                    radix, s
+                ))),
+            };
         }
+
+        if let Some(node) = self.parse_integer_node(&s, radix) {
+            return Ok(node);
+        }
+
+        Err(ReaderError::InvalidNumber(format!(
+            "Invalid radix {} number: {}",
+            radix, s
+        )))
     }
 
     /// Read and evaluate a feature expression
@@ -610,7 +1154,7 @@ impl<'a> Reader<'a> {
 
     /// Read a character literal: #\x or #\space
     fn read_character(&mut self) -> ReaderResult {
-        let name = self.read_token_with_case(ReadtableCase::Preserve)?;
+        let (name, _) = self.read_token_with_case(ReadtableCase::Preserve)?;
         let ch = if name.is_empty() {
             // Fallback: single character after #\
             if let Some(c) = self.input.next() {
@@ -634,10 +1178,7 @@ impl<'a> Reader<'a> {
             }
         };
 
-        // Store character as integer (code point)
-        Ok(self
-            .arena
-            .alloc(Node::Leaf(OpaqueValue::Integer(ch as i64))))
+        Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Char(ch))))
     }
 
     /// Read a vector literal: #(1 2 3)
@@ -650,7 +1191,7 @@ impl<'a> Reader<'a> {
             self.skip_whitespace();
             match self.input.peek() {
                 None => return Err(ReaderError::UnbalancedParen),
-                Some(&')') => {
+                Some(')') => {
                     self.input.next();
                     break;
                 }
@@ -697,7 +1238,7 @@ impl<'a> Reader<'a> {
             self.skip_whitespace();
             match self.input.peek() {
                 None => return Err(ReaderError::UnexpectedEof),
-                Some(&']') => {
+                Some(']') => {
                     self.input.next();
                     break;
                 }
@@ -734,30 +1275,111 @@ impl<'a> Reader<'a> {
 
     /// Read number-prefixed dispatch
     fn read_number_dispatch(&mut self) -> ReaderResult {
-        // Skip for now
-        Err(ReaderError::UnexpectedChar('#'))
+        let mut num_str = String::new();
+        while let Some(c) = self.input.peek() {
+            if c.is_ascii_digit() {
+                num_str.push(c);
+                self.input.next();
+            } else {
+                break;
+            }
+        }
+
+        let n: u64 = num_str
+            .parse()
+            .map_err(|_| ReaderError::InvalidNumber(num_str.clone()))?;
+
+        let dispatch = self.input.next().ok_or(ReaderError::UnexpectedEof)?;
+        match dispatch {
+            '=' => {
+                let placeholder = self.arena.alloc(Node::Leaf(OpaqueValue::Unbound));
+                self.label_map.insert(n, placeholder);
+                let obj = self.read()?;
+                if obj != placeholder {
+                    let node = self.arena.get_unchecked(obj).clone();
+                    self.arena.overwrite(placeholder, node);
+                }
+                Ok(placeholder)
+            }
+            '#' => {
+                if let Some(&node) = self.label_map.get(&n) {
+                    Ok(node)
+                } else {
+                    Err(ReaderError::InvalidChar(format!(
+                        "Undefined label: #{}#",
+                        n
+                    )))
+                }
+            }
+            'R' | 'r' => {
+                if n < 2 || n > 36 {
+                    return Err(ReaderError::InvalidNumber(format!(
+                        "Invalid radix: {}",
+                        n
+                    )));
+                }
+                let token = self.read_symbol_name()?;
+                if let Some((num_str, denom_str)) = Self::split_ratio(&token) {
+                    return match self.parse_ratio(num_str, denom_str, n as u32)? {
+                        Some(node) => Ok(node),
+                        None => Err(ReaderError::InvalidNumber(token)),
+                    };
+                }
+                if let Some(node) = self.parse_integer_node(&token, n as u32) {
+                    return Ok(node);
+                }
+                Err(ReaderError::InvalidNumber(token))
+            }
+            '*' => {
+                let len = usize::try_from(n).map_err(|_| {
+                    ReaderError::InvalidNumber(format!("Invalid length: {}", n))
+                })?;
+                self.read_bit_vector(Some(len))
+            }
+            'A' | 'a' => {
+                let rank = usize::try_from(n).map_err(|_| {
+                    ReaderError::InvalidNumber(format!("Invalid rank: {}", n))
+                })?;
+                self.read_array(rank)
+            }
+            _ => {
+                if let Some(func) = self.readtable.get_dispatch_macro_character('#', dispatch) {
+                    let num_arg = i64::try_from(n).map_err(|_| {
+                        ReaderError::InvalidNumber(format!("Invalid numeric argument: {}", n))
+                    })?;
+                    self.read_lisp_dispatch_macro(func, dispatch, Some(num_arg))
+                } else {
+                    Err(ReaderError::UnexpectedChar(dispatch))
+                }
+            }
+        }
     }
 
     /// Read an atom (number or symbol)
     fn read_atom(&mut self) -> ReaderResult {
-        let s = self.read_symbol_name()?;
-        self.parse_atom(&s)
+        let (s, escaped) = self.read_symbol_name_with_escapes()?;
+        self.parse_atom(&s, escaped)
     }
 
     /// Read atom with a prefix character
     fn read_atom_with_prefix(&mut self, prefix: char) -> ReaderResult {
         let mut s = String::new();
         s.push(prefix);
-        s.push_str(&self.read_symbol_name()?);
-        self.parse_atom(&s)
+        let (rest, escaped) = self.read_symbol_name_with_escapes()?;
+        s.push_str(&rest);
+        self.parse_atom(&s, escaped)
     }
 
     /// Read a symbol name (until delimiter)
-    fn read_token_with_case(&mut self, case_mode: ReadtableCase) -> Result<String, ReaderError> {
+    fn read_token_with_case(
+        &mut self,
+        case_mode: ReadtableCase,
+    ) -> Result<(String, bool), ReaderError> {
         let mut chars: Vec<(char, bool)> = Vec::new();
         let mut in_multi_escape = false;
+        let mut saw_escape = false;
 
-        while let Some(&c) = self.input.peek() {
+        while let Some(c) = self.input.peek() {
             if in_multi_escape {
                 match c {
                     '|' => {
@@ -784,8 +1406,15 @@ impl<'a> Reader<'a> {
 
             let syntax = self.readtable.get_syntax_type(c);
             match syntax {
-                SyntaxType::Whitespace | SyntaxType::TerminatingMacro => break,
+                SyntaxType::Whitespace => {
+                    if !self.preserve_whitespace {
+                        self.input.next();
+                    }
+                    break;
+                }
+                SyntaxType::TerminatingMacro => break,
                 SyntaxType::SingleEscape => {
+                    saw_escape = true;
                     self.input.next();
                     if let Some(escaped) = self.input.next() {
                         chars.push((escaped, true));
@@ -794,6 +1423,7 @@ impl<'a> Reader<'a> {
                     }
                 }
                 SyntaxType::MultiEscape => {
+                    saw_escape = true;
                     self.input.next();
                     in_multi_escape = true;
                 }
@@ -859,68 +1489,289 @@ impl<'a> Reader<'a> {
             }
         }
 
-        Ok(out)
+        let escaped = saw_escape;
+        Ok((out, escaped))
     }
 
     fn read_symbol_name(&mut self) -> Result<String, ReaderError> {
+        let case_mode = self.readtable.readtable_case();
+        Ok(self.read_token_with_case(case_mode)?.0)
+    }
+
+    fn read_symbol_name_with_escapes(&mut self) -> Result<(String, bool), ReaderError> {
         let case_mode = self.readtable.readtable_case();
         self.read_token_with_case(case_mode)
     }
 
     /// Parse an atom string as number or symbol
-    fn parse_atom(&mut self, s: &str) -> ReaderResult {
-        // Check for NIL
-        if s == "NIL" {
-            return Ok(self.nil_node);
-        }
-
-        // Try integer (respect read-base)
-        if self.read_base == 10 {
-            if let Ok(n) = s.parse::<i64>() {
-                return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n))));
+    fn parse_atom(&mut self, s: &str, escaped: bool) -> ReaderResult {
+        if !escaped {
+            if s == "NIL" {
+                return Ok(self.nil_node);
             }
-        } else if let Ok(n) = i64::from_str_radix(s, self.read_base) {
-            return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Integer(n))));
-        }
 
-        // Try big integer
-        if self.read_base == 10 {
-            if let Ok(bn) = s.parse::<num_bigint::BigInt>() {
-                return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(bn))));
+            if s.chars().all(|c| c == '.') {
+                return Err(ReaderError::InvalidChar("Invalid dot token".to_string()));
             }
-        } else if let Some(bn) = num_bigint::BigInt::parse_bytes(s.as_bytes(), self.read_base) {
-            return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(bn))));
-        }
 
-        // Try float
-        if let Ok(f) = s.parse::<f64>() {
-            return Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Float(f))));
-        }
+            if let Some(num) = self.parse_number(s)? {
+                return Ok(num);
+            }
 
-        // Check for keyword
-        if s.starts_with(':') {
-            let key_name = &s[1..];
-            let sym_id = self.symbols.intern_keyword(key_name);
-            return self.symbol_to_node(sym_id);
-        }
-
-        // Check for package-qualified symbol
-        if let Some(pos) = s.find(':') {
-            let (pkg_name, sym_name) = if s[pos..].starts_with("::") {
-                (&s[..pos], &s[pos + 2..])
-            } else {
-                (&s[..pos], &s[pos + 1..])
-            };
-
-            if let Some(pkg_id) = self.symbols.find_package(pkg_name) {
-                let sym_id = self.symbols.intern_in(sym_name, pkg_id);
+            if s.starts_with(':') {
+                let key_name = &s[1..];
+                let sym_id = self.symbols.intern_keyword(key_name);
                 return self.symbol_to_node(sym_id);
             }
+
+            if let Some(pos) = s.find(':') {
+                let (pkg_name, sym_name) = if s[pos..].starts_with("::") {
+                    (&s[..pos], &s[pos + 2..])
+                } else {
+                    (&s[..pos], &s[pos + 1..])
+                };
+
+                if let Some(pkg_id) = self.symbols.find_package(pkg_name) {
+                    let sym_id = self.symbols.intern_in(sym_name, pkg_id);
+                    return self.symbol_to_node(sym_id);
+                }
+            }
         }
 
-        // Regular symbol in current package
         let sym_id = self.symbols.intern(s);
         self.symbol_to_node(sym_id)
+    }
+
+    fn parse_number(&mut self, s: &str) -> Result<Option<NodeId>, ReaderError> {
+        if let Some((num_str, denom_str)) = Self::split_ratio(s) {
+            match self.parse_ratio(num_str, denom_str, self.read_base)? {
+                Some(node) => return Ok(Some(node)),
+                None => {}
+            }
+        }
+
+        if self.read_base == 10 && self.looks_like_float(s) {
+            if let Some(f) = self.parse_float_token(s) {
+                return Ok(Some(self.arena.alloc(Node::Leaf(OpaqueValue::Float(f)))));
+            }
+        }
+
+        if let Some(node) = self.parse_integer_node(s, self.read_base) {
+            return Ok(Some(node));
+        }
+
+        Ok(None)
+    }
+
+    fn split_ratio(s: &str) -> Option<(&str, &str)> {
+        let mut parts = s.split('/');
+        let first = parts.next()?;
+        let second = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        if first.is_empty() || second.is_empty() {
+            return None;
+        }
+        Some((first, second))
+    }
+
+    fn parse_ratio(
+        &mut self,
+        num_str: &str,
+        denom_str: &str,
+        base: u32,
+    ) -> Result<Option<NodeId>, ReaderError> {
+        let (neg, num_digits) = Self::split_sign(num_str);
+        if denom_str.starts_with('+') || denom_str.starts_with('-') {
+            return Ok(None);
+        }
+
+        let mut numerator = match self.parse_bigint_digits(num_digits, base) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let mut denominator = match self.parse_bigint_digits(denom_str, base) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        if denominator == num_bigint::BigInt::from(0) {
+            return Err(ReaderError::InvalidNumber(
+                "Division by zero".to_string(),
+            ));
+        }
+
+        if neg {
+            numerator = -numerator;
+        }
+
+        if denominator.is_negative() {
+            numerator = -numerator;
+            denominator = -denominator;
+        }
+
+        let mut a = numerator.abs();
+        let mut b = denominator.abs();
+        while b != num_bigint::BigInt::from(0) {
+            let r = &a % &b;
+            a = b;
+            b = r;
+        }
+        if a != num_bigint::BigInt::from(0) {
+            numerator /= &a;
+            denominator /= &a;
+        }
+
+        if denominator == num_bigint::BigInt::from(1) {
+            return Ok(Some(self.bigint_to_node(numerator)));
+        }
+
+        Ok(Some(
+            self.arena
+                .alloc(Node::Leaf(OpaqueValue::Ratio(numerator, denominator))),
+        ))
+    }
+
+    fn split_sign(s: &str) -> (bool, &str) {
+        if let Some(rest) = s.strip_prefix('-') {
+            (true, rest)
+        } else if let Some(rest) = s.strip_prefix('+') {
+            (false, rest)
+        } else {
+            (false, s)
+        }
+    }
+
+    fn parse_bigint_digits(&self, s: &str, base: u32) -> Option<num_bigint::BigInt> {
+        let s = s.to_ascii_lowercase();
+        num_bigint::BigInt::parse_bytes(s.as_bytes(), base)
+    }
+
+    fn bigint_to_node(&mut self, n: num_bigint::BigInt) -> NodeId {
+        if let Some(v) = n.to_i64() {
+            self.arena.alloc(Node::Leaf(OpaqueValue::Integer(v)))
+        } else {
+            self.arena.alloc(Node::Leaf(OpaqueValue::BigInt(n)))
+        }
+    }
+
+    fn parse_integer_node(&mut self, s: &str, base: u32) -> Option<NodeId> {
+        let (neg, digits) = Self::split_sign(s);
+        if digits.is_empty() {
+            return None;
+        }
+        let mut n = self.parse_bigint_digits(digits, base)?;
+        if neg {
+            n = -n;
+        }
+        Some(self.bigint_to_node(n))
+    }
+
+    fn looks_like_float(&self, s: &str) -> bool {
+        s.contains('.')
+            || s.chars().any(|c| {
+                matches!(
+                    c,
+                    'e' | 'E' | 'd' | 'D' | 's' | 'S' | 'f' | 'F' | 'l' | 'L'
+                )
+            })
+    }
+
+    fn parse_float_token(&self, s: &str) -> Option<f64> {
+        let mut chars = s.chars().peekable();
+        let mut sign = String::new();
+        if let Some(&c) = chars.peek() {
+            if c == '+' || c == '-' {
+                sign.push(c);
+                chars.next();
+            }
+        }
+
+        let rest: String = chars.collect();
+        if rest.is_empty() {
+            return None;
+        }
+
+        let mut marker_idx = None;
+        let mut marker_char = 'e';
+        for (idx, c) in rest.char_indices() {
+            if matches!(c, 'e' | 'E' | 'd' | 'D' | 's' | 'S' | 'f' | 'F' | 'l' | 'L') {
+                marker_idx = Some(idx);
+                marker_char = c;
+                break;
+            }
+        }
+
+        let (mantissa, exponent) = if let Some(idx) = marker_idx {
+            let (left, right) = rest.split_at(idx);
+            if right.len() < marker_char.len_utf8() + 1 {
+                return None;
+            }
+            let exp_str = &right[marker_char.len_utf8()..];
+            if exp_str.is_empty() {
+                return None;
+            }
+            (left, Some(exp_str))
+        } else {
+            (rest.as_str(), None)
+        };
+
+        let mut saw_digit = false;
+        let mut saw_dot = false;
+        for c in mantissa.chars() {
+            if c == '.' {
+                if saw_dot {
+                    return None;
+                }
+                saw_dot = true;
+            } else if c.is_ascii_digit() {
+                saw_digit = true;
+            } else {
+                return None;
+            }
+        }
+        if !saw_digit {
+            return None;
+        }
+
+        if marker_idx.is_none() && !saw_dot {
+            return None;
+        }
+
+        let mut normalized = String::new();
+        normalized.push_str(&sign);
+        normalized.push_str(mantissa);
+
+        if let Some(exp_str) = exponent {
+            let mut exp_chars = exp_str.chars();
+            let mut exp_sign = String::new();
+            let first = exp_chars.next()?;
+            if first == '+' || first == '-' {
+                exp_sign.push(first);
+            } else {
+                exp_sign.push(first);
+            }
+            let rest_exp: String = exp_chars.collect();
+            let exp_digits = if exp_sign == "+" || exp_sign == "-" {
+                rest_exp
+            } else {
+                let mut tmp = exp_sign.clone();
+                tmp.push_str(&rest_exp);
+                exp_sign = String::new();
+                tmp
+            };
+            if exp_digits.is_empty() || !exp_digits.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            normalized.push('e');
+            if !exp_sign.is_empty() {
+                normalized.push_str(&exp_sign);
+            }
+            normalized.push_str(&exp_digits);
+        }
+
+        normalized.parse::<f64>().ok()
     }
 
     /// Convert a SymbolId to a Node representation

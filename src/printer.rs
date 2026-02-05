@@ -168,6 +168,29 @@ impl<'a> Printer<'a> {
                     self.output.push_str(&format!("{}", f));
                 }
             }
+            OpaqueValue::Char(c) => {
+                if self.options.escape {
+                    self.output.push_str("#\\");
+                    let name = match c {
+                        ' ' => Some("SPACE"),
+                        '\n' => Some("NEWLINE"),
+                        '\t' => Some("TAB"),
+                        '\r' => Some("RETURN"),
+                        '\x0c' => Some("PAGE"),
+                        '\x7f' => Some("RUBOUT"),
+                        '\x08' => Some("BACKSPACE"),
+                        '\0' => Some("NULL"),
+                        _ => None,
+                    };
+                    if let Some(n) = name {
+                        self.output.push_str(n);
+                    } else {
+                        self.output.push(c);
+                    }
+                } else {
+                    self.output.push(c);
+                }
+            }
             OpaqueValue::String(s) => {
                 if self.options.escape {
                     self.output.push('"');
@@ -185,6 +208,13 @@ impl<'a> Printer<'a> {
             }
             OpaqueValue::VectorHandle(h) => {
                 self.output.push_str(&format!("#<vector:{}>", h));
+            }
+            OpaqueValue::Complex(real, imag) => {
+                self.output.push_str("#C(");
+                self.print_node(real);
+                self.output.push(' ');
+                self.print_node(imag);
+                self.output.push(')');
             }
             OpaqueValue::ForeignPtr(ptr) => {
                 self.output.push_str(&format!("#<foreign:{:?}>", ptr));
@@ -226,6 +256,11 @@ impl<'a> Printer<'a> {
             }
             OpaqueValue::BigInt(n) => {
                 self.output.push_str(&n.to_string());
+            }
+            OpaqueValue::Ratio(n, d) => {
+                self.output.push_str(&n.to_string());
+                self.output.push('/');
+                self.output.push_str(&d.to_string());
             }
             OpaqueValue::StreamHandle(id) => {
                 self.output.push_str(&format!("#<stream:{}>", id));
@@ -503,6 +538,7 @@ impl<'a> DotPrinter<'a> {
                     OpaqueValue::Integer(i) => i.to_string(),
                     OpaqueValue::Float(f) => f.to_string(),
                     OpaqueValue::String(s) => format!("{:?}", s),
+                    OpaqueValue::Ratio(n, d) => format!("{}/{}", n, d),
                     _ => "?".to_string(),
                 };
                 self.output
@@ -623,6 +659,7 @@ impl<'a> BookTreeBuilder<'a> {
             ),
             OpaqueValue::Integer(i) => Some(i.to_string()),
             OpaqueValue::BigInt(i) => Some(i.to_string()),
+            OpaqueValue::Ratio(n, d) => Some(format!("{}/{}", n, d)),
             OpaqueValue::Float(f) => Some(f.to_string()),
             OpaqueValue::String(s) => Some(format!("\"{}\"", s)),
             _ => Some("atom".to_string()),
