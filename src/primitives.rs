@@ -89,6 +89,18 @@ fn string_from_designator(
             .unwrap()
             .symbol_name(SymbolId(*id))
             .map(|s| s.to_string()),
+        Node::Leaf(OpaqueValue::VectorHandle(id)) => {
+            let arr = proc.arrays.get(crate::arrays::VectorId(*id))?;
+            if !arr.element_type.is_character() {
+                return None;
+            }
+            let mut out = String::new();
+            for item in arr.elements_for_sequence() {
+                let ch = node_to_char(proc, ctx, item)?;
+                out.push(ch);
+            }
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -109,8 +121,8 @@ fn string_from_sequence(
                 return None;
             }
             let mut out = String::new();
-            for item in &arr.elements {
-                let ch = node_to_char(proc, ctx, *item)?;
+            for item in arr.elements_for_sequence() {
+                let ch = node_to_char(proc, ctx, item)?;
                 out.push(ch);
             }
             Some(out)
@@ -126,6 +138,58 @@ fn string_from_sequence(
         }
         _ => None,
     }
+}
+
+fn current_package_id(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+) -> crate::symbol::PackageId {
+    if let Some(val) = proc.get_value(ctx.package_sym) {
+        if let Node::Leaf(OpaqueValue::Package(id)) = proc.arena.inner.get_unchecked(val) {
+            return crate::symbol::PackageId(*id);
+        }
+    }
+    ctx.symbols.read().unwrap().current_package()
+}
+
+fn package_id_from_designator_opt(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Option<crate::symbol::PackageId> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Package(id)) => Some(crate::symbol::PackageId(*id)),
+        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(*id))
+            .and_then(|name| ctx.symbols.read().unwrap().find_package(name)),
+        Node::Leaf(OpaqueValue::String(s)) => ctx.symbols.read().unwrap().find_package(s),
+        Node::Leaf(OpaqueValue::Char(c)) => ctx
+            .symbols
+            .read()
+            .unwrap()
+            .find_package(&c.to_string()),
+        Node::Leaf(OpaqueValue::Integer(_)) => {
+            node_to_char(proc, ctx, node)
+                .and_then(|c| ctx.symbols.read().unwrap().find_package(&c.to_string()))
+        }
+        Node::Leaf(OpaqueValue::VectorHandle(_)) => {
+            let s = string_from_sequence(proc, ctx, node)?;
+            ctx.symbols.read().unwrap().find_package(&s)
+        }
+        _ => None,
+    }
+}
+
+fn package_id_from_designator(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Result<crate::symbol::PackageId, ControlSignal> {
+    package_id_from_designator_opt(proc, ctx, node)
+        .ok_or_else(|| ControlSignal::Error("Invalid package designator".into()))
 }
 
 /// Registry of primitive functions
@@ -211,8 +275,33 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("TYPEP", cl, prim_typep);
     globals.register_primitive("SYMBOL-VALUE", cl, prim_symbol_value);
     globals.register_primitive("GENSYM", cl, prim_gensym);
+    globals.register_primitive("GENTEMP", cl, prim_gentemp);
     globals.register_primitive("MAKE-SYMBOL", cl, prim_make_symbol);
     globals.register_primitive("INTERN", cl, prim_intern);
+    globals.register_primitive("FIND-SYMBOL", cl, prim_find_symbol);
+    globals.register_primitive("FIND-ALL-SYMBOLS", cl, prim_find_all_symbols);
+    globals.register_primitive("EXPORT", cl, prim_export);
+    globals.register_primitive("UNEXPORT", cl, prim_unexport);
+    globals.register_primitive("IMPORT", cl, prim_import);
+    globals.register_primitive("SHADOW", cl, prim_shadow);
+    globals.register_primitive("SHADOWING-IMPORT", cl, prim_shadowing_import);
+    globals.register_primitive("UNINTERN", cl, prim_unintern);
+    globals.register_primitive("USE-PACKAGE", cl, prim_use_package);
+    globals.register_primitive("UNUSE-PACKAGE", cl, prim_unuse_package);
+    globals.register_primitive("MAKE-PACKAGE", cl, prim_make_package);
+    globals.register_primitive("DELETE-PACKAGE", cl, prim_delete_package);
+    globals.register_primitive("RENAME-PACKAGE", cl, prim_rename_package);
+    globals.register_primitive("PACKAGEP", cl, prim_packagep);
+    globals.register_primitive("PACKAGE-NICKNAMES", cl, prim_package_nicknames);
+    globals.register_primitive("PACKAGE-USE-LIST", cl, prim_package_use_list);
+    globals.register_primitive("PACKAGE-USED-BY-LIST", cl, prim_package_used_by_list);
+    globals.register_primitive("PACKAGE-SHADOWING-SYMBOLS", cl, prim_package_shadowing_symbols);
+    globals.register_primitive("SYS-DEFPACKAGE", cl, prim_sys_defpackage);
+    globals.register_primitive(
+        "SYS-PACKAGE-ITERATOR-ENTRIES",
+        cl,
+        prim_sys_package_iterator_entries,
+    );
 
     // Logic
     globals.register_primitive("NOT", cl, prim_not);
@@ -654,10 +743,14 @@ fn prim_symbol_package(
             let pkg_id = ctx.symbols.read().unwrap().symbol_package(sym_id);
 
             if let Some(id) = pkg_id {
-                return Ok(proc
-                    .arena
-                    .inner
-                    .alloc(Node::Leaf(OpaqueValue::Package(id.0))));
+                if let Some(pkg) = ctx.symbols.read().unwrap().get_package(id) {
+                    if !pkg.is_deleted() {
+                        return Ok(proc
+                            .arena
+                            .inner
+                            .alloc(Node::Leaf(OpaqueValue::Package(id.0))));
+                    }
+                }
             }
         }
     }
@@ -867,6 +960,14 @@ fn prim_boundp(
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
         if let Some(sym_id) = node_to_symbol(proc, arg) {
+            if sym_id == ctx.t_sym || sym_id == ctx.nil_sym {
+                return Ok(proc.make_t(ctx));
+            }
+            if let Some(sym) = ctx.symbols.read().unwrap().get_symbol(sym_id) {
+                if sym.is_keyword() {
+                    return Ok(proc.make_t(ctx));
+                }
+            }
             if let Some(binding) = proc.dictionary.get(&sym_id) {
                 if binding.value.is_some() {
                     return Ok(proc.make_t(ctx));
@@ -894,7 +995,7 @@ fn prim_makunbound(
 
 fn prim_set(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
+    ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if args.len() < 2 {
@@ -905,6 +1006,11 @@ fn prim_set(
 
     if let Some(sym_id) = node_to_symbol(proc, sym_node) {
         proc.set_value(sym_id, val_node);
+        if sym_id == ctx.package_sym {
+            if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, val_node) {
+                ctx.symbols.write().unwrap().set_current_package(pkg_id);
+            }
+        }
         Ok(val_node)
     } else {
         err_helper("SET: first argument must be a symbol")
@@ -998,27 +1104,14 @@ fn prim_find_package(
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let name = match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::String(s)) => Some(s.clone()),
-            Node::Leaf(OpaqueValue::Symbol(id)) => ctx
-                .symbols
-                .read()
-                .unwrap()
-                .symbol_name(SymbolId(*id))
-                .map(|s| s.to_string()),
-            Node::Leaf(OpaqueValue::Package(_id)) => {
-                return Ok(arg);
-            }
-            _ => None,
-        };
-
-        if let Some(n) = name {
-            if let Some(pkg_id) = ctx.symbols.read().unwrap().find_package(&n) {
-                return Ok(proc
-                    .arena
-                    .inner
-                    .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))));
-            }
+        if matches!(proc.arena.inner.get_unchecked(arg), Node::Leaf(OpaqueValue::Package(_))) {
+            return Ok(arg);
+        }
+        if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, arg) {
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))));
         }
     }
     Ok(proc.make_nil())
@@ -1046,23 +1139,63 @@ fn prim_copy_symbol(
     _ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    if let Some(&arg) = args.first() {
-        if let Some(sym_id) = node_to_symbol(proc, arg) {
-            let name = _ctx
-                .symbols
-                .read()
-                .unwrap()
-                .symbol_name(sym_id)
-                .unwrap_or("G")
-                .to_string();
-            let new_sym_id = _ctx.symbols.write().unwrap().make_symbol(&name);
-            return Ok(proc
-                .arena
-                .inner
-                .alloc(Node::Leaf(OpaqueValue::Symbol(new_sym_id.0))));
-        }
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("COPY-SYMBOL requires 1 or 2 arguments");
     }
-    Ok(proc.make_nil())
+
+    let sym_id = node_to_symbol(proc, args[0])
+        .ok_or_else(|| ControlSignal::Error("COPY-SYMBOL: argument must be a symbol".into()))?;
+
+    let copy_plist = if args.len() == 2 {
+        !matches!(proc.arena.inner.get_unchecked(args[1]), Node::Leaf(OpaqueValue::Nil))
+    } else {
+        false
+    };
+
+    let name = _ctx
+        .symbols
+        .read()
+        .unwrap()
+        .symbol_name(sym_id)
+        .unwrap_or("G")
+        .to_string();
+    let new_sym_id = _ctx.symbols.write().unwrap().make_symbol(&name);
+
+    if copy_plist {
+        let mut new_binding = crate::process::SymbolBindings::default();
+        let (plist_opt, value_opt, func_opt) = if let Some(binding) = proc.dictionary.get(&sym_id)
+        {
+            (binding.plist, binding.value, binding.function)
+        } else {
+            (None, None, None)
+        };
+
+        if let Some(plist) = plist_opt {
+            fn copy_list(proc: &mut Process, list: NodeId) -> NodeId {
+                match proc.arena.inner.get_unchecked(list).clone() {
+                    Node::Leaf(OpaqueValue::Nil) => proc.make_nil(),
+                    Node::Fork(car, cdr) => {
+                        let tail = copy_list(proc, cdr);
+                        proc.arena.inner.alloc(Node::Fork(car, tail))
+                    }
+                    _ => list,
+                }
+            }
+            new_binding.plist = Some(copy_list(proc, plist));
+        }
+        if let Some(val) = value_opt {
+            new_binding.value = Some(val);
+        }
+        if let Some(func) = func_opt {
+            new_binding.function = Some(func);
+        }
+        proc.dictionary.insert(new_sym_id, new_binding);
+    }
+
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(new_sym_id.0))))
 }
 
 fn prim_in_package(
@@ -1076,29 +1209,16 @@ fn prim_in_package(
         ));
     }
 
-    let pkg_id_opt = match proc.arena.inner.get_unchecked(args[0]) {
-        Node::Leaf(OpaqueValue::Package(id)) => Some(crate::symbol::PackageId(*id)),
-        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
-            .symbols
-            .read()
-            .unwrap()
-            .symbol_name(SymbolId(*id))
-            .and_then(|name| ctx.symbols.read().unwrap().find_package(name)),
-        Node::Leaf(OpaqueValue::String(s)) => ctx.symbols.read().unwrap().find_package(s),
-        _ => None,
-    };
+    let pkg_id = package_id_from_designator(proc, ctx, args[0])
+        .map_err(|_| ControlSignal::Error("IN-PACKAGE: unknown package".to_string()))?;
 
-    if let Some(pkg_id) = pkg_id_opt {
-        ctx.symbols.write().unwrap().set_current_package(pkg_id);
-        return Ok(proc
-            .arena
-            .inner
-            .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))));
-    }
-
-    Err(ControlSignal::Error(
-        "IN-PACKAGE: unknown package".to_string(),
-    ))
+    ctx.symbols.write().unwrap().set_current_package(pkg_id);
+    let pkg_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0)));
+    proc.set_value(ctx.package_sym, pkg_node);
+    Ok(pkg_node)
 }
 
 fn prim_package_name(
@@ -1107,33 +1227,14 @@ fn prim_package_name(
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let pkg_id_opt = match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::Package(id)) => Some(crate::symbol::PackageId(*id)),
-            Node::Leaf(OpaqueValue::Symbol(id)) => {
-                // Return home package name? Or if arg represents package name?
-                // Standard says: package designator.
-                // If symbol, use its name to find package? No, symbols name packages.
-                // Actually PACKAGE-NAME takes a package designator.
-                // A string or symbol designates the package named by it.
-                let name = ctx
-                    .symbols
-                    .read()
-                    .unwrap()
-                    .symbol_name(SymbolId(*id))
-                    .unwrap_or("")
-                    .to_string();
-                ctx.symbols.read().unwrap().find_package(&name)
-            }
-            Node::Leaf(OpaqueValue::String(s)) => ctx.symbols.read().unwrap().find_package(s),
-            _ => None,
-        };
-
-        if let Some(pkg_id) = pkg_id_opt {
+        if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, arg) {
             if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
-                return Ok(proc
-                    .arena
-                    .inner
-                    .alloc(Node::Leaf(OpaqueValue::String(pkg.name.clone()))));
+                if !pkg.is_deleted() {
+                    return Ok(proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::String(pkg.name.clone()))));
+                }
             }
         }
     }
@@ -1151,6 +1252,12 @@ fn prim_list_all_packages(
     // Iterate backwards to preserve order in list construction if we pushed front,
     // but here order doesn't strictly matter.
     for i in (0..count).rev() {
+        let pkg_id = crate::symbol::PackageId(i as u32);
+        if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
+            if pkg.is_deleted() {
+                continue;
+            }
+        }
         let pkg_node = proc
             .arena
             .inner
@@ -3822,40 +3929,42 @@ fn prim_symbol_value(
     }
 }
 
-fn ensure_gensym_counter(
-    proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
-) -> i64 {
-    let counter_sym = ctx
-        .symbols
-        .write()
-        .unwrap()
-        .intern_in("*GENSYM-COUNTER*", crate::symbol::PackageId(1));
-
-    if let Some(val_node) = proc.get_value(counter_sym) {
-        if let NumVal::Int(n) = extract_number(&proc.arena.inner, val_node) {
-            return n;
-        }
+fn bigint_to_node(proc: &mut crate::process::Process, val: &BigInt) -> NodeId {
+    if let Some(i) = val.to_i64() {
+        proc.make_integer(i)
+    } else {
+        proc.arena.inner.alloc(Node::Leaf(OpaqueValue::BigInt(val.clone())))
     }
-
-    // Initialize to 1
-    let one = proc.make_integer(1);
-    proc.set_value(counter_sym, one);
-    1
 }
 
-fn inc_gensym_counter(
-    proc: &mut crate::process::Process,
-    ctx: &crate::context::GlobalContext,
-    current: i64,
-) {
-    let counter_sym = ctx
-        .symbols
-        .write()
-        .unwrap()
-        .intern_in("*GENSYM-COUNTER*", crate::symbol::PackageId(1));
-    let next = proc.make_integer(current + 1);
-    proc.set_value(counter_sym, next);
+fn read_counter(proc: &crate::process::Process, sym_id: SymbolId) -> BigInt {
+    if let Some(val_node) = proc.get_value(sym_id) {
+        match extract_number(&proc.arena.inner, val_node) {
+            NumVal::Int(n) => BigInt::from(n),
+            NumVal::Big(b) => b,
+            _ => BigInt::from(0),
+        }
+    } else {
+        BigInt::from(0)
+    }
+}
+
+fn write_counter(proc: &mut crate::process::Process, sym_id: SymbolId, val: BigInt) {
+    let node = bigint_to_node(proc, &val);
+    proc.set_value(sym_id, node);
+}
+
+fn parse_unsigned_integer(
+    proc: &crate::process::Process,
+    node: NodeId,
+) -> Result<BigInt, ControlSignal> {
+    match extract_number(&proc.arena.inner, node) {
+        NumVal::Int(n) if n >= 0 => Ok(BigInt::from(n)),
+        NumVal::Big(b) if !b.is_negative() => Ok(b),
+        _ => Err(ControlSignal::Error(
+            "Expected non-negative integer".to_string(),
+        )),
+    }
 }
 
 fn prim_gensym(
@@ -3863,27 +3972,101 @@ fn prim_gensym(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    let mut prefix = "G".to_string();
-
-    if let Some(&arg) = args.first() {
-        match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::String(s)) => {
-                prefix = s.clone();
-            }
-            _ => {}
-        }
+    if args.len() > 1 {
+        return err_helper("GENSYM accepts at most one argument");
     }
 
-    let counter = ensure_gensym_counter(proc, ctx);
-    inc_gensym_counter(proc, ctx, counter);
+    let counter_sym = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in("*GENSYM-COUNTER*", crate::symbol::PackageId(1));
 
-    let name = format!("{}{}", prefix, counter);
+    let (prefix, use_counter, explicit_counter) = if let Some(&arg) = args.first() {
+        match proc.arena.inner.get_unchecked(arg) {
+            Node::Leaf(OpaqueValue::String(s)) => (s.clone(), true, None),
+            _ => {
+                let n = parse_unsigned_integer(proc, arg)?;
+                ("G".to_string(), false, Some(n))
+            }
+        }
+    } else {
+        ("G".to_string(), true, None)
+    };
+
+    let counter_val = if let Some(explicit) = explicit_counter {
+        explicit
+    } else {
+        read_counter(proc, counter_sym)
+    };
+
+    let name = format!("{}{}", prefix, counter_val);
     let sym_id = ctx.symbols.write().unwrap().make_symbol(&name);
+
+    if use_counter {
+        let next = &counter_val + BigInt::from(1);
+        write_counter(proc, counter_sym, next);
+    }
 
     Ok(proc
         .arena
         .inner
         .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))))
+}
+
+fn prim_gentemp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 2 {
+        return err_helper("GENTEMP accepts at most two arguments");
+    }
+
+    let prefix = if let Some(&arg) = args.first() {
+        string_from_designator(proc, ctx, arg)
+            .ok_or_else(|| ControlSignal::Error("GENTEMP: invalid prefix".into()))?
+    } else {
+        "T".to_string()
+    };
+
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    let counter_sym = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .intern_in("*GENTEMP-COUNTER*", crate::symbol::PackageId(1));
+
+    let mut counter = read_counter(proc, counter_sym);
+    loop {
+        let name = format!("{}{}", prefix, counter);
+        let found = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .find_symbol_in_package(pkg_id, &name)
+            .is_some();
+        if !found {
+            let sym_id = ctx
+                .symbols
+                .write()
+                .unwrap()
+                .intern_in_with_status(&name, pkg_id)
+                .0;
+            let next = &counter + BigInt::from(1);
+            write_counter(proc, counter_sym, next);
+            return Ok(proc
+                .arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))));
+        }
+        counter = &counter + BigInt::from(1);
+    }
 }
 
 fn prim_make_symbol(
@@ -3914,35 +4097,1149 @@ fn prim_intern(
     if args.is_empty() || args.len() > 2 {
         return err_helper("INTERN requires a string and optional package");
     }
-    let name = string_from_designator(proc, ctx, args[0])
+    let name = string_from_sequence(proc, ctx, args[0])
         .ok_or_else(|| ControlSignal::Error("INTERN: name must be a string designator".into()))?;
     let pkg_id = if args.len() == 2 {
-        match proc.arena.inner.get_unchecked(args[1]) {
-            Node::Leaf(OpaqueValue::Package(id)) => PackageId(*id),
-            Node::Leaf(OpaqueValue::String(s)) => ctx
-                .symbols
-                .read()
-                .unwrap()
-                .find_package(s)
-                .ok_or_else(|| ControlSignal::Error("INTERN: unknown package".into()))?,
-            Node::Leaf(OpaqueValue::Symbol(id)) => ctx
-                .symbols
-                .read()
-                .unwrap()
-                .symbol_package(SymbolId(*id))
-                .unwrap_or_else(|| ctx.symbols.read().unwrap().current_package()),
-            Node::Leaf(OpaqueValue::Nil) => ctx.symbols.read().unwrap().current_package(),
-            _ => return err_helper("INTERN: invalid package designator"),
-        }
+        package_id_from_designator(proc, ctx, args[1])?
     } else {
-        ctx.symbols.read().unwrap().current_package()
+        current_package_id(proc, ctx)
     };
 
-    let sym_id = ctx.symbols.write().unwrap().intern_in(&name, pkg_id);
+    let (sym_id, status) = ctx.symbols.write().unwrap().intern_in_with_status(&name, pkg_id);
+    let sym_node = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0)));
+    let status_node = match status {
+        None => proc.make_nil(),
+        Some(crate::symbol::FindSymbolStatus::Internal) => {
+            let id = ctx.symbols.write().unwrap().intern_in("INTERNAL", PackageId(0));
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(id.0)))
+        }
+        Some(crate::symbol::FindSymbolStatus::External) => {
+            let id = ctx.symbols.write().unwrap().intern_in("EXTERNAL", PackageId(0));
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(id.0)))
+        }
+        Some(crate::symbol::FindSymbolStatus::Inherited) => {
+            let id = ctx.symbols.write().unwrap().intern_in("INHERITED", PackageId(0));
+            proc.arena
+                .inner
+                .alloc(Node::Leaf(OpaqueValue::Symbol(id.0)))
+        }
+    };
+    let primary = set_multiple_values(proc, vec![sym_node, status_node]);
+    Ok(primary)
+}
+
+fn prim_find_symbol(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("FIND-SYMBOL requires a string and optional package");
+    }
+    let name = string_from_sequence(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("FIND-SYMBOL: name must be a string designator".into()))?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    if let Some((sym_id, status)) = ctx.symbols.read().unwrap().find_symbol_in_package(pkg_id, &name) {
+        let sym_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0)));
+        let status_node = match status {
+            crate::symbol::FindSymbolStatus::Internal => {
+                let id = ctx.symbols.write().unwrap().intern_in("INTERNAL", PackageId(0));
+                proc.arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(id.0)))
+            }
+            crate::symbol::FindSymbolStatus::External => {
+                let id = ctx.symbols.write().unwrap().intern_in("EXTERNAL", PackageId(0));
+                proc.arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(id.0)))
+            }
+            crate::symbol::FindSymbolStatus::Inherited => {
+                let id = ctx.symbols.write().unwrap().intern_in("INHERITED", PackageId(0));
+                proc.arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(id.0)))
+            }
+        };
+        let primary = set_multiple_values(proc, vec![sym_node, status_node]);
+        return Ok(primary);
+    }
+
+    let primary = set_multiple_values(proc, vec![proc.make_nil(), proc.make_nil()]);
+    Ok(primary)
+}
+
+fn prim_find_all_symbols(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("FIND-ALL-SYMBOLS requires exactly 1 argument");
+    }
+    let name = string_from_sequence(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("FIND-ALL-SYMBOLS: name must be a string designator".into()))?;
+
+    let symbols = ctx.symbols.read().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for idx in 0..symbols.package_count() {
+        let pkg_id = crate::symbol::PackageId(idx as u32);
+        if let Some(pkg) = symbols.get_package(pkg_id) {
+            if pkg.is_deleted() {
+                continue;
+            }
+        }
+        if let Some((sym_id, _)) = symbols.find_symbol_in_package(pkg_id, &name) {
+            if seen.insert(sym_id.0) {
+                out.push(proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))));
+            }
+        }
+    }
+    Ok(proc.make_list(&out))
+}
+
+fn symbols_from_arg(
+    proc: &crate::process::Process,
+    arg: NodeId,
+) -> Result<Vec<SymbolId>, ControlSignal> {
+    match proc.arena.inner.get_unchecked(arg) {
+        Node::Leaf(OpaqueValue::Nil) => Ok(Vec::new()),
+        Node::Leaf(OpaqueValue::Symbol(id)) => Ok(vec![SymbolId(*id)]),
+        Node::Fork(_, _) => {
+            let items = list_to_vec_opt(proc, arg)
+                .ok_or_else(|| ControlSignal::Error("Expected list of symbols".into()))?;
+            let mut out = Vec::new();
+            for item in items {
+                if let Some(sym) = node_to_symbol(proc, item) {
+                    out.push(sym);
+                } else {
+                    return Err(ControlSignal::Error(
+                        "Expected symbol in list".to_string(),
+                    ));
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(ControlSignal::Error("Expected symbol".into())),
+    }
+}
+
+fn names_from_arg(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    arg: NodeId,
+) -> Result<Vec<String>, ControlSignal> {
+    match proc.arena.inner.get_unchecked(arg) {
+        Node::Leaf(OpaqueValue::Nil) => Ok(Vec::new()),
+        Node::Fork(_, _) => {
+            let items = list_to_vec_opt(proc, arg)
+                .ok_or_else(|| ControlSignal::Error("Expected list of names".into()))?;
+            let mut out = Vec::new();
+            for item in items {
+                let s = string_from_sequence(proc, ctx, item).ok_or_else(|| {
+                    ControlSignal::Error("Expected string designator".to_string())
+                })?;
+                out.push(s);
+            }
+            Ok(out)
+        }
+        _ => {
+            let s = string_from_sequence(proc, ctx, arg)
+                .ok_or_else(|| ControlSignal::Error("Expected string designator".into()))?;
+            Ok(vec![s])
+        }
+    }
+}
+
+fn packages_from_arg(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    arg: NodeId,
+) -> Result<Vec<PackageId>, ControlSignal> {
+    match proc.arena.inner.get_unchecked(arg) {
+        Node::Leaf(OpaqueValue::Nil) => Ok(Vec::new()),
+        Node::Fork(_, _) => {
+            let items = list_to_vec_opt(proc, arg)
+                .ok_or_else(|| ControlSignal::Error("Expected list of packages".into()))?;
+            let mut out = Vec::new();
+            for item in items {
+                out.push(package_id_from_designator(proc, ctx, item)?);
+            }
+            Ok(out)
+        }
+        _ => Ok(vec![package_id_from_designator(proc, ctx, arg)?]),
+    }
+}
+
+fn prim_export(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("EXPORT requires a symbol (or list) and optional package");
+    }
+    let symbols = symbols_from_arg(proc, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for sym in symbols {
+        let name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(sym)
+            .ok_or_else(|| ControlSignal::Error("Unknown symbol".into()))?
+            .to_string();
+
+        let (existing, _) = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .find_symbol_in_package(pkg_id, &name)
+            .ok_or_else(|| ControlSignal::Error("EXPORT: symbol not accessible in package".into()))?;
+        if existing != sym {
+            return Err(ControlSignal::Error(
+                "EXPORT: name conflict in package".to_string(),
+            ));
+        }
+
+        // Conflict check against used-by packages
+        let used_by = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .get_package(pkg_id)
+            .map(|p| p.used_by_list().to_vec())
+            .unwrap_or_default();
+        for user_id in used_by {
+            if let Some((other, _)) = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_symbol_in_package(user_id, &name)
+            {
+                if other != sym {
+                    return Err(ControlSignal::Error(
+                        "EXPORT: name conflict in using package".to_string(),
+                    ));
+                }
+            }
+        }
+
+        ctx.symbols
+            .write()
+            .unwrap()
+            .export_in_package(pkg_id, sym)
+            .map_err(ControlSignal::Error)?;
+    }
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_unexport(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("UNEXPORT requires a symbol (or list) and optional package");
+    }
+    let symbols = symbols_from_arg(proc, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for sym in symbols {
+        ctx.symbols
+            .write()
+            .unwrap()
+            .unexport_in_package(pkg_id, sym)
+            .map_err(ControlSignal::Error)?;
+    }
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_import(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("IMPORT requires a symbol (or list) and optional package");
+    }
+    let symbols = symbols_from_arg(proc, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for sym in symbols {
+        let name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(sym)
+            .ok_or_else(|| ControlSignal::Error("Unknown symbol".into()))?
+            .to_string();
+        if let Some((existing, _)) = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .find_symbol_in_package(pkg_id, &name)
+        {
+            if existing != sym {
+                return Err(ControlSignal::Error("IMPORT: name conflict".into()));
+            }
+            continue;
+        }
+        ctx.symbols
+            .write()
+            .unwrap()
+            .import_into_package(pkg_id, sym)
+            .map_err(ControlSignal::Error)?;
+    }
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_shadow(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("SHADOW requires a name (or list) and optional package");
+    }
+    let names = names_from_arg(proc, ctx, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for name in names {
+        let maybe = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .find_symbol_in_package(pkg_id, &name);
+        let sym_id = match maybe {
+            Some((sym, crate::symbol::FindSymbolStatus::Internal))
+            | Some((sym, crate::symbol::FindSymbolStatus::External)) => sym,
+            _ => ctx
+                .symbols
+                .write()
+                .unwrap()
+                .create_symbol_in_package(&name, pkg_id),
+        };
+        ctx.symbols
+            .write()
+            .unwrap()
+            .add_shadowing_symbol(pkg_id, sym_id)
+            .map_err(ControlSignal::Error)?;
+    }
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_shadowing_import(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("SHADOWING-IMPORT requires a symbol (or list) and optional package");
+    }
+    let symbols = symbols_from_arg(proc, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for sym in symbols {
+        let name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(sym)
+            .ok_or_else(|| ControlSignal::Error("Unknown symbol".into()))?
+            .to_string();
+
+        if let Some((existing, _)) = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .find_symbol_in_package(pkg_id, &name)
+        {
+            if existing != sym {
+                ctx.symbols
+                    .write()
+                    .unwrap()
+                    .unintern_from_package(pkg_id, existing)
+                    .map_err(ControlSignal::Error)?;
+            }
+        }
+
+        ctx.symbols
+            .write()
+            .unwrap()
+            .import_into_package(pkg_id, sym)
+            .map_err(ControlSignal::Error)?;
+        ctx.symbols
+            .write()
+            .unwrap()
+            .add_shadowing_symbol(pkg_id, sym)
+            .map_err(ControlSignal::Error)?;
+    }
+
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_unintern(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("UNINTERN requires a symbol and optional package");
+    }
+    let symbols = symbols_from_arg(proc, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    let mut removed_any = false;
+    for sym in symbols {
+        let removed = ctx
+            .symbols
+            .write()
+            .unwrap()
+            .unintern_from_package(pkg_id, sym)
+            .map_err(ControlSignal::Error)?;
+        if removed {
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        Ok(proc.make_t(ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_use_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("USE-PACKAGE requires a package (or list) and optional package");
+    }
+    let use_pkgs = packages_from_arg(proc, ctx, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for use_pkg in use_pkgs {
+        ctx.symbols
+            .write()
+            .unwrap()
+            .use_package(pkg_id, use_pkg)
+            .map_err(ControlSignal::Error)?;
+    }
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_unuse_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("UNUSE-PACKAGE requires a package (or list) and optional package");
+    }
+    let use_pkgs = packages_from_arg(proc, ctx, args[0])?;
+    let pkg_id = if args.len() == 2 {
+        package_id_from_designator(proc, ctx, args[1])?
+    } else {
+        current_package_id(proc, ctx)
+    };
+
+    for use_pkg in use_pkgs {
+        ctx.symbols
+            .write()
+            .unwrap()
+            .unuse_package(pkg_id, use_pkg)
+            .map_err(ControlSignal::Error)?;
+    }
+    Ok(proc.make_t(ctx))
+}
+
+fn prim_make_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("MAKE-PACKAGE requires at least 1 argument");
+    }
+    let name = string_from_sequence(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("MAKE-PACKAGE: invalid name".into()))?;
+
+    let mut nicknames: Vec<String> = Vec::new();
+    let mut use_list: Option<Vec<PackageId>> = None;
+    let mut documentation: Option<String> = None;
+
+    let mut i = 1;
+    while i + 1 < args.len() {
+        let key = args[i];
+        let val = args[i + 1];
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key) {
+            let name_kw = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            match name_kw.as_str() {
+                "NICKNAMES" => {
+                    nicknames = names_from_arg(proc, ctx, val)?;
+                }
+                "USE" => {
+                    use_list = Some(packages_from_arg(proc, ctx, val)?);
+                }
+                "DOCUMENTATION" => {
+                    if let Node::Leaf(OpaqueValue::String(s)) = proc.arena.inner.get_unchecked(val) {
+                        documentation = Some(s.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 2;
+    }
+
+    let use_list = use_list.unwrap_or_default();
+    let pkg_id = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .make_package(&name, nicknames, use_list, documentation)
+        .map_err(|e| ControlSignal::Error(format!("MAKE-PACKAGE: {}", e)))?;
+
     Ok(proc
         .arena
         .inner
-        .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0))))
+        .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))))
+}
+
+fn prim_delete_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("DELETE-PACKAGE requires exactly 1 argument");
+    }
+    let pkg_id = package_id_from_designator(proc, ctx, args[0])?;
+    let deleted = ctx
+        .symbols
+        .write()
+        .unwrap()
+        .delete_package(pkg_id)
+        .map_err(|e| ControlSignal::Error(format!("DELETE-PACKAGE: {}", e)))?;
+    if deleted {
+        Ok(proc.make_t(ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_rename_package(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return err_helper("RENAME-PACKAGE requires 2 or 3 arguments");
+    }
+    let pkg_id = package_id_from_designator(proc, ctx, args[0])?;
+    let new_name = string_from_sequence(proc, ctx, args[1])
+        .ok_or_else(|| ControlSignal::Error("RENAME-PACKAGE: invalid name".into()))?;
+    let new_nicknames = if args.len() == 3 {
+        Some(names_from_arg(proc, ctx, args[2])?)
+    } else {
+        None
+    };
+    ctx.symbols
+        .write()
+        .unwrap()
+        .rename_package(pkg_id, &new_name, new_nicknames)
+        .map_err(|e| ControlSignal::Error(format!("RENAME-PACKAGE: {}", e)))?;
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))))
+}
+
+fn prim_packagep(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Node::Leaf(OpaqueValue::Package(id)) = proc.arena.inner.get_unchecked(arg) {
+            let pkg_id = crate::symbol::PackageId(*id);
+            if ctx.symbols.read().unwrap().get_package(pkg_id).is_some() {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_package_nicknames(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, arg) {
+            if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
+                if pkg.is_deleted() {
+                    return Ok(proc.make_nil());
+                }
+                let mut nodes = Vec::new();
+                for nick in &pkg.nicknames {
+                    nodes.push(
+                        proc.arena
+                            .inner
+                            .alloc(Node::Leaf(OpaqueValue::String(nick.clone()))),
+                    );
+                }
+                return Ok(proc.make_list(&nodes));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_package_use_list(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, arg) {
+            if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
+                if pkg.is_deleted() {
+                    return Ok(proc.make_nil());
+                }
+                let mut nodes = Vec::new();
+                for used in pkg.use_list() {
+                    nodes.push(proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Package(used.0))));
+                }
+                return Ok(proc.make_list(&nodes));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_package_used_by_list(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, arg) {
+            if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
+                if pkg.is_deleted() {
+                    return Ok(proc.make_nil());
+                }
+                let mut nodes = Vec::new();
+                for used_by in pkg.used_by_list() {
+                    nodes.push(proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Package(used_by.0))));
+                }
+                return Ok(proc.make_list(&nodes));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_package_shadowing_symbols(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if let Some(&arg) = args.first() {
+        if let Some(pkg_id) = package_id_from_designator_opt(proc, ctx, arg) {
+            if let Some(pkg) = ctx.symbols.read().unwrap().get_package(pkg_id) {
+                if pkg.is_deleted() {
+                    return Ok(proc.make_nil());
+                }
+                let mut nodes = Vec::new();
+                for sym in pkg.shadowing_symbols() {
+                    nodes.push(proc
+                        .arena
+                        .inner
+                        .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0))));
+                }
+                return Ok(proc.make_list(&nodes));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_sys_defpackage(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("SYS-DEFPACKAGE requires name and options list");
+    }
+
+    let name = string_from_sequence(proc, ctx, args[0])
+        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid name".into()))?;
+
+    let options = list_to_vec_opt(proc, args[1])
+        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid options".into()))?;
+
+    let mut nicknames: Vec<String> = Vec::new();
+    let mut use_specs: Option<Vec<PackageId>> = None;
+    let mut shadow: Vec<String> = Vec::new();
+    let mut shadowing_import_from: Vec<(PackageId, Vec<String>)> = Vec::new();
+    let mut import_from: Vec<(PackageId, Vec<String>)> = Vec::new();
+    let mut export: Vec<String> = Vec::new();
+    let mut intern: Vec<String> = Vec::new();
+    let mut documentation: Option<String> = None;
+
+    for opt in options {
+        let opt_list = list_to_vec_opt(proc, opt)
+            .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: option must be a list".into()))?;
+        if opt_list.is_empty() {
+            continue;
+        }
+        let key = opt_list[0];
+        let key_name = if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(key) {
+            ctx.symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase()
+        } else {
+            return err_helper("DEFPACKAGE: invalid option keyword");
+        };
+        let args_list = &opt_list[1..];
+
+        match key_name.as_str() {
+            "NICKNAMES" => {
+                for arg in args_list {
+                    let n = string_from_sequence(proc, ctx, *arg)
+                        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid nickname".into()))?;
+                    nicknames.push(n);
+                }
+            }
+            "USE" => {
+                let mut pkgs = Vec::new();
+                for arg in args_list {
+                    pkgs.push(package_id_from_designator(proc, ctx, *arg)?);
+                }
+                if let Some(existing) = &mut use_specs {
+                    existing.extend(pkgs);
+                } else {
+                    use_specs = Some(pkgs);
+                }
+            }
+            "SHADOW" => {
+                for arg in args_list {
+                    let n = string_from_sequence(proc, ctx, *arg)
+                        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid shadow name".into()))?;
+                    shadow.push(n);
+                }
+            }
+            "SHADOWING-IMPORT-FROM" => {
+                if args_list.is_empty() {
+                    continue;
+                }
+                let from_pkg = package_id_from_designator(proc, ctx, args_list[0])?;
+                let mut names = Vec::new();
+                for arg in &args_list[1..] {
+                    let n = string_from_sequence(proc, ctx, *arg)
+                        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid shadowing import name".into()))?;
+                    names.push(n);
+                }
+                shadowing_import_from.push((from_pkg, names));
+            }
+            "IMPORT-FROM" => {
+                if args_list.is_empty() {
+                    continue;
+                }
+                let from_pkg = package_id_from_designator(proc, ctx, args_list[0])?;
+                let mut names = Vec::new();
+                for arg in &args_list[1..] {
+                    let n = string_from_sequence(proc, ctx, *arg)
+                        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid import name".into()))?;
+                    names.push(n);
+                }
+                import_from.push((from_pkg, names));
+            }
+            "EXPORT" => {
+                for arg in args_list {
+                    let n = string_from_sequence(proc, ctx, *arg)
+                        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid export name".into()))?;
+                    export.push(n);
+                }
+            }
+            "INTERN" => {
+                for arg in args_list {
+                    let n = string_from_sequence(proc, ctx, *arg)
+                        .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: invalid intern name".into()))?;
+                    intern.push(n);
+                }
+            }
+            "DOCUMENTATION" => {
+                if let Some(arg) = args_list.first() {
+                    if let Node::Leaf(OpaqueValue::String(s)) = proc.arena.inner.get_unchecked(*arg)
+                    {
+                        documentation = Some(s.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let pkg_id = if let Some(existing) = ctx.symbols.read().unwrap().find_package(&name) {
+        if !nicknames.is_empty() {
+            ctx.symbols
+                .write()
+                .unwrap()
+                .rename_package(existing, &name, Some(nicknames.clone()))
+                .map_err(ControlSignal::Error)?;
+        }
+        existing
+    } else {
+        ctx.symbols
+            .write()
+            .unwrap()
+            .make_package(&name, nicknames.clone(), Vec::new(), documentation.clone())
+            .map_err(|e| ControlSignal::Error(format!("DEFPACKAGE: {}", e)))?
+    };
+
+    // Documentation update
+    if let Some(pkg) = ctx.symbols.write().unwrap().get_package_mut(pkg_id) {
+        pkg.set_documentation(documentation);
+    }
+
+    // Reset use-list if specified
+    if let Some(use_pkgs) = use_specs {
+        let current_use = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .get_package(pkg_id)
+            .map(|p| p.use_list().to_vec())
+            .unwrap_or_default();
+        for used in current_use {
+            let _ = ctx.symbols.write().unwrap().unuse_package(pkg_id, used);
+        }
+        for used in use_pkgs {
+            ctx.symbols
+                .write()
+                .unwrap()
+                .use_package(pkg_id, used)
+                .map_err(ControlSignal::Error)?;
+        }
+    }
+
+    // Shadow
+    if !shadow.is_empty() {
+        for name in shadow {
+            let maybe = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_symbol_in_package(pkg_id, &name);
+            let sym_id = match maybe {
+                Some((sym, crate::symbol::FindSymbolStatus::Internal))
+                | Some((sym, crate::symbol::FindSymbolStatus::External)) => sym,
+                _ => ctx
+                    .symbols
+                    .write()
+                    .unwrap()
+                    .create_symbol_in_package(&name, pkg_id),
+            };
+            ctx.symbols
+            .write()
+            .unwrap()
+            .add_shadowing_symbol(pkg_id, sym_id)
+            .map_err(ControlSignal::Error)?;
+        }
+    }
+
+    // Shadowing-import-from
+    for (from_pkg, names) in shadowing_import_from {
+        for name in names {
+            let sym_id = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_symbol_in_package(from_pkg, &name)
+                .map(|(s, _)| s)
+                .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: symbol not found for shadowing-import".into()))?;
+            // Remove conflicts and import
+            if let Some((existing, _)) = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_symbol_in_package(pkg_id, &name)
+            {
+                if existing != sym_id {
+                    ctx.symbols
+                    .write()
+                    .unwrap()
+                    .unintern_from_package(pkg_id, existing)
+                    .map_err(ControlSignal::Error)?;
+                }
+            }
+            ctx.symbols
+                .write()
+                .unwrap()
+                .import_into_package(pkg_id, sym_id)
+                .map_err(ControlSignal::Error)?;
+            ctx.symbols
+                .write()
+                .unwrap()
+                .add_shadowing_symbol(pkg_id, sym_id)
+                .map_err(ControlSignal::Error)?;
+        }
+    }
+
+    // Import-from
+    for (from_pkg, names) in import_from {
+        for name in names {
+            let sym_id = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_symbol_in_package(from_pkg, &name)
+                .map(|(s, _)| s)
+                .ok_or_else(|| ControlSignal::Error("DEFPACKAGE: symbol not found for import".into()))?;
+            if let Some((existing, _)) = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .find_symbol_in_package(pkg_id, &name)
+            {
+                if existing != sym_id {
+                    return Err(ControlSignal::Error(
+                        "DEFPACKAGE: import name conflict".into(),
+                    ));
+                }
+                continue;
+            }
+            ctx.symbols
+                .write()
+                .unwrap()
+                .import_into_package(pkg_id, sym_id)
+                .map_err(ControlSignal::Error)?;
+        }
+    }
+
+    // Intern
+    for name in intern {
+        ctx.symbols.write().unwrap().intern_in_with_status(&name, pkg_id);
+    }
+
+    // Export
+    for name in export {
+        let sym_id = ctx
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in_with_status(&name, pkg_id)
+            .0;
+        ctx.symbols
+            .write()
+            .unwrap()
+            .export_in_package(pkg_id, sym_id)
+            .map_err(ControlSignal::Error)?;
+    }
+
+    Ok(proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0))))
+}
+
+fn prim_sys_package_iterator_entries(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("SYS-PACKAGE-ITERATOR-ENTRIES requires packages and types");
+    }
+    let pkgs = packages_from_arg(proc, ctx, args[0])?;
+    let types = list_to_vec_opt(proc, args[1]).unwrap_or_default();
+
+    let mut want_internal = false;
+    let mut want_external = false;
+    let mut want_inherited = false;
+    for t in types {
+        if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(t) {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            match name.as_str() {
+                "INTERNAL" => want_internal = true,
+                "EXTERNAL" => want_external = true,
+                "INHERITED" => want_inherited = true,
+                _ => {}
+            }
+        }
+    }
+
+    let (kw_internal, kw_external, kw_inherited) = {
+        let mut syms = ctx.symbols.write().unwrap();
+        (
+            syms.intern_in("INTERNAL", PackageId(0)),
+            syms.intern_in("EXTERNAL", PackageId(0)),
+            syms.intern_in("INHERITED", PackageId(0)),
+        )
+    };
+    let symbols = ctx.symbols.read().unwrap();
+    let mut entries: Vec<NodeId> = Vec::new();
+    for pkg_id in pkgs {
+        let pkg = match symbols.get_package(pkg_id) {
+            Some(p) if !p.is_deleted() => p,
+            _ => continue,
+        };
+
+        if want_internal {
+            for (_name, sym) in pkg.internal_symbols() {
+                let sym_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)));
+                let status_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(kw_internal.0)));
+                let pkg_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0)));
+                let entry = proc.make_list(&[sym_node, status_node, pkg_node]);
+                entries.push(entry);
+            }
+        }
+
+        if want_external {
+            for (_name, sym) in pkg.external_symbols() {
+                let sym_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)));
+                let status_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Symbol(kw_external.0)));
+                let pkg_node = proc
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0)));
+                let entry = proc.make_list(&[sym_node, status_node, pkg_node]);
+                entries.push(entry);
+            }
+        }
+
+        if want_inherited {
+            let mut seen = std::collections::HashSet::new();
+            for used in pkg.use_list() {
+                let used_pkg = match symbols.get_package(*used) {
+                    Some(p) if !p.is_deleted() => p,
+                    _ => continue,
+                };
+                for (name, sym) in used_pkg.external_symbols() {
+                    if let Some((sym_id, crate::symbol::FindSymbolStatus::Inherited)) =
+                        symbols.find_symbol_in_package(pkg_id, name)
+                    {
+                        if sym_id != sym {
+                            continue;
+                        }
+                        if !seen.insert(sym_id.0) {
+                            continue;
+                        }
+                        let sym_node = proc
+                            .arena
+                            .inner
+                            .alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0)));
+                        let status_node = proc
+                            .arena
+                            .inner
+                            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_inherited.0)));
+                        let pkg_node = proc
+                            .arena
+                            .inner
+                            .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0)));
+                        let entry = proc.make_list(&[sym_node, status_node, pkg_node]);
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(proc.make_list(&entries))
 }
 
 // ============================================================================
@@ -10373,7 +11670,11 @@ fn prim_make_array(
         elements = vec![initial_element; total_size];
     }
 
-    if element_type == crate::arrays::ArrayElementType::Character && dims.len() == 1 {
+    if element_type == crate::arrays::ArrayElementType::Character
+        && dims.len() == 1
+        && fill_pointer.is_none()
+        && displaced_to.is_none()
+    {
         let mut s = String::new();
         for node in &elements {
             let ch = node_to_char(proc, _ctx, *node).ok_or_else(|| {

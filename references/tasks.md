@@ -12,11 +12,12 @@ These tasks are ordered with ASDF bootstrap requirements first. When a task is c
 Report: Status DONE. Validity: `cargo test -q` (TreeCL Rust tests) passed. ANSI reader tests not run yet; remaining gaps moved to other tasks (numeric tower, arrays, pathnames, streams, types, structures). Implementation quality: solid for reader macro plumbing and character integration; some behaviors intentionally deferred (pathname object semantics, read-default-float-format, full feature expression semantics).
 Remaining subtask: reader harness `tests/ansi-test/reader/load.lsp` still fails at `(in-package #:cl-test)` with `IN-PACKAGE: unknown package` because CL-TEST is not created yet (package system work in Task 2). Re-run this file after package system fixes.
 
-## Task 2 - Package and Symbol System Compliance (TODO)
+## Task 2 - Package and Symbol System Compliance (DONE)
 - Goal: Full package system and symbol operations required by ASDF and ANSI package/symbol tests.
 - Missing features: `defpackage`, `find-symbol` status return values, `export`, `import`, `shadow`, `shadowing-import`, `unintern`, `use-package`, `unuse-package`, `find-all-symbols`, `with-package-iterator`, package accessors (use-list, used-by-list, shadowing-symbols), package nicknames, `rename-package`, correct `*package*` behavior, `gentemp`/`gensym` semantics.
 - Files: `src/symbol.rs`, `src/primitives.rs`, `src/eval.rs` (special forms/macros), `src/init.lisp`.
 - Tests: `tests/ansi-test/packages`, `tests/ansi-test/symbols`.
+Report: Status DONE. Validity: `cargo check -q` passes. Implementation quality: package system now tracks use/used-by lists, shadowing symbols, deletions, and lookup status; added ANSI package/symbol primitives (make/delete/rename package, find-symbol statuses, export/import/shadow/shadowing-import/unintern/use/unuse, package accessors, find-all-symbols), plus `gentemp` and enhanced `gensym`/`copy-symbol`/`boundp`. `defpackage`, `with-package-iterator`, and `do-*-symbols` macros were added in `init_new.lisp`, and `*package*` is wired as a special variable with dynamic updates in `let`/`setq`/`defvar`/`defparameter`. Remaining gaps: condition-system typed errors are still missing (package-error tests will still fail), and some ANSI string/array behaviors (fill pointers, displaced strings) are only partially represented.
 
 ## Task 3 - Pathnames and Filesystem API (TODO)
 - Goal: ANSI pathname objects and file operations for ASDF and file/pathname tests.

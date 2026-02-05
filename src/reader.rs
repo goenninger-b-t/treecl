@@ -1525,15 +1525,38 @@ impl<'a> Reader<'a> {
             }
 
             if let Some(pos) = s.find(':') {
-                let (pkg_name, sym_name) = if s[pos..].starts_with("::") {
-                    (&s[..pos], &s[pos + 2..])
+                let (pkg_name, sym_name, internal) = if s[pos..].starts_with("::") {
+                    (&s[..pos], &s[pos + 2..], true)
                 } else {
-                    (&s[..pos], &s[pos + 1..])
+                    (&s[..pos], &s[pos + 1..], false)
                 };
 
+                if sym_name.is_empty() {
+                    return Err(ReaderError::InvalidChar("Invalid package token".to_string()));
+                }
+
                 if let Some(pkg_id) = self.symbols.find_package(pkg_name) {
-                    let sym_id = self.symbols.intern_in(sym_name, pkg_id);
-                    return self.symbol_to_node(sym_id);
+                    if internal {
+                        let sym_id = self.symbols.intern_in(sym_name, pkg_id);
+                        return self.symbol_to_node(sym_id);
+                    }
+
+                    if let Some((sym_id, status)) =
+                        self.symbols.find_symbol_in_package(pkg_id, sym_name)
+                    {
+                        if status == crate::symbol::FindSymbolStatus::External {
+                            return self.symbol_to_node(sym_id);
+                        }
+                    }
+                    return Err(ReaderError::InvalidChar(format!(
+                        "Symbol {} not external in package {}",
+                        sym_name, pkg_name
+                    )));
+                } else {
+                    return Err(ReaderError::InvalidChar(format!(
+                        "Unknown package {}",
+                        pkg_name
+                    )));
                 }
             }
         }

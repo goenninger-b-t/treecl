@@ -34,6 +34,76 @@
       `(funcall 'in-package ,designator)
       `(funcall 'in-package ',designator)))
 
+(defmacro defpackage (name &rest options)
+  `(sys-defpackage ',name ',options))
+
+(defmacro with-package-iterator ((name package-list &rest symbol-types) &body body)
+  (let ((entries (gensym "ENTRIES"))
+        (entry (gensym "ENTRY")))
+    `(let ((,entries (sys-package-iterator-entries ,package-list ',symbol-types)))
+       (flet ((,name ()
+                (if (null ,entries)
+                    (values nil nil nil nil)
+                    (let ((,entry (car ,entries)))
+                      (setq ,entries (cdr ,entries))
+                      (values t (car ,entry) (cadr ,entry) (caddr ,entry))))))
+         ,@body))))
+
+(defmacro do-symbols ((var &optional (package '*package*) result) &body body)
+  (let ((iter (gensym "ITER"))
+        (pkg (gensym "PKG"))
+        (more (gensym "MORE"))
+        (sym (gensym "SYM"))
+        (access (gensym "ACCESS"))
+        (pp (gensym "PP")))
+    `(let ((,pkg ,package))
+       (with-package-iterator (,iter (list ,pkg) :internal :external :inherited)
+         (block nil
+           (tagbody
+            start
+              (multiple-value-bind (,more ,sym ,access ,pp) (,iter)
+                (declare (ignore ,access ,pp))
+                (unless ,more (return ,result))
+                (let ((,var ,sym))
+                  ,@body)
+                (go start))))))))
+
+(defmacro do-external-symbols ((var &optional (package '*package*) result) &body body)
+  (let ((iter (gensym "ITER"))
+        (pkg (gensym "PKG"))
+        (more (gensym "MORE"))
+        (sym (gensym "SYM"))
+        (access (gensym "ACCESS"))
+        (pp (gensym "PP")))
+    `(let ((,pkg ,package))
+       (with-package-iterator (,iter (list ,pkg) :external)
+         (block nil
+           (tagbody
+            start
+              (multiple-value-bind (,more ,sym ,access ,pp) (,iter)
+                (declare (ignore ,access ,pp))
+                (unless ,more (return ,result))
+                (let ((,var ,sym))
+                  ,@body)
+                (go start))))))))
+
+(defmacro do-all-symbols ((var &optional result) &body body)
+  (let ((iter (gensym "ITER"))
+        (more (gensym "MORE"))
+        (sym (gensym "SYM"))
+        (access (gensym "ACCESS"))
+        (pp (gensym "PP")))
+    `(with-package-iterator (,iter (list-all-packages) :internal :external :inherited)
+       (block nil
+         (tagbody
+          start
+            (multiple-value-bind (,more ,sym ,access ,pp) (,iter)
+              (declare (ignore ,access ,pp))
+              (unless ,more (return ,result))
+              (let ((,var ,sym))
+                ,@body)
+              (go start)))))))
+
 
 
 

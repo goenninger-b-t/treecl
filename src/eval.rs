@@ -4176,6 +4176,7 @@ impl<'a> Interpreter<'a> {
 
                                 // Set in Process Dictionary
                                 self.process.set_value(sym, val);
+                                self.maybe_update_current_package(sym, val);
                             }
                             result = val;
                         }
@@ -4228,6 +4229,7 @@ impl<'a> Interpreter<'a> {
     fn eval_let(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         if let Node::Fork(bindings, body) = self.process.arena.get_unchecked(args).clone() {
             let new_env = Environment::with_parent(env.clone());
+            let mut special_bindings: Vec<(SymbolId, Option<NodeId>)> = Vec::new();
 
             // Process bindings
             let mut current = bindings;
@@ -4242,7 +4244,14 @@ impl<'a> Interpreter<'a> {
                                     self.process.arena.get_unchecked(val_rest).clone()
                                 {
                                     let val = self.eval(val_node, env)?; // Note: parallel let (eval in old env)
-                                    new_env.bind(sym, val);
+                                    if self.is_special_symbol(sym) {
+                                        let old = self.process.get_value(sym);
+                                        special_bindings.push((sym, old));
+                                        self.process.set_value(sym, val);
+                                        self.maybe_update_current_package(sym, val);
+                                    } else {
+                                        new_env.bind(sym, val);
+                                    }
                                 }
                             }
                         }
@@ -4254,9 +4263,71 @@ impl<'a> Interpreter<'a> {
 
             // Evaluate body in new environment
             let (_decls, body_start) = self.parse_body(body);
-            self.eval_progn(body_start, &new_env)
+            let result = self.eval_progn(body_start, &new_env);
+
+            for (sym, old) in special_bindings {
+                match old {
+                    Some(val) => {
+                        self.process.set_value(sym, val);
+                        self.maybe_update_current_package(sym, val);
+                    }
+                    None => {
+                        self.process.unbind_value(sym);
+                    }
+                }
+            }
+
+            result
         } else {
             Ok(self.process.make_nil())
+        }
+    }
+
+    fn is_special_symbol(&self, sym: SymbolId) -> bool {
+        if sym == self.globals.package_sym {
+            return true;
+        }
+        if let Some(name) = self.globals.symbols.read().unwrap().symbol_name(sym) {
+            if name.starts_with('*') && name.ends_with('*') && name.len() > 1 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn package_id_from_node(&self, node: NodeId) -> Option<crate::symbol::PackageId> {
+        match self.process.arena.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Package(id)) => Some(crate::symbol::PackageId(*id)),
+            Node::Leaf(OpaqueValue::Symbol(id)) => self
+                .globals
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .and_then(|name| self.globals.symbols.read().unwrap().find_package(name)),
+            Node::Leaf(OpaqueValue::String(s)) => {
+                self.globals.symbols.read().unwrap().find_package(s)
+            }
+            Node::Leaf(OpaqueValue::Char(c)) => self
+                .globals
+                .symbols
+                .read()
+                .unwrap()
+                .find_package(&c.to_string()),
+            _ => None,
+        }
+    }
+
+    fn maybe_update_current_package(&mut self, sym: SymbolId, val: NodeId) {
+        if sym != self.globals.package_sym {
+            return;
+        }
+        if let Some(pkg_id) = self.package_id_from_node(val) {
+            self.globals
+                .symbols
+                .write()
+                .unwrap()
+                .set_current_package(pkg_id);
         }
     }
 
@@ -5532,6 +5603,7 @@ impl<'a> Interpreter<'a> {
                     {
                         let val = self.eval(init_node, env)?;
                         self.process.set_value(name_sym, val);
+                        self.maybe_update_current_package(name_sym, val);
                     }
                     // If no init-value, variable remains unbound but declared "special".
                     // We don't track "special" declarations strictly yet, but existing in dict (even as none?)
@@ -5553,6 +5625,7 @@ impl<'a> Interpreter<'a> {
                 {
                     let val = self.eval(init_node, env)?;
                     self.process.set_value(name_sym, val);
+                    self.maybe_update_current_package(name_sym, val);
                     return Ok(name_node);
                 } else {
                     return Err(ControlSignal::Error(

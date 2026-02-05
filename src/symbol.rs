@@ -4,6 +4,13 @@
 
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindSymbolStatus {
+    Internal,
+    External,
+    Inherited,
+}
+
 /// Unique identifier for a symbol (index into symbol table)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SymbolId(pub u32);
@@ -52,6 +59,14 @@ pub struct Package {
     external: HashMap<String, SymbolId>,
     /// List of used packages
     use_list: Vec<PackageId>,
+    /// Packages that use this package
+    used_by_list: Vec<PackageId>,
+    /// Shadowing symbols by name
+    shadowing: HashMap<String, SymbolId>,
+    /// Documentation string
+    documentation: Option<String>,
+    /// Deleted flag (name/nicknames removed from registry)
+    deleted: bool,
     // Shadowing symbols
     // Shadowing symbols - REMOVING field to avoid dead code warning for now
     // shadowing: Vec<SymbolId>,
@@ -65,8 +80,19 @@ impl Package {
             internal: HashMap::new(),
             external: HashMap::new(),
             use_list: Vec::new(),
-            // shadowing: Vec::new(),
+            used_by_list: Vec::new(),
+            shadowing: HashMap::new(),
+            documentation: None,
+            deleted: false,
         }
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted
+    }
+
+    pub fn mark_deleted(&mut self) {
+        self.deleted = true;
     }
 
     /// Add a package to the use-list
@@ -76,9 +102,49 @@ impl Package {
         }
     }
 
+    pub fn unuse_package(&mut self, pkg: PackageId) -> bool {
+        if let Some(pos) = self.use_list.iter().position(|p| *p == pkg) {
+            self.use_list.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    pub fn add_used_by(&mut self, pkg: PackageId) {
+        if !self.used_by_list.contains(&pkg) {
+            self.used_by_list.push(pkg);
+        }
+    }
+
+    pub fn remove_used_by(&mut self, pkg: PackageId) -> bool {
+        if let Some(pos) = self.used_by_list.iter().position(|p| *p == pkg) {
+            self.used_by_list.remove(pos);
+            return true;
+        }
+        false
+    }
+
+    pub fn used_by_list(&self) -> &[PackageId] {
+        &self.used_by_list
+    }
+
+    pub fn use_list(&self) -> &[PackageId] {
+        &self.use_list
+    }
+
     /// Export a symbol
     pub fn export(&mut self, name: &str, sym: SymbolId) {
         self.external.insert(name.to_string(), sym);
+        self.internal.remove(name);
+    }
+
+    /// Unexport a symbol (move to internal if present)
+    pub fn unexport(&mut self, name: &str, sym: SymbolId) -> bool {
+        if self.external.remove(name).is_some() {
+            self.internal.insert(name.to_string(), sym);
+            return true;
+        }
+        false
     }
 
     /// Find an external symbol
@@ -92,6 +158,54 @@ impl Package {
             .get(name)
             .or_else(|| self.internal.get(name))
             .copied()
+    }
+
+    pub fn insert_internal(&mut self, name: &str, sym: SymbolId) {
+        self.internal.insert(name.to_string(), sym);
+    }
+
+    pub fn remove_symbol(&mut self, name: &str) -> bool {
+        let mut removed = false;
+        if self.internal.remove(name).is_some() {
+            removed = true;
+        }
+        if self.external.remove(name).is_some() {
+            removed = true;
+        }
+        self.shadowing.remove(name);
+        removed
+    }
+
+    pub fn shadowing_symbol(&self, name: &str) -> Option<SymbolId> {
+        self.shadowing.get(name).copied()
+    }
+
+    pub fn add_shadowing(&mut self, name: &str, sym: SymbolId) {
+        self.shadowing.insert(name.to_string(), sym);
+    }
+
+    pub fn remove_shadowing(&mut self, name: &str) {
+        self.shadowing.remove(name);
+    }
+
+    pub fn shadowing_symbols(&self) -> impl Iterator<Item = SymbolId> + '_ {
+        self.shadowing.values().copied()
+    }
+
+    pub fn internal_symbols(&self) -> impl Iterator<Item = (&String, SymbolId)> + '_ {
+        self.internal.iter().map(|(k, v)| (k, *v))
+    }
+
+    pub fn external_symbols(&self) -> impl Iterator<Item = (&String, SymbolId)> + '_ {
+        self.external.iter().map(|(k, v)| (k, *v))
+    }
+
+    pub fn set_documentation(&mut self, doc: Option<String>) {
+        self.documentation = doc;
+    }
+
+    pub fn documentation(&self) -> Option<&str> {
+        self.documentation.as_deref()
     }
 }
 
@@ -124,6 +238,7 @@ impl SymbolTable {
 
         // CL-USER uses COMMON-LISP
         table.packages[2].use_package(PackageId(1));
+        table.packages[1].add_used_by(PackageId(2));
 
         // Set current package to CL-USER
         table.current_package = PackageId(2);
@@ -171,9 +286,105 @@ impl SymbolTable {
         id
     }
 
+    fn normalize_package_name(name: &str) -> String {
+        name.to_uppercase()
+    }
+
+    pub fn make_package(
+        &mut self,
+        name: &str,
+        nicknames: Vec<String>,
+        use_list: Vec<PackageId>,
+        documentation: Option<String>,
+    ) -> Result<PackageId, String> {
+        let name_norm = Self::normalize_package_name(name);
+        if self.package_names.contains_key(&name_norm) {
+            return Err(format!("Package already exists: {}", name_norm));
+        }
+
+        let mut pkg = Package::new(&name_norm);
+        pkg.set_documentation(documentation);
+
+        for nick in nicknames {
+            let nick_norm = Self::normalize_package_name(&nick);
+            if self.package_names.contains_key(&nick_norm) {
+                return Err(format!("Package nickname already exists: {}", nick_norm));
+            }
+            pkg.nicknames.push(nick_norm.clone());
+        }
+
+        let id = PackageId(self.packages.len() as u32);
+        self.package_names.insert(name_norm.clone(), id);
+        for nick in &pkg.nicknames {
+            self.package_names.insert(nick.clone(), id);
+        }
+
+        self.packages.push(pkg);
+
+        for used in use_list {
+            self.use_package(id, used)?;
+        }
+
+        Ok(id)
+    }
+
+    pub fn delete_package(&mut self, id: PackageId) -> Result<bool, String> {
+        let (name, nicknames, used, used_by) = {
+            let pkg = self
+                .packages
+                .get_mut(id.0 as usize)
+                .ok_or_else(|| "Unknown package".to_string())?;
+
+            if pkg.is_deleted() {
+                return Ok(false);
+            }
+
+            (
+                pkg.name.clone(),
+                pkg.nicknames.clone(),
+                pkg.use_list.clone(),
+                pkg.used_by_list.clone(),
+            )
+        };
+
+        let mut keys = vec![name];
+        keys.extend(nicknames);
+        for key in keys {
+            self.package_names.remove(&Self::normalize_package_name(&key));
+        }
+
+        // Remove from used-by lists in used packages
+        for used_id in used {
+            if let Some(used_pkg) = self.packages.get_mut(used_id.0 as usize) {
+                used_pkg.remove_used_by(id);
+            }
+        }
+
+        // Remove from use-lists in packages that used this package
+        for user_id in used_by {
+            if let Some(user_pkg) = self.packages.get_mut(user_id.0 as usize) {
+                user_pkg.unuse_package(id);
+            }
+        }
+
+        // Unintern home symbols by clearing their home package
+        for sym in self.symbols.iter_mut() {
+            if sym.package == Some(id) {
+                sym.package = None;
+            }
+        }
+
+        if let Some(pkg) = self.packages.get_mut(id.0 as usize) {
+            pkg.mark_deleted();
+        }
+        Ok(true)
+    }
+
     /// Find a package by name
     pub fn find_package(&self, name: &str) -> Option<PackageId> {
-        self.package_names.get(&name.to_uppercase()).copied()
+        self.package_names
+            .get(&Self::normalize_package_name(name))
+            .copied()
     }
 
     /// Get the current package
@@ -227,39 +438,46 @@ impl SymbolTable {
 
     /// Intern a symbol in a specific package
     pub fn intern_in(&mut self, name: &str, pkg_id: PackageId) -> SymbolId {
+        self.intern_in_with_status(name, pkg_id).0
+    }
+
+    pub fn intern_in_with_status(
+        &mut self,
+        name: &str,
+        pkg_id: PackageId,
+    ) -> (SymbolId, Option<FindSymbolStatus>) {
         let name = name.to_string();
 
-        // Check if already exists in package
-        if let Some(pkg) = self.packages.get(pkg_id.0 as usize) {
-            if let Some(sym) = pkg.find_symbol(&name) {
-                return sym;
-            }
-
-            // Check used packages for external symbol
-            for &used_id in &pkg.use_list.clone() {
-                if let Some(used_pkg) = self.packages.get(used_id.0 as usize) {
-                    if let Some(sym) = used_pkg.find_external(&name) {
-                        return sym;
-                    }
-                }
-            }
+        if let Some((sym, status)) = self.find_symbol_in_package(pkg_id, &name) {
+            return (sym, Some(status));
         }
 
-        // Create new symbol
         let sym_id = SymbolId(self.symbols.len() as u32);
         let symbol = Symbol::new(name.clone(), Some(pkg_id));
         self.symbols.push(symbol);
 
-        // Add to package
         if let Some(pkg) = self.packages.get_mut(pkg_id.0 as usize) {
-            // Keywords are automatically external
             if pkg_id == PackageId(0) {
-                pkg.external.insert(name, sym_id);
+                pkg.export(&name, sym_id);
             } else {
-                pkg.internal.insert(name, sym_id);
+                pkg.insert_internal(&name, sym_id);
             }
         }
 
+        (sym_id, None)
+    }
+
+    pub fn create_symbol_in_package(&mut self, name: &str, pkg_id: PackageId) -> SymbolId {
+        let sym_id = SymbolId(self.symbols.len() as u32);
+        let symbol = Symbol::new(name.to_string(), Some(pkg_id));
+        self.symbols.push(symbol);
+        if let Some(pkg) = self.get_package_mut(pkg_id) {
+            if pkg_id == PackageId(0) {
+                pkg.export(name, sym_id);
+            } else {
+                pkg.insert_internal(name, sym_id);
+            }
+        }
         sym_id
     }
 
@@ -296,6 +514,240 @@ impl SymbolTable {
                 }
             }
         }
+    }
+
+    pub fn export_in_package(
+        &mut self,
+        pkg_id: PackageId,
+        sym_id: SymbolId,
+    ) -> Result<(), String> {
+        let sym_name = self
+            .symbol_name(sym_id)
+            .ok_or_else(|| "Unknown symbol".to_string())?
+            .to_string();
+        let pkg = self
+            .get_package_mut(pkg_id)
+            .ok_or_else(|| "Unknown package".to_string())?;
+        if pkg.is_deleted() {
+            return Err("Package deleted".into());
+        }
+        pkg.export(&sym_name, sym_id);
+        Ok(())
+    }
+
+    pub fn unexport_in_package(
+        &mut self,
+        pkg_id: PackageId,
+        sym_id: SymbolId,
+    ) -> Result<bool, String> {
+        let sym_name = self
+            .symbol_name(sym_id)
+            .ok_or_else(|| "Unknown symbol".to_string())?
+            .to_string();
+        let pkg = self
+            .get_package_mut(pkg_id)
+            .ok_or_else(|| "Unknown package".to_string())?;
+        if pkg.is_deleted() {
+            return Ok(false);
+        }
+        Ok(pkg.unexport(&sym_name, sym_id))
+    }
+
+    pub fn import_into_package(
+        &mut self,
+        pkg_id: PackageId,
+        sym_id: SymbolId,
+    ) -> Result<(), String> {
+        let sym_name = self
+            .symbol_name(sym_id)
+            .ok_or_else(|| "Unknown symbol".to_string())?
+            .to_string();
+        let pkg = self
+            .get_package_mut(pkg_id)
+            .ok_or_else(|| "Unknown package".to_string())?;
+        if pkg.is_deleted() {
+            return Err("Package deleted".into());
+        }
+        pkg.insert_internal(&sym_name, sym_id);
+        Ok(())
+    }
+
+    pub fn unintern_from_package(
+        &mut self,
+        pkg_id: PackageId,
+        sym_id: SymbolId,
+    ) -> Result<bool, String> {
+        let sym_name = self
+            .symbol_name(sym_id)
+            .ok_or_else(|| "Unknown symbol".to_string())?
+            .to_string();
+        let pkg = self
+            .get_package_mut(pkg_id)
+            .ok_or_else(|| "Unknown package".to_string())?;
+        if pkg.is_deleted() {
+            return Ok(false);
+        }
+        Ok(pkg.remove_symbol(&sym_name))
+    }
+
+    pub fn add_shadowing_symbol(
+        &mut self,
+        pkg_id: PackageId,
+        sym_id: SymbolId,
+    ) -> Result<(), String> {
+        let sym_name = self
+            .symbol_name(sym_id)
+            .ok_or_else(|| "Unknown symbol".to_string())?
+            .to_string();
+        let pkg = self
+            .get_package_mut(pkg_id)
+            .ok_or_else(|| "Unknown package".to_string())?;
+        if pkg.is_deleted() {
+            return Err("Package deleted".into());
+        }
+        pkg.add_shadowing(&sym_name, sym_id);
+        Ok(())
+    }
+
+    pub fn find_symbol_in_package(
+        &self,
+        pkg_id: PackageId,
+        name: &str,
+    ) -> Option<(SymbolId, FindSymbolStatus)> {
+        let pkg = self.packages.get(pkg_id.0 as usize)?;
+        if pkg.is_deleted() {
+            return None;
+        }
+
+        if let Some(sym) = pkg.find_external(name) {
+            return Some((sym, FindSymbolStatus::External));
+        }
+        if let Some(sym) = pkg.find_symbol(name) {
+            return Some((sym, FindSymbolStatus::Internal));
+        }
+
+        for &used_id in pkg.use_list() {
+            let used_pkg = self.packages.get(used_id.0 as usize)?;
+            if used_pkg.is_deleted() {
+                continue;
+            }
+            if let Some(sym) = used_pkg.find_external(name) {
+                return Some((sym, FindSymbolStatus::Inherited));
+            }
+        }
+        None
+    }
+
+    pub fn use_package(&mut self, pkg_id: PackageId, use_pkg: PackageId) -> Result<(), String> {
+        if pkg_id == use_pkg {
+            return Ok(());
+        }
+
+        let (pkg_use_list, shadowing) = {
+            let pkg = self
+                .get_package(pkg_id)
+                .ok_or_else(|| "Unknown package".to_string())?;
+            if pkg.is_deleted() {
+                return Err("Package deleted".into());
+            }
+            (pkg.use_list().to_vec(), pkg.shadowing.clone())
+        };
+
+        if pkg_use_list.contains(&use_pkg) {
+            return Ok(());
+        }
+
+        let used_pkg = self
+            .get_package(use_pkg)
+            .ok_or_else(|| "Unknown package".to_string())?;
+        if used_pkg.is_deleted() {
+            return Err("Package deleted".into());
+        }
+
+        // Conflict check
+        for (name, sym) in used_pkg.external.iter() {
+            if shadowing.contains_key(name) {
+                continue;
+            }
+            if let Some((existing, _)) = self.find_symbol_in_package(pkg_id, name) {
+                if existing != *sym {
+                    return Err(format!("Name conflict on {}", name));
+                }
+            }
+        }
+
+        if let Some(pkg) = self.get_package_mut(pkg_id) {
+            pkg.use_package(use_pkg);
+        }
+        if let Some(used) = self.get_package_mut(use_pkg) {
+            used.add_used_by(pkg_id);
+        }
+        Ok(())
+    }
+
+    pub fn unuse_package(&mut self, pkg_id: PackageId, use_pkg: PackageId) -> Result<bool, String> {
+        let mut removed = false;
+        if let Some(pkg) = self.get_package_mut(pkg_id) {
+            removed = pkg.unuse_package(use_pkg);
+        }
+        if removed {
+            if let Some(used) = self.get_package_mut(use_pkg) {
+                used.remove_used_by(pkg_id);
+            }
+        }
+        Ok(removed)
+    }
+
+    pub fn rename_package(
+        &mut self,
+        pkg_id: PackageId,
+        new_name: &str,
+        new_nicknames: Option<Vec<String>>,
+    ) -> Result<(), String> {
+        let name_norm = Self::normalize_package_name(new_name);
+        if let Some(existing) = self.package_names.get(&name_norm) {
+            if *existing != pkg_id {
+                return Err(format!("Package name already in use: {}", name_norm));
+            }
+        }
+
+        let (old_name, old_nicknames) = {
+            let pkg = self
+                .get_package(pkg_id)
+                .ok_or_else(|| "Unknown package".to_string())?;
+            if pkg.is_deleted() {
+                return Err("Package deleted".into());
+            }
+            (pkg.name.clone(), pkg.nicknames.clone())
+        };
+
+        // Remove old name/nicknames
+        let mut keys = vec![old_name];
+        keys.extend(old_nicknames.clone());
+        for key in keys {
+            self.package_names.remove(&Self::normalize_package_name(&key));
+        }
+
+        let new_nicks_norm = if let Some(nicks) = new_nicknames {
+            nicks
+                .into_iter()
+                .map(|n| Self::normalize_package_name(&n))
+                .collect()
+        } else {
+            old_nicknames
+        };
+
+        if let Some(pkg) = self.get_package_mut(pkg_id) {
+            pkg.name = name_norm.clone();
+            pkg.nicknames = new_nicks_norm.clone();
+        }
+
+        self.package_names.insert(name_norm.clone(), pkg_id);
+        for nick in &new_nicks_norm {
+            self.package_names.insert(nick.clone(), pkg_id);
+        }
+
+        Ok(())
     }
 }
 

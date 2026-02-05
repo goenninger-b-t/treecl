@@ -148,3 +148,12 @@ Progress update (Feb 5 2026)
 - Added an `in-package` macro in `src/init_new.lisp` so the designator is not evaluated (ANSI behavior); it calls the `IN-PACKAGE` primitive via `funcall`.
 - Reader harness `tests/ansi-test/reader/load.lsp` now emits progress prints. Running it with a 300s timeout fails after `compile-and-load` with `IN-PACKAGE: unknown package` because `CL-TEST` is not created yet. This confirms Task 2 package system work is required (make-package, use-package, shadow/import/export, etc.) before running the reader suite standalone.
 - Regression: `cargo test -q` passes.
+
+Progress update (Feb 5 2026, Task 2)
+--------------------------------------------------------------------------------
+- Package system expanded in `src/symbol.rs`: packages now track use-lists, used-by lists, shadowing symbols, deletion state, and documentation; new helpers support package creation, deletion, renaming, shadowing, and symbol lookup status (:internal/:external/:inherited).
+- New package/symbol primitives added in `src/primitives.rs` for `make-package`, `delete-package`, `rename-package`, `packagep`, `find-symbol`, `find-all-symbols`, `export`/`unexport`, `import`, `shadow`/`shadowing-import`, `unintern`, `use-package`/`unuse-package`, package accessors, `gentemp`, and a `sys-package-iterator-entries` helper to drive `with-package-iterator`.
+- `gensym` now supports integer arguments and big counters (separate from `gentemp`), `copy-symbol` supports optional plist/value/function copying, and `boundp` treats `NIL`, `T`, and keywords as bound.
+- `*package*`, `*gensym-counter*`, and `*gentemp-counter*` are initialized in `Process::new`; `setq`/`defvar`/`defparameter`/`let` update `*package*` and treat `*...*` variables as special (dynamic) bindings.
+- Reader `pkg:symbol` now requires external symbols; `pkg::symbol` continues to intern internal symbols. String designators now accept character vectors with fill pointers; `make-array` preserves character vectors with fill pointers/displacement rather than collapsing to raw strings.
+- `src/init_new.lisp` now defines `defpackage`, `with-package-iterator`, `do-symbols`, `do-external-symbols`, and `do-all-symbols` macros to support ANSI package tests and ASDF bootstrapping.

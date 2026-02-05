@@ -378,6 +378,28 @@ impl Process {
         let features_list = proc.make_list(&features);
         proc.set_value(features_sym, features_list);
 
+        // *PACKAGE* tracks the current package (default CL-USER)
+        let package_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Package(
+            globals.symbols.read().unwrap().current_package().0,
+        )));
+        proc.set_value(globals.package_sym, package_node);
+
+        // *GENSYM-COUNTER* default
+        let gensym_counter_sym = intern_cl("*GENSYM-COUNTER*");
+        let gensym_counter_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Integer(0)));
+        proc.set_value(gensym_counter_sym, gensym_counter_node);
+
+        // *GENTEMP-COUNTER* internal counter (non-standard)
+        let gentemp_counter_sym = intern_cl("*GENTEMP-COUNTER*");
+        let gentemp_counter_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Integer(0)));
+        proc.set_value(gentemp_counter_sym, gentemp_counter_node);
+
         // Create T and NIL in local arena
         // We use globals to get symbols, but we create nodes locally.
         // T_SYM and NIL_SYM are in Global Symbol Table.
