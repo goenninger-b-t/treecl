@@ -8,7 +8,7 @@ use crate::process::Process;
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
 
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Environment for lexical bindings
@@ -25,16 +25,16 @@ pub struct Environment {
 impl Environment {
     pub fn new() -> Self {
         Self {
-            bindings: Arc::new(RwLock::new(HashMap::new())),
-            functions: Arc::new(RwLock::new(HashMap::new())),
+            bindings: Arc::new(RwLock::new(HashMap::default())),
+            functions: Arc::new(RwLock::new(HashMap::default())),
             parent: None,
         }
     }
 
     pub fn with_parent(parent: Environment) -> Self {
         Self {
-            bindings: Arc::new(RwLock::new(HashMap::new())),
-            functions: Arc::new(RwLock::new(HashMap::new())),
+            bindings: Arc::new(RwLock::new(HashMap::default())),
+            functions: Arc::new(RwLock::new(HashMap::default())),
             parent: Some(Box::new(parent)),
         }
     }
@@ -1221,7 +1221,7 @@ impl<'a> Interpreter<'a> {
         let body_list = self.cons_to_vec(args);
 
         // Scan for tags and build map
-        let mut tag_map = HashMap::new();
+        let mut tag_map = HashMap::default();
 
         for (i, node) in body_list.iter().enumerate() {
             let n = self.process.arena.inner.get_unchecked(*node);
@@ -2619,7 +2619,7 @@ impl<'a> Interpreter<'a> {
         args: NodeId,
         env: &mut Environment,
     ) -> Result<(), ControlSignal> {
-        let mut bindings = HashMap::new();
+        let mut bindings = HashMap::default();
         let mut shape = crate::pattern::ShapeClassifier::new();
         self.match_dlist_pattern(&pattern.pattern, args, env, &mut bindings, &mut shape)
     }
@@ -4576,7 +4576,7 @@ impl<'a> Interpreter<'a> {
     /// (go tag) transfers control to that tag.
     fn eval_tagbody(&mut self, args: NodeId, env: &Environment) -> EvalResult {
         // Collect tags and statements
-        let mut tags: HashMap<SymbolId, usize> = HashMap::new();
+        let mut tags: HashMap<SymbolId, usize> = HashMap::default();
         let mut statements: Vec<(Option<SymbolId>, NodeId)> = Vec::new();
 
         let mut current = args;

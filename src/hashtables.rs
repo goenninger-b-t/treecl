@@ -1,4 +1,83 @@
 use crate::types::NodeId;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+#[derive(Default, Debug, Clone)]
+pub struct HashCounters {
+    pub get_calls: u64,
+    pub set_calls: u64,
+    pub rem_calls: u64,
+    pub clr_calls: u64,
+    pub maphash_calls: u64,
+}
+
+static COUNTERS_ENABLED: OnceLock<bool> = OnceLock::new();
+static COUNTERS_FORCE_ENABLE: AtomicBool = AtomicBool::new(false);
+static GET_CALLS: AtomicU64 = AtomicU64::new(0);
+static SET_CALLS: AtomicU64 = AtomicU64::new(0);
+static REM_CALLS: AtomicU64 = AtomicU64::new(0);
+static CLR_CALLS: AtomicU64 = AtomicU64::new(0);
+static MAPHASH_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn counters_enabled() -> bool {
+    if COUNTERS_FORCE_ENABLE.load(Ordering::Relaxed) {
+        return true;
+    }
+    *COUNTERS_ENABLED.get_or_init(|| std::env::var("TREECL_DEBUG_COUNTERS").is_ok())
+}
+
+pub fn record_get() {
+    if counters_enabled() {
+        GET_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_set() {
+    if counters_enabled() {
+        SET_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_rem() {
+    if counters_enabled() {
+        REM_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_clr() {
+    if counters_enabled() {
+        CLR_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_maphash() {
+    if counters_enabled() {
+        MAPHASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn snapshot_counters() -> HashCounters {
+    HashCounters {
+        get_calls: GET_CALLS.load(Ordering::Relaxed),
+        set_calls: SET_CALLS.load(Ordering::Relaxed),
+        rem_calls: REM_CALLS.load(Ordering::Relaxed),
+        clr_calls: CLR_CALLS.load(Ordering::Relaxed),
+        maphash_calls: MAPHASH_CALLS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_counters() {
+    GET_CALLS.store(0, Ordering::Relaxed);
+    SET_CALLS.store(0, Ordering::Relaxed);
+    REM_CALLS.store(0, Ordering::Relaxed);
+    CLR_CALLS.store(0, Ordering::Relaxed);
+    MAPHASH_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn force_enable_counters() {
+    COUNTERS_FORCE_ENABLE.store(true, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TestMode {
@@ -316,5 +395,24 @@ mod tests {
         table.insert(list_a, value, &arena);
 
         assert_eq!(table.get(list_b, &arena, TestMode::Equal), Some(value));
+    }
+
+    #[test]
+    fn hash_counters_increment() {
+        force_enable_counters();
+        reset_counters();
+
+        record_get();
+        record_set();
+        record_rem();
+        record_clr();
+        record_maphash();
+
+        let counters = snapshot_counters();
+        assert_eq!(counters.get_calls, 1);
+        assert_eq!(counters.set_calls, 1);
+        assert_eq!(counters.rem_calls, 1);
+        assert_eq!(counters.clr_calls, 1);
+        assert_eq!(counters.maphash_calls, 1);
     }
 }

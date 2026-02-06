@@ -1,6 +1,6 @@
 use crate::arena::{Arena, Node};
 use crate::types::{NodeId, OpaqueValue};
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 pub struct EvalContext {
     pub steps: usize,
@@ -19,9 +19,9 @@ impl Default for EvalContext {
             max_steps: 10000,
             exhausted: false,
             cache_epoch: 0,
-            purity_cache: HashMap::new(),
-            whnf_cache: HashMap::new(),
-            nf_cache: HashMap::new(),
+            purity_cache: HashMap::default(),
+            whnf_cache: HashMap::default(),
+            nf_cache: HashMap::default(),
         }
     }
 }
@@ -503,7 +503,7 @@ pub enum ControlSignal {
 
 /// Frame for tagbody control construct
 pub struct TagbodyFrame {
-    pub tags: std::collections::HashMap<String, usize>,
+    pub tags: crate::fastmap::HashMap<String, usize>,
     pub statements: Vec<NodeId>,
     pub pc: usize,
 }

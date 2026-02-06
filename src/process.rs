@@ -1,7 +1,8 @@
 use crate::arena::{Arena, Node};
 use crate::search::EvalContext;
 use crate::types::{NodeId, OpaqueValue, SymbolId};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::fastmap::{HashMap, HashSet};
+use std::collections::VecDeque;
 
 /// Process ID
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -224,7 +225,7 @@ impl Process {
         let streams = crate::streams::StreamManager::new();
 
         let closures = Vec::new(); // Closures are now rooted indices
-        let dictionary = HashMap::new();
+        let dictionary = HashMap::default();
         let conditions = crate::conditions::ConditionSystem::new();
         let arrays = crate::arrays::ArrayStore::new();
         let mut readtables = crate::readtable::ReadtableStore::new();
@@ -256,9 +257,9 @@ impl Process {
             dictionary,
             streams,
             closures,
-            macros: HashMap::new(), // Initialize macros
-            functions: HashMap::new(),
-            setf_functions: HashMap::new(),
+            macros: HashMap::default(), // Initialize macros
+            functions: HashMap::default(),
+            setf_functions: HashMap::default(),
             fast_make_instance_ok: None,
             conditions,
             arrays,
@@ -266,8 +267,8 @@ impl Process {
             current_readtable,
             standard_readtable,
             hashtables,
-            links: HashSet::new(),    // Initialize links
-            monitors: HashMap::new(), // Initialize monitors
+            links: HashSet::default(),    // Initialize links
+            monitors: HashMap::default(), // Initialize monitors
             mop,
             eval_context,
             continuation_stack: Vec::new(),
@@ -445,7 +446,7 @@ impl Process {
 
     pub fn collect_garbage(&mut self) -> usize {
         let start = std::time::Instant::now();
-        let mut marked = HashSet::new();
+        let mut marked = HashSet::default();
 
         // 1. Mark Roots
         self.mark_node(self.nil_node, &mut marked);

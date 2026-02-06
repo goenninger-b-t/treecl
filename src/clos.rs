@@ -6,7 +6,7 @@ use crate::arena::{Arena, Node};
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
 use num_traits::ToPrimitive;
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 /// Unique identifier for a class
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -275,8 +275,8 @@ impl MetaObjectProtocol {
     pub fn new(symbols: &mut SymbolTable) -> Self {
         let mut mop = Self {
             classes: Vec::new(),
-            class_names: HashMap::new(),
-            class_meta_instances: HashMap::new(),
+            class_names: HashMap::default(),
+            class_meta_instances: HashMap::default(),
             t_class: ClassId(0),
             standard_object: ClassId(1),
             standard_class: ClassId(2),
@@ -290,21 +290,21 @@ impl MetaObjectProtocol {
             symbol_class: ClassId(3),
             integer_class: ClassId(4),
             generics: Vec::new(),
-            generic_names: HashMap::new(),
-            setf_generic_names: HashMap::new(),
+            generic_names: HashMap::default(),
+            setf_generic_names: HashMap::default(),
             setf_symbol: SymbolId(0),
             methods: Vec::new(),
-            generic_meta_instances: HashMap::new(),
-            method_meta_instances: HashMap::new(),
-            slot_def_meta_instances: HashMap::new(),
+            generic_meta_instances: HashMap::default(),
+            method_meta_instances: HashMap::default(),
+            slot_def_meta_instances: HashMap::default(),
             standalone_slot_defs: Vec::new(),
-            before_wrappers: HashMap::new(),
-            after_wrappers: HashMap::new(),
-            method_combinations: HashMap::new(),
+            before_wrappers: HashMap::default(),
+            after_wrappers: HashMap::default(),
+            method_combinations: HashMap::default(),
             instances: Vec::new(),
             eql_specializers: Vec::new(),
-            class_dependents: HashMap::new(),
-            generic_dependents: HashMap::new(),
+            class_dependents: HashMap::default(),
+            generic_dependents: HashMap::default(),
         };
 
         // Bootstrap the class hierarchy
@@ -745,7 +745,7 @@ impl MetaObjectProtocol {
         // 1. Collect inherited slots from supers
         // Since supers already have effective slots (if this is sequential), we can use them.
         // Handling multiple inheritance duplicates: simplistically use first found.
-        let mut seen_slots = std::collections::HashSet::new();
+        let mut seen_slots = crate::fastmap::HashSet::default();
 
         // Traverse CPL (excluding self which is first) to gather slots in precedence order?
         // Actually, for instance layout, we want supers first usually (C++ style) or specific?
@@ -803,7 +803,7 @@ impl MetaObjectProtocol {
 
         // Compute effective default initargs from CPL (general -> specific).
         let mut default_initargs: Vec<(SymbolId, NodeId)> = Vec::new();
-        let mut initarg_positions: HashMap<SymbolId, usize> = HashMap::new();
+        let mut initarg_positions: HashMap<SymbolId, usize> = HashMap::default();
         for &cid in cpl.iter().rev() {
             let pairs = if cid == id {
                 direct_default_initargs.clone()
@@ -1173,7 +1173,7 @@ impl MetaObjectProtocol {
             required_parameters,
             argument_precedence_order,
             discriminating_function: None,
-            method_cache: HashMap::new(),
+            method_cache: HashMap::default(),
             methods: Vec::new(),
             method_combination: MethodCombination::Standard,
         });
@@ -1209,7 +1209,7 @@ impl MetaObjectProtocol {
             required_parameters,
             argument_precedence_order,
             discriminating_function: None,
-            method_cache: HashMap::new(),
+            method_cache: HashMap::default(),
             methods: Vec::new(),
             method_combination: MethodCombination::Standard,
         });
@@ -1434,7 +1434,7 @@ impl MetaObjectProtocol {
 
     pub fn specializer_direct_generic_functions(&self, spec: &Specializer) -> Vec<GenericId> {
         let mut generics = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = crate::fastmap::HashSet::default();
         for method in self.methods.iter() {
             if !method.specializers.iter().any(|s| s == spec) {
                 continue;

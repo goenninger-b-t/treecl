@@ -166,7 +166,7 @@ impl ArrayStore {
     }
 
     /// For GC: Iterate over all occupied arrays
-    pub fn sweep(&mut self, marked: &std::collections::HashSet<u32>) -> usize {
+    pub fn sweep(&mut self, marked: &crate::fastmap::HashSet<u32>) -> usize {
         let mut freed_count = 0;
         for i in 0..self.arrays.len() {
             let idx = i as u32;
@@ -198,7 +198,7 @@ impl ArrayStore {
     }
 
     /// Trace nodes in a specific array (for GC)
-    pub fn trace_vector(&self, id: VectorId, marked: &mut std::collections::HashSet<u32>) {
+    pub fn trace_vector(&self, id: VectorId, marked: &mut crate::fastmap::HashSet<u32>) {
         if let Some(arr) = self.arrays.get(id.0 as usize) {
             for &node in &arr.elements {
                 marked.insert(node.0);

@@ -212,6 +212,53 @@ fn main() -> io::Result<()> {
             }
 
             if finished {
+                if std::env::var("TREECL_DEBUG_COUNTERS").is_ok() {
+                    let sym = treecl::symbol::snapshot_counters();
+                    let hash = treecl::hashtables::snapshot_counters();
+                    let pkg_ms = sym.find_package_ns as f64 / 1_000_000.0;
+                    let sym_ms = sym.find_symbol_ns as f64 / 1_000_000.0;
+                    eprintln!(
+                        "COUNTERS SUMMARY: find_package={} ({:.2}ms) find_symbol={} ({:.2}ms) intern={} gethash={} sethash={} remhash={} clrhash={} maphash={}",
+                        sym.find_package_calls,
+                        pkg_ms,
+                        sym.find_symbol_calls,
+                        sym_ms,
+                        sym.intern_calls,
+                        hash.get_calls,
+                        hash.set_calls,
+                        hash.rem_calls,
+                        hash.clr_calls,
+                        hash.maphash_calls
+                    );
+
+                    let mut loads = treecl::counters::snapshot_loads();
+                    if !loads.is_empty() {
+                        let mut total = treecl::counters::LoadCounters::default();
+                        for (_, entry) in &loads {
+                            total.add(entry);
+                        }
+                        eprintln!(
+                            "LOAD SUMMARY: files={} loads={} elapsed={:.2}ms find_symbol={} gethash={}",
+                            loads.len(),
+                            total.loads,
+                            total.elapsed_ns as f64 / 1_000_000.0,
+                            total.find_symbol_calls,
+                            total.gethash_calls
+                        );
+                        loads.sort_by(|a, b| b.1.elapsed_ns.cmp(&a.1.elapsed_ns));
+                        for (path, entry) in loads.iter().take(10) {
+                            eprintln!(
+                                "LOAD TOP: {} loads={} elapsed={:.2}ms find_symbol={} gethash={} sethash={}",
+                                path,
+                                entry.loads,
+                                entry.elapsed_ns as f64 / 1_000_000.0,
+                                entry.find_symbol_calls,
+                                entry.gethash_calls,
+                                entry.sethash_calls
+                            );
+                        }
+                    }
+                }
                 std::process::exit(exit_code);
             }
 

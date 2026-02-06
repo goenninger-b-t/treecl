@@ -5,6 +5,7 @@
 use crate::arena::{Arena, Node};
 use crate::context::PrimitiveFn;
 use crate::eval::{Closure, ControlSignal, Environment, EvalResult, Interpreter, ParsedLambdaList};
+use crate::counters::LoadCounters;
 use crate::hashtables::{HashTable, TestMode};
 use crate::process::Process;
 use crate::readtable::{ReadtableCase, ReadtableId};
@@ -16,7 +17,7 @@ use crate::clos::GenericName;
 use libc;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 fn err_helper(msg: &str) -> EvalResult {
     Err(ControlSignal::Error(msg.to_string()))
@@ -88,6 +89,60 @@ fn list_to_vec_opt(proc: &Process, list: NodeId) -> Option<Vec<NodeId>> {
         }
     }
     Some(out)
+}
+
+fn path_from_designator(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+    label: &str,
+) -> Result<String, ControlSignal> {
+    string_from_designator(proc, ctx, node)
+        .ok_or_else(|| ControlSignal::Error(format!("{}: invalid pathspec", label)))
+}
+
+fn alloc_string(proc: &mut Process, value: String) -> NodeId {
+    proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(value)))
+}
+
+fn path_is_absolute(path: &str) -> bool {
+    if std::path::Path::new(path).is_absolute() {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let s = text.as_bytes();
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    let mut star_idx: Option<usize> = None;
+    let mut match_idx = 0usize;
+
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == s[si]) {
+            pi += 1;
+            si += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_idx = Some(pi);
+            match_idx = si;
+            pi += 1;
+        } else if let Some(star) = star_idx {
+            pi = star + 1;
+            match_idx += 1;
+            si = match_idx;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+
+    pi == p.len()
 }
 
 fn string_from_designator(
@@ -216,7 +271,7 @@ pub struct Primitives {
 impl Primitives {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::new(),
+            functions: HashMap::default(),
         }
     }
 
@@ -696,9 +751,18 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("MAPC", cl, prim_mapc);
     globals.register_primitive("MAKE-PATHNAME", cl, prim_make_pathname);
     globals.register_primitive("PATHNAME-DIRECTORY", cl, prim_pathname_directory);
+    globals.register_primitive("PATHNAME-NAME", cl, prim_pathname_name);
     globals.register_primitive("PATHNAME-TYPE", cl, prim_pathname_type);
+    globals.register_primitive("PATHNAME-HOST", cl, prim_pathname_host);
+    globals.register_primitive("PATHNAME-DEVICE", cl, prim_pathname_device);
+    globals.register_primitive("PATHNAME-VERSION", cl, prim_pathname_version);
     globals.register_primitive("DIRECTORY", cl, prim_directory);
     globals.register_primitive("DELETE-FILE", cl, prim_delete_file);
+    globals.register_primitive("PROBE-FILE", cl, prim_probe_file);
+    globals.register_primitive("RENAME-FILE", cl, prim_rename_file);
+    globals.register_primitive("ENSURE-DIRECTORIES-EXIST", cl, prim_ensure_directories_exist);
+    globals.register_primitive("FILE-NAMESTRING", cl, prim_file_namestring);
+    globals.register_primitive("DIRECTORY-NAMESTRING", cl, prim_directory_namestring);
     globals.register_primitive("TRUENAME", cl, prim_truename);
     globals.register_primitive("COMPILE-FILE-PATHNAME", cl, prim_compile_file_pathname);
     globals.register_primitive("STRING-EQUAL", cl, prim_string_equal);
@@ -1432,8 +1496,18 @@ fn prim_load(
         proc.set_value(load_pn_sym, pn_node);
         proc.set_value(load_tn_sym, tn_node);
 
+        let load_start = std::time::Instant::now();
         let content = std::fs::read_to_string(path)
             .map_err(|e| ControlSignal::Error(format!("LOAD: io error: {}", e)))?;
+
+        let counters_base = if std::env::var("TREECL_DEBUG_COUNTERS_RESET").is_ok() {
+            Some((
+                crate::symbol::snapshot_counters(),
+                crate::hashtables::snapshot_counters(),
+            ))
+        } else {
+            None
+        };
 
         // Parse and Eval loop
         // We need to use Reader and Interpreter
@@ -1516,6 +1590,72 @@ fn prim_load(
         proc.next_method_states = saved_next_methods;
 
         eval_result?;
+
+        if std::env::var("TREECL_DEBUG_COUNTERS").is_ok() {
+            let sym_now = crate::symbol::snapshot_counters();
+            let hash_now = crate::hashtables::snapshot_counters();
+            let (sym, hash) = if let Some((sym_base, hash_base)) = counters_base {
+                (
+                    crate::symbol::SymbolCounters {
+                        find_package_calls: sym_now
+                            .find_package_calls
+                            .saturating_sub(sym_base.find_package_calls),
+                        find_package_ns: sym_now
+                            .find_package_ns
+                            .saturating_sub(sym_base.find_package_ns),
+                        find_symbol_calls: sym_now
+                            .find_symbol_calls
+                            .saturating_sub(sym_base.find_symbol_calls),
+                        find_symbol_ns: sym_now
+                            .find_symbol_ns
+                            .saturating_sub(sym_base.find_symbol_ns),
+                        intern_calls: sym_now.intern_calls.saturating_sub(sym_base.intern_calls),
+                    },
+                    crate::hashtables::HashCounters {
+                        get_calls: hash_now.get_calls.saturating_sub(hash_base.get_calls),
+                        set_calls: hash_now.set_calls.saturating_sub(hash_base.set_calls),
+                        rem_calls: hash_now.rem_calls.saturating_sub(hash_base.rem_calls),
+                        clr_calls: hash_now.clr_calls.saturating_sub(hash_base.clr_calls),
+                        maphash_calls: hash_now
+                            .maphash_calls
+                            .saturating_sub(hash_base.maphash_calls),
+                    },
+                )
+            } else {
+                (sym_now, hash_now)
+            };
+            let pkg_ms = sym.find_package_ns as f64 / 1_000_000.0;
+            let sym_ms = sym.find_symbol_ns as f64 / 1_000_000.0;
+            let elapsed_ns = load_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            eprintln!(
+                "LOAD COUNTERS [{}]: find_package={} ({:.2}ms) find_symbol={} ({:.2}ms) intern={} gethash={} sethash={} remhash={} clrhash={} maphash={}",
+                filename,
+                sym.find_package_calls,
+                pkg_ms,
+                sym.find_symbol_calls,
+                sym_ms,
+                sym.intern_calls,
+                hash.get_calls,
+                hash.set_calls,
+                hash.rem_calls,
+                hash.clr_calls,
+                hash.maphash_calls
+            );
+            let mut delta = LoadCounters::default();
+            delta.loads = 1;
+            delta.elapsed_ns = elapsed_ns;
+            delta.find_package_calls = sym.find_package_calls;
+            delta.find_package_ns = sym.find_package_ns;
+            delta.find_symbol_calls = sym.find_symbol_calls;
+            delta.find_symbol_ns = sym.find_symbol_ns;
+            delta.intern_calls = sym.intern_calls;
+            delta.gethash_calls = hash.get_calls;
+            delta.sethash_calls = hash.set_calls;
+            delta.remhash_calls = hash.rem_calls;
+            delta.clrhash_calls = hash.clr_calls;
+            delta.maphash_calls = hash.maphash_calls;
+            crate::counters::record_load(&full_path_str, &delta);
+        }
 
         // Restore bindings
         if let Some(v) = old_pn {
@@ -1709,70 +1849,155 @@ fn prim_make_pathname(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    // Basic parser for :name "foo" :type "lisp"
-    let mut name = String::new();
-    let mut type_ext = String::new();
+    // Minimal pathname constructor: combines :directory, :name, :type with optional :defaults.
+    let mut name: Option<String> = None;
+    let mut type_ext: Option<String> = None;
     let mut directory: Option<String> = None;
+    let mut defaults: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(args[i]) {
             if let Some(s) = ctx.symbols.read().unwrap().symbol_name(SymbolId(*id)) {
-                if s == "NAME" && i + 1 < args.len() {
-                    if let Node::Leaf(OpaqueValue::String(val)) =
-                        proc.arena.inner.get_unchecked(args[i + 1])
-                    {
-                        name = val.clone();
+                if i + 1 < args.len() {
+                    let value = args[i + 1];
+                    match s {
+                        "NAME" => {
+                            if !node_is_nil(proc, value) {
+                                name = string_from_designator(proc, ctx, value);
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        "TYPE" => {
+                            if !node_is_nil(proc, value) {
+                                type_ext = string_from_designator(proc, ctx, value);
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        "DIRECTORY" => {
+                            if node_is_nil(proc, value) {
+                                directory = None;
+                            } else if let Some(sval) = string_from_designator(proc, ctx, value) {
+                                directory = Some(sval);
+                            } else if let Some(items) = list_to_vec_opt(proc, value) {
+                                let mut iter = items.into_iter();
+                                let mut absolute = false;
+                                let mut parts: Vec<String> = Vec::new();
+                                if let Some(first) = iter.next() {
+                                    if let Some(sym) = node_to_symbol(proc, first)
+                                        .and_then(|sym| ctx.symbols.read().unwrap().symbol_name(sym).map(|s| s.to_string()))
+                                    {
+                                        if sym == "ABSOLUTE" {
+                                            absolute = true;
+                                        } else if sym == "RELATIVE" {
+                                            absolute = false;
+                                        } else if let Some(sval) = string_from_designator(proc, ctx, first) {
+                                            parts.push(sval);
+                                        }
+                                    } else if let Some(sval) = string_from_designator(proc, ctx, first) {
+                                        parts.push(sval);
+                                    }
+                                }
+                                for item in iter {
+                                    if let Some(sym) = node_to_symbol(proc, item)
+                                        .and_then(|sym| ctx.symbols.read().unwrap().symbol_name(sym).map(|s| s.to_string()))
+                                    {
+                                        if sym == "BACK" || sym == "UP" {
+                                            parts.push("..".to_string());
+                                            continue;
+                                        }
+                                        if sym == "CURRENT" {
+                                            parts.push(".".to_string());
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(sval) = string_from_designator(proc, ctx, item) {
+                                        parts.push(sval);
+                                    }
+                                }
+                                let mut buf = if absolute {
+                                    std::path::PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+                                } else {
+                                    std::path::PathBuf::new()
+                                };
+                                for part in parts {
+                                    buf.push(part);
+                                }
+                                directory = Some(buf.to_string_lossy().to_string());
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        "DEFAULTS" => {
+                            if !node_is_nil(proc, value) {
+                                defaults = string_from_designator(proc, ctx, value);
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    i += 2;
-                    continue;
-                }
-                if s == "TYPE" && i + 1 < args.len() {
-                    if let Node::Leaf(OpaqueValue::String(val)) =
-                        proc.arena.inner.get_unchecked(args[i + 1])
-                    {
-                        type_ext = val.clone();
-                    }
-                    i += 2;
-                    continue;
-                }
-                if s == "DIRECTORY" && i + 1 < args.len() {
-                    if let Node::Leaf(OpaqueValue::String(val)) =
-                        proc.arena.inner.get_unchecked(args[i + 1])
-                    {
-                        directory = Some(val.clone());
-                    }
-                    i += 2;
-                    continue;
                 }
             }
         }
         i += 1;
     }
 
-    let mut res = if !type_ext.is_empty() {
-        format!("{}.{}", name, type_ext)
-    } else {
-        name
-    };
-
-    if let Some(dir) = directory {
-        if !res.is_empty() {
-            res = std::path::Path::new(&dir)
-                .join(res)
-                .to_string_lossy()
-                .to_string();
-        } else {
-            res = dir;
+    let defaults_path = defaults.as_ref().map(std::path::Path::new);
+    if name.is_none() {
+        if let Some(p) = defaults_path {
+            if let Some(stem) = p.file_stem() {
+                name = Some(stem.to_string_lossy().to_string());
+            }
+        }
+    }
+    if type_ext.is_none() {
+        if let Some(p) = defaults_path {
+            if let Some(ext) = p.extension() {
+                type_ext = Some(ext.to_string_lossy().to_string());
+            }
+        }
+    }
+    if directory.is_none() {
+        if let Some(p) = defaults_path {
+            let dir = if p.is_dir() {
+                Some(p.to_path_buf())
+            } else {
+                p.parent().map(|d| d.to_path_buf())
+            };
+            if let Some(dir) = dir {
+                directory = Some(dir.to_string_lossy().to_string());
+            }
         }
     }
 
-    let final_res = if res.is_empty() { "dummy".to_string() } else { res };
+    let mut file = String::new();
+    if let Some(name) = name {
+        file = name;
+        if let Some(ext) = type_ext {
+            if !ext.is_empty() {
+                file.push('.');
+                file.push_str(&ext);
+            }
+        }
+    }
 
-    Ok(proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::String(final_res))))
+    let res = if let Some(dir) = directory {
+        if file.is_empty() {
+            dir
+        } else {
+            std::path::Path::new(&dir)
+                .join(file)
+                .to_string_lossy()
+                .to_string()
+        }
+    } else {
+        file
+    };
+
+    Ok(alloc_string(proc, res))
 }
 
 fn prim_pathname_directory(
@@ -1783,35 +2008,89 @@ fn prim_pathname_directory(
     if args.len() != 1 {
         return err_helper("PATHNAME-DIRECTORY requires exactly 1 argument");
     }
-    let path = string_from_designator(proc, ctx, args[0])
-        .ok_or_else(|| ControlSignal::Error("PATHNAME-DIRECTORY: invalid path".to_string()))?;
-    let dir = std::path::Path::new(&path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(String::new);
-    Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(dir))))
+    let path = path_from_designator(proc, ctx, args[0], "PATHNAME-DIRECTORY")?;
+    let path = translate_logical_path_minimal(&path);
+    let path = std::path::Path::new(&path);
+    let dir = match path.parent() {
+        Some(dir) => dir,
+        None => return Ok(proc.make_nil()),
+    };
+
+    let mut kw = |name: &str| -> NodeId {
+        let sym = ctx.symbols.write().unwrap().intern_keyword(name);
+        proc.arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(sym.0)))
+    };
+
+    let mut parts: Vec<NodeId> = Vec::new();
+    let absolute = dir.is_absolute();
+    parts.push(kw(if absolute { "ABSOLUTE" } else { "RELATIVE" }));
+
+    for comp in dir.components() {
+        let component = match comp {
+            std::path::Component::RootDir => continue,
+            std::path::Component::CurDir => ".".to_string(),
+            std::path::Component::ParentDir => "..".to_string(),
+            std::path::Component::Normal(s) => s.to_string_lossy().to_string(),
+            std::path::Component::Prefix(prefix) => prefix.as_os_str().to_string_lossy().to_string(),
+        };
+        parts.push(alloc_string(proc, component));
+    }
+
+    let mut list = proc.make_nil();
+    for node in parts.into_iter().rev() {
+        list = proc.arena.inner.alloc(Node::Fork(node, list));
+    }
+    Ok(list)
 }
 
 fn prim_merge_pathnames(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
+    ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    // Return first arg if present
-    if let Some(&arg) = args.first() {
-        Ok(arg)
-    } else {
-        Ok(proc.make_nil())
+    if args.is_empty() {
+        return Ok(proc.make_nil());
     }
+    let specified = path_from_designator(proc, ctx, args[0], "MERGE-PATHNAMES")?;
+    let mut defaults = None;
+    if args.len() > 1 {
+        defaults = Some(path_from_designator(proc, ctx, args[1], "MERGE-PATHNAMES")?);
+    } else {
+        let sym = ctx
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("*DEFAULT-PATHNAME-DEFAULTS*", PackageId(1));
+        if let Some(val) = proc.get_value(sym) {
+            defaults = string_from_designator(proc, ctx, val);
+        }
+    }
+
+    let merged = if path_is_absolute(&specified) || defaults.is_none() {
+        specified
+    } else {
+        let defaults = defaults.unwrap();
+        let base = std::path::Path::new(&defaults);
+        let dir = if base.is_dir() {
+            base.to_path_buf()
+        } else {
+            base.parent().unwrap_or(base).to_path_buf()
+        };
+        dir.join(&specified).to_string_lossy().to_string()
+    };
+    Ok(alloc_string(proc, merged))
 }
 
 fn prim_pathname(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
+    ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
-        Ok(arg)
+        let path = path_from_designator(proc, ctx, arg, "PATHNAME")?;
+        Ok(alloc_string(proc, path))
     } else {
         Ok(proc.make_nil())
     }
@@ -1819,11 +2098,29 @@ fn prim_pathname(
 
 fn prim_namestring(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
+    ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
-        Ok(arg)
+        let path = path_from_designator(proc, ctx, arg, "NAMESTRING")?;
+        Ok(alloc_string(proc, path))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_pathname_name(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("PATHNAME-NAME requires exactly 1 argument");
+    }
+    let path = path_from_designator(proc, ctx, args[0], "PATHNAME-NAME")?;
+    let path = std::path::Path::new(&path);
+    if let Some(stem) = path.file_stem() {
+        Ok(alloc_string(proc, stem.to_string_lossy().to_string()))
     } else {
         Ok(proc.make_nil())
     }
@@ -1831,16 +2128,22 @@ fn prim_namestring(
 
 fn prim_pathname_type(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
 ) -> EvalResult {
-    Ok(proc
-        .arena
-        .inner
-        .alloc(Node::Leaf(OpaqueValue::String("lsp".to_string()))))
+    if args.len() != 1 {
+        return err_helper("PATHNAME-TYPE requires exactly 1 argument");
+    }
+    let path = path_from_designator(proc, ctx, args[0], "PATHNAME-TYPE")?;
+    let path = std::path::Path::new(&path);
+    if let Some(ext) = path.extension() {
+        Ok(alloc_string(proc, ext.to_string_lossy().to_string()))
+    } else {
+        Ok(proc.make_nil())
+    }
 }
 
-fn prim_directory(
+fn prim_pathname_host(
     proc: &mut crate::process::Process,
     _ctx: &crate::context::GlobalContext,
     _args: &[NodeId],
@@ -1848,20 +2151,175 @@ fn prim_directory(
     Ok(proc.make_nil())
 }
 
+fn prim_pathname_device(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    _args: &[NodeId],
+) -> EvalResult {
+    Ok(proc.make_nil())
+}
+
+fn prim_pathname_version(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    _args: &[NodeId],
+) -> EvalResult {
+    Ok(proc.make_nil())
+}
+
+fn prim_directory(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("DIRECTORY requires exactly 1 argument");
+    }
+    let mut path = path_from_designator(proc, ctx, args[0], "DIRECTORY")?;
+    path = translate_logical_path_minimal(&path);
+
+    let has_wildcards = path.contains('*') || path.contains('?');
+    let mut entries: Vec<String> = Vec::new();
+
+    if has_wildcards {
+        let pattern_path = std::path::Path::new(&path);
+        let dir = pattern_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let pattern = pattern_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "*".to_string());
+        if let Ok(read_dir) = std::fs::read_dir(dir) {
+            for entry in read_dir.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if glob_match(&pattern, &file_name) {
+                    let full = entry.path().to_string_lossy().to_string();
+                    entries.push(full);
+                }
+            }
+        }
+    } else {
+        let path_buf = std::path::Path::new(&path);
+        match std::fs::metadata(path_buf) {
+            Ok(meta) if meta.is_dir() => {
+                if let Ok(read_dir) = std::fs::read_dir(path_buf) {
+                    for entry in read_dir.flatten() {
+                        entries.push(entry.path().to_string_lossy().to_string());
+                    }
+                }
+            }
+            Ok(_) => entries.push(path),
+            Err(_) => {}
+        }
+    }
+
+    entries.sort();
+    let mut list = proc.make_nil();
+    for entry in entries.into_iter().rev() {
+        let node = alloc_string(proc, entry);
+        list = proc.arena.inner.alloc(Node::Fork(node, list));
+    }
+    Ok(list)
+}
+
 fn prim_delete_file(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    args: &[NodeId],
 ) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("DELETE-FILE requires exactly 1 argument");
+    }
+    let mut path = path_from_designator(proc, ctx, args[0], "DELETE-FILE")?;
+    path = translate_logical_path_minimal(&path);
+    std::fs::remove_file(&path)
+        .map_err(|e| ControlSignal::Error(format!("DELETE-FILE: {}", e)))?;
     Ok(proc.make_t(ctx))
+}
+
+fn prim_probe_file(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("PROBE-FILE requires exactly 1 argument");
+    }
+    let mut path = path_from_designator(proc, ctx, args[0], "PROBE-FILE")?;
+    path = translate_logical_path_minimal(&path);
+    if std::fs::metadata(&path).is_ok() {
+        if let Ok(full) = std::fs::canonicalize(&path) {
+            return Ok(alloc_string(proc, full.to_string_lossy().to_string()));
+        }
+        return Ok(alloc_string(proc, path));
+    }
+    Ok(proc.make_nil())
 }
 
 fn prim_truename(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    args: &[NodeId],
 ) -> EvalResult {
-    Ok(proc.make_t(ctx))
+    if args.len() != 1 {
+        return err_helper("TRUENAME requires exactly 1 argument");
+    }
+    let mut path = path_from_designator(proc, ctx, args[0], "TRUENAME")?;
+    path = translate_logical_path_minimal(&path);
+    let full = std::fs::canonicalize(&path)
+        .map_err(|e| ControlSignal::Error(format!("TRUENAME: {}", e)))?;
+    Ok(alloc_string(proc, full.to_string_lossy().to_string()))
+}
+
+fn prim_rename_file(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("RENAME-FILE requires exactly 2 arguments");
+    }
+    let mut from = path_from_designator(proc, ctx, args[0], "RENAME-FILE")?;
+    let mut to = path_from_designator(proc, ctx, args[1], "RENAME-FILE")?;
+    from = translate_logical_path_minimal(&from);
+    to = translate_logical_path_minimal(&to);
+    std::fs::rename(&from, &to)
+        .map_err(|e| ControlSignal::Error(format!("RENAME-FILE: {}", e)))?;
+
+    let old_true = std::fs::canonicalize(&to)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&to))
+        .to_string_lossy()
+        .to_string();
+    let new_node = alloc_string(proc, to);
+    let old_node = alloc_string(proc, old_true.clone());
+    let new_true_node = alloc_string(proc, old_true);
+    Ok(set_multiple_values(proc, vec![new_node, old_node, new_true_node]))
+}
+
+fn prim_ensure_directories_exist(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ENSURE-DIRECTORIES-EXIST requires exactly 1 argument");
+    }
+    let mut path = path_from_designator(proc, ctx, args[0], "ENSURE-DIRECTORIES-EXIST")?;
+    path = translate_logical_path_minimal(&path);
+    let path_buf = std::path::Path::new(&path);
+    let has_trailing_sep = path.ends_with(std::path::MAIN_SEPARATOR);
+    let is_dir = path_buf.is_dir();
+    let is_file_hint = path_buf.extension().is_some() && !has_trailing_sep;
+    let dir = if has_trailing_sep || is_dir || !is_file_hint {
+        path_buf
+    } else {
+        path_buf.parent().unwrap_or(path_buf)
+    };
+    let existed = dir.exists();
+    std::fs::create_dir_all(dir)
+        .map_err(|e| ControlSignal::Error(format!("ENSURE-DIRECTORIES-EXIST: {}", e)))?;
+    let path_node = alloc_string(proc, path);
+    let created_node = if existed { proc.make_nil() } else { proc.make_t(ctx) };
+    Ok(set_multiple_values(proc, vec![path_node, created_node]))
 }
 
 fn prim_compile_file_pathname(
@@ -1873,6 +2331,45 @@ fn prim_compile_file_pathname(
         .arena
         .inner
         .alloc(Node::Leaf(OpaqueValue::String("out.fasl".to_string()))))
+}
+
+fn prim_file_namestring(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("FILE-NAMESTRING requires exactly 1 argument");
+    }
+    let path = path_from_designator(proc, ctx, args[0], "FILE-NAMESTRING")?;
+    let path = std::path::Path::new(&path);
+    if let Some(name) = path.file_name() {
+        Ok(alloc_string(proc, name.to_string_lossy().to_string()))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_directory_namestring(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("DIRECTORY-NAMESTRING requires exactly 1 argument");
+    }
+    let path = path_from_designator(proc, ctx, args[0], "DIRECTORY-NAMESTRING")?;
+    let path = std::path::Path::new(&path);
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let mut out = dir.to_string_lossy().to_string();
+    if !out.ends_with(std::path::MAIN_SEPARATOR) && !out.is_empty() {
+        out.push(std::path::MAIN_SEPARATOR);
+    }
+    Ok(alloc_string(proc, out))
 }
 
 fn prim_string(
@@ -2902,6 +3399,7 @@ fn prim_gethash(
     if args.len() < 2 {
         return err_helper("GETHASH: requires key and hash-table");
     }
+    crate::hashtables::record_get();
     let key = args[0];
     let table_node = args[1];
     let default = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
@@ -2928,6 +3426,7 @@ fn prim_set_gethash(
     if args.len() < 3 {
         return err_helper("SET-GETHASH: requires key, hash-table, value");
     }
+    crate::hashtables::record_set();
     let key = args[0];
     let table_node = args[1];
     let value = args[2];
@@ -2950,6 +3449,7 @@ fn prim_remhash(
     if args.len() < 2 {
         return err_helper("REMHASH: requires key and hash-table");
     }
+    crate::hashtables::record_rem();
     let key = args[0];
     let table_node = args[1];
 
@@ -2975,6 +3475,7 @@ fn prim_clrhash(
     if args.len() != 1 {
         return err_helper("CLRHASH: requires hash-table");
     }
+    crate::hashtables::record_clr();
     let table_node = args[0];
     let handle = node_to_hash_handle(proc, table_node)
         .ok_or_else(|| ControlSignal::Error("CLRHASH: not a hash-table".to_string()))?;
@@ -2994,6 +3495,7 @@ fn prim_maphash(
     if args.len() < 2 {
         return err_helper("MAPHASH: requires function and hash-table");
     }
+    crate::hashtables::record_maphash();
     let func = args[0];
     let table_node = args[1];
 
@@ -4617,7 +5119,7 @@ fn prim_find_all_symbols(
         .ok_or_else(|| ControlSignal::Error("FIND-ALL-SYMBOLS: name must be a string designator".into()))?;
 
     let symbols = ctx.symbols.read().unwrap();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = crate::fastmap::HashSet::default();
     let mut out = Vec::new();
     for idx in 0..symbols.package_count() {
         let pkg_id = crate::symbol::PackageId(idx as u32);
@@ -5662,7 +6164,7 @@ fn prim_sys_package_iterator_entries(
         }
 
         if want_inherited {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = crate::fastmap::HashSet::default();
             for used in pkg.use_list() {
                 let used_pkg = match symbols.get_package(*used) {
                     Some(p) if !p.is_deleted() => p,
@@ -7198,7 +7700,7 @@ pub(crate) fn prim_shared_initialize(
     // "The first value ... is used."
     // So scan.
     let mut initargs_map = if initargs.is_empty() {
-        HashMap::new()
+        HashMap::default()
     } else {
         parse_keywords_list(proc, initargs)
     };
@@ -7218,7 +7720,7 @@ pub(crate) fn prim_shared_initialize(
     let slot_names_set = if slot_names_all || slot_names_none {
         None
     } else {
-        let mut set = std::collections::HashSet::new();
+        let mut set = crate::fastmap::HashSet::default();
         for head in list_to_vec(proc, slot_names) {
             if let Some(sym) = node_to_symbol(proc, head) {
                 set.insert(sym);
@@ -8135,7 +8637,7 @@ fn slot_map_for_class(
         .mop
         .get_class(class_id)
         .ok_or_else(|| ControlSignal::Error("Class missing".into()))?;
-    let mut slot_map = HashMap::new();
+    let mut slot_map = HashMap::default();
     for slot in &class.slots {
         slot_map.insert(slot.name, slot.index);
     }
@@ -8300,7 +8802,7 @@ fn sync_class_metaobject(
             .ok_or_else(|| ControlSignal::Error("Metaclass missing".into()))?;
         sc.slots.clone()
     };
-    let mut slot_map: HashMap<SymbolId, usize> = HashMap::new();
+    let mut slot_map: HashMap<SymbolId, usize> = HashMap::default();
     for slot in &sc_slots {
         slot_map.insert(slot.name, slot.index);
     }
@@ -8626,7 +9128,7 @@ fn instance_index_from_node(
 }
 
 fn parse_keywords_list(proc: &Process, args: &[NodeId]) -> HashMap<SymbolId, NodeId> {
-    let mut keywords = HashMap::new();
+    let mut keywords = HashMap::default();
     let mut i = 0;
     while i < args.len() {
         if i + 1 >= args.len() {
@@ -8938,7 +9440,7 @@ fn update_instances_for_redefined_class(
     old_slots: &[crate::clos::SlotDefinition],
 ) {
     let unbound = proc.make_unbound();
-    let mut old_map: HashMap<SymbolId, usize> = HashMap::new();
+    let mut old_map: HashMap<SymbolId, usize> = HashMap::default();
     for slot in old_slots {
         if slot.allocation == crate::clos::SlotAllocation::Instance {
             old_map.insert(slot.name, slot.index);
@@ -9290,7 +9792,7 @@ pub(crate) fn prim_ensure_class(
     let mut direct_default_initargs: Vec<(SymbolId, NodeId)> = Vec::new();
     if let Some(k) = kw_default_initargs {
         if let Some(&defaults_node) = kwargs.get(&k) {
-            let mut seen = HashMap::new();
+            let mut seen = HashMap::default();
             let elems = list_to_vec(proc, defaults_node);
             let mut i = 0;
             while i + 1 < elems.len() {
@@ -11752,7 +12254,7 @@ fn prim_change_class(
         .map(|i| i.slots.clone())
         .unwrap_or_default();
 
-    let mut old_map: HashMap<SymbolId, NodeId> = HashMap::new();
+    let mut old_map: HashMap<SymbolId, NodeId> = HashMap::default();
     for slot in &old_class_slots {
         if slot.allocation == crate::clos::SlotAllocation::Instance {
             if let Some(val) = old_values.get(slot.index) {
@@ -14058,6 +14560,204 @@ mod tests {
                 proc.arena.inner.get_unchecked(result)
             ),
         }
+    }
+
+    #[test]
+    fn test_make_pathname_directory_name_type() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let kw_dir = globals.symbols.write().unwrap().intern_keyword("DIRECTORY");
+        let kw_name = globals.symbols.write().unwrap().intern_keyword("NAME");
+        let kw_type = globals.symbols.write().unwrap().intern_keyword("TYPE");
+
+        let dir_kw = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_dir.0)));
+        let name_kw = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_name.0)));
+        let type_kw = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_type.0)));
+
+        let dir = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("/tmp/treecl-path".to_string())));
+        let name = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("sample".to_string())));
+        let ty = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("lisp".to_string())));
+
+        let result = prim_make_pathname(&mut proc, &globals, &[dir_kw, dir, name_kw, name, type_kw, ty])
+            .unwrap();
+        let out = string_from_designator(&proc, &globals, result).unwrap();
+        assert!(out.ends_with("/tmp/treecl-path/sample.lisp"));
+    }
+
+    #[test]
+    fn test_pathname_name_type_and_namestrings() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let path = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("/tmp/treecl/sample.lisp".to_string())));
+        let name = prim_pathname_name(&mut proc, &globals, &[path]).unwrap();
+        let typ = prim_pathname_type(&mut proc, &globals, &[path]).unwrap();
+        let file_ns = prim_file_namestring(&mut proc, &globals, &[path]).unwrap();
+        let dir_ns = prim_directory_namestring(&mut proc, &globals, &[path]).unwrap();
+
+        assert_eq!(
+            string_from_designator(&proc, &globals, name).unwrap(),
+            "sample"
+        );
+        assert_eq!(
+            string_from_designator(&proc, &globals, typ).unwrap(),
+            "lisp"
+        );
+        assert_eq!(
+            string_from_designator(&proc, &globals, file_ns).unwrap(),
+            "sample.lisp"
+        );
+        let dir_out = string_from_designator(&proc, &globals, dir_ns).unwrap();
+        assert!(dir_out.ends_with("/tmp/treecl/"));
+    }
+
+    #[test]
+    fn test_merge_pathnames_with_defaults() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let defaults_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("*DEFAULT-PATHNAME-DEFAULTS*", PackageId(1));
+        let defaults = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(
+            "/tmp/treecl-defaults/base.lisp".to_string(),
+        )));
+        proc.set_value(defaults_sym, defaults);
+
+        let specified = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("child.lisp".to_string())));
+        let merged = prim_merge_pathnames(&mut proc, &globals, &[specified]).unwrap();
+        let out = string_from_designator(&proc, &globals, merged).unwrap();
+        assert!(out.ends_with("/tmp/treecl-defaults/child.lisp"));
+    }
+
+    #[test]
+    fn test_probe_file_and_directory_glob() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let base = std::env::temp_dir().join(format!("treecl-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let file_a = base.join("a.lsp");
+        let file_b = base.join("b.lsp");
+        let file_c = base.join("c.txt");
+        std::fs::write(&file_a, "a").unwrap();
+        std::fs::write(&file_b, "b").unwrap();
+        std::fs::write(&file_c, "c").unwrap();
+
+        let probe_node = alloc_string(&mut proc, file_a.to_string_lossy().to_string());
+        let probe = prim_probe_file(&mut proc, &globals, &[probe_node]).unwrap();
+        let probe_str = string_from_designator(&proc, &globals, probe).unwrap();
+        assert!(probe_str.ends_with("a.lsp"));
+
+        let pattern = base.join("*.lsp").to_string_lossy().to_string();
+        let pattern_node = alloc_string(&mut proc, pattern);
+        let list = prim_directory(&mut proc, &globals, &[pattern_node]).unwrap();
+        let items = list_to_vec_opt(&proc, list).unwrap();
+        let mut names: Vec<String> = items
+            .iter()
+            .filter_map(|node| string_from_designator(&proc, &globals, *node))
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().any(|n| n.ends_with("a.lsp")));
+        assert!(names.iter().any(|n| n.ends_with("b.lsp")));
+
+        let _ = std::fs::remove_file(&file_a);
+        let _ = std::fs::remove_file(&file_b);
+        let _ = std::fs::remove_file(&file_c);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_ensure_directories_exist_creates() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let base = std::env::temp_dir().join(format!("treecl-ensure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = base.join("nested/dir/file.txt");
+        let node = alloc_string(&mut proc, target.to_string_lossy().to_string());
+        let _ = prim_ensure_directories_exist(&mut proc, &globals, &[node]).unwrap();
+
+        assert!(proc.values.len() >= 2);
+        let created = proc.values[1];
+        match proc.arena.inner.get_unchecked(created) {
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0 => {}
+            Node::Leaf(OpaqueValue::Nil) => {}
+            other => panic!("Unexpected created flag {:?}", other),
+        }
+
+        assert!(base.join("nested/dir").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

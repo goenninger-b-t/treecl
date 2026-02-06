@@ -88,7 +88,7 @@ impl Arena {
     /// Sweep phase of GC.
     /// Reclaims all Occupied nodes whose indices are NOT in the `marked` set.
     /// Returns the number of nodes freed.
-    pub fn sweep(&mut self, marked: &std::collections::HashSet<u32>) -> usize {
+    pub fn sweep(&mut self, marked: &crate::fastmap::HashSet<u32>) -> usize {
         let mut freed_count = 0;
         for idx in 0..self.nodes.len() {
             let u_idx = idx as u32;
@@ -161,7 +161,7 @@ impl Arena {
 /// Preserves structure (DAGs) using a memoization map.
 pub fn deep_copy(src_arena: &Arena, src_root: NodeId, dest_arena: &mut Arena) -> NodeId {
     // Memoization map: Source NodeId -> Dest NodeId
-    let mut copied = std::collections::HashMap::new();
+    let mut copied = crate::fastmap::HashMap::default();
     
     // Stack for iterative traversal
     // (Source Node, Parent's Slot to update) - simplified recursive logic
@@ -179,7 +179,7 @@ fn deep_copy_recursive(
     src_arena: &Arena, 
     src_id: NodeId, 
     dest_arena: &mut Arena, 
-    copied: &mut std::collections::HashMap<NodeId, NodeId>
+    copied: &mut crate::fastmap::HashMap<NodeId, NodeId>
 ) -> NodeId {
     if let Some(&dest_id) = copied.get(&src_id) {
         return dest_id;

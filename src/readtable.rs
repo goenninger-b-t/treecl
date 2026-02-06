@@ -2,7 +2,7 @@
 //
 // Defines syntactic character types and macro dispatch tables.
 
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 use crate::reader::{Reader, ReaderResult};
 use crate::types::NodeId;
 
@@ -48,10 +48,10 @@ pub struct Readtable {
 impl Readtable {
     pub fn new() -> Self {
         let mut rt = Self {
-            syntax_types: HashMap::new(),
-            macro_functions: HashMap::new(),
-            lisp_macro_functions: HashMap::new(),
-            dispatch_tables: HashMap::new(),
+            syntax_types: HashMap::default(),
+            macro_functions: HashMap::default(),
+            lisp_macro_functions: HashMap::default(),
+            dispatch_tables: HashMap::default(),
             default_syntax: SyntaxType::Constituent,
             case_mode: ReadtableCase::Upcase,
         };
@@ -128,7 +128,9 @@ impl Readtable {
     }
 
     pub fn make_dispatch_macro_character(&mut self, c: char) {
-        self.dispatch_tables.entry(c).or_insert_with(HashMap::new);
+        self.dispatch_tables
+            .entry(c)
+            .or_insert_with(HashMap::default);
     }
 
     pub fn is_dispatch_macro_character(&self, c: char) -> bool {
@@ -141,7 +143,10 @@ impl Readtable {
         sub: char,
         func: Option<NodeId>,
     ) {
-        let table = self.dispatch_tables.entry(disp).or_insert_with(HashMap::new);
+        let table = self
+            .dispatch_tables
+            .entry(disp)
+            .or_insert_with(HashMap::default);
         if let Some(f) = func {
             table.insert(sub, f);
         } else {

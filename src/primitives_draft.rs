@@ -1,5 +1,5 @@
 fn parse_keywords_list(proc: &Process, args: &[NodeId]) -> HashMap<SymbolId, NodeId> {
-    let mut keywords = HashMap::new();
+    let mut keywords = HashMap::default();
     let mut i = 0;
     while i < args.len() {
         if i + 1 >= args.len() {

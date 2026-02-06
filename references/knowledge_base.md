@@ -272,3 +272,35 @@ Progress update (Feb 6 2026, perf profile of ANSI package/symbol load)
 
 - Ran `perf record` for 30s on `/tmp/ansi_packages_symbols.lsp` and captured a report. The hottest samples are in SipHash (`core::intrinsics::rotate_left`, `Sip13Rounds::d_rounds`, `RandomState::build_hasher`, `SipHasher13::new_with_keys`) and `hashbrown` lookups, with smaller time in `treecl::arena::Arena::get_unchecked` and a few tree-calculus helpers.
 - Interpretation: load-time work is dominated by HashMap hashing/lookup overhead (likely `SymbolTable` and env/package maps) rather than evaluator reduction. This suggests profiling/optimizing symbol and package lookup paths (and possibly switching to a faster hasher) is the next lever for reducing load timeouts.
+
+Progress update (Feb 6 2026, fast hash maps + counters)
+--------------------------------------------------------------------------------
+
+- Switched internal `HashMap`/`HashSet` usage to `rustc_hash` `FxHashMap`/`FxHashSet` via a new `src/fastmap.rs` module; updated call sites to use `HashMap::default()`/`HashSet::default()`.
+- Added symbol/package lookup counters (find-package/find-symbol/intern) and hash table counters (get/set/rem/clr/maphash) gated by `TREECL_DEBUG_COUNTERS`; `TREECL_DEBUG_COUNTERS_RESET=1` resets counters per load. `prim_load` now prints counter summaries when enabled.
+- Added unit tests for the new counters in `src/symbol.rs` and `src/hashtables.rs`.
+- Re-profiled with `perf`: SipHash hotspots are gone; the top CPU samples are now in `hashbrown` `RawTable::find/get` and SSE group matching, plus slice precondition checks. Hash lookups remain the dominant cost.
+- `cargo test -q` passes; package/symbol harness still times out at 120s.
+
+Progress update (Feb 6 2026, lookup optimization + cumulative counters)
+--------------------------------------------------------------------------------
+
+- `find_package` now avoids allocating when the designator is already uppercase by using a `Cow` for lookup; `intern_in_with_status` no longer allocates a `String` unless insertion is needed.
+- `LOAD` counters now report per-load deltas without resetting global totals; cumulative counters are printed at process exit when `TREECL_DEBUG_COUNTERS=1`.
+- A focused load run (`/tmp/ansi_packages_subset.lsp`) shows the first `gethash`/`sethash` activity during `tests/ansi-test/packages/find-symbol.lsp` (gethash 26, sethash 26). Earlier package aux files show zero hash table ops, so hash usage begins with the test definitions themselves.
+- Cumulative load summary (subset run) indicates `find-symbol.lsp` and `find-all-symbols.lsp` dominate elapsed load time (about 21.7s and 9.0s respectively), with other package files under 0.5s. This isolates the main slowdown to those two test files.
+
+Progress update (Feb 6 2026, find-symbol lookup cache)
+--------------------------------------------------------------------------------
+
+- Added a per-package `find_symbol_in_package` lookup cache with generation invalidation on package/symbol mutations (intern/export/import/unintern/use/unuse/shadow). Cached hits and misses now avoid repeated use-list scans.
+- Added regression test `test_find_symbol_cache_invalidation_after_intern` in `src/symbol.rs`.
+- Subset counters run (`TREECL_DEBUG_COUNTERS=1` on `/tmp/ansi_packages_subset.lsp`) shows improved load times: `find-symbol.lsp` ~12.9s, `find-all-symbols.lsp` ~5.6s, total ~18.8s.
+- Full package/symbol harness still times out at 120s (`timeout 120s target/debug/treecl /tmp/ansi_packages_symbols.lsp`).
+
+Progress update (Feb 6 2026, minimal pathnames + filesystem primitives)
+--------------------------------------------------------------------------------
+
+- Implemented minimal string-backed pathname and filesystem primitives: `pathname`, `namestring`, `make-pathname` (supports :defaults), `merge-pathnames`, `pathname-directory/name/type` (directory returns a keyword list), `pathname-host/device/version` (nil), `probe-file`, `truename`, `directory` (basic glob `*`/`?`), `delete-file`, `rename-file`, `ensure-directories-exist`, `file-namestring`, and `directory-namestring`.
+- Added unit tests in `src/primitives.rs` for make-pathname, pathname accessors/namestrings, merge-pathnames defaults, probe-file + directory glob, and ensure-directories-exist.
+- Tests: `cargo test -q` passes; regression harness still times out at 120s.

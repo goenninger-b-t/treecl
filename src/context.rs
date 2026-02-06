@@ -2,7 +2,7 @@ use crate::eval::{EvalResult, SpecialForms};
 use crate::process::Process;
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::NodeId;
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 /// Type for primitive functions
 /// Note: Signature changed to take Process context
@@ -58,7 +58,7 @@ impl GlobalContext {
         Self {
             symbols: RwLock::new(symbols),
             special_forms,
-            primitives: HashMap::new(),
+            primitives: HashMap::default(),
             t_sym,
             nil_sym,
             package_sym,

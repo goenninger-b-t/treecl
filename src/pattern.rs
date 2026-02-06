@@ -5,7 +5,7 @@ use crate::search::{reduce, EvalContext};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::tree_calculus;
 use crate::types::{NodeId, OpaqueValue};
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
@@ -134,7 +134,7 @@ impl<'a> PatternMatcher<'a> {
             hashtables,
             symbols,
             quote_sym,
-            bindings: HashMap::new(),
+            bindings: HashMap::default(),
             bind_stack: Vec::new(),
             shape: ShapeClassifier::new(),
         }

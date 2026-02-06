@@ -1497,13 +1497,13 @@ mod tests {
 }
 
 pub struct Copier {
-    map: std::collections::HashMap<NodeId, NodeId>,
+    map: crate::fastmap::HashMap<NodeId, NodeId>,
 }
 
 impl Copier {
     pub fn new() -> Self {
         Self {
-            map: std::collections::HashMap::with_capacity(1024),
+            map: crate::fastmap::HashMap::with_capacity(1024),
         }
     }
 

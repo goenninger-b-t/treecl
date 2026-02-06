@@ -597,7 +597,7 @@ impl<'a> BookTreeBuilder<'a> {
     }
 
     fn build(&mut self, node: NodeId) -> usize {
-        let mut active = std::collections::HashSet::new();
+        let mut active = crate::fastmap::HashSet::default();
         self.build_inner(node, 0, &mut active)
     }
 
@@ -605,7 +605,7 @@ impl<'a> BookTreeBuilder<'a> {
         &mut self,
         node: NodeId,
         depth: usize,
-        active: &mut std::collections::HashSet<NodeId>,
+        active: &mut crate::fastmap::HashSet<NodeId>,
     ) -> usize {
         if depth > self.max_depth {
             return self.new_node(Some("...".to_string()));
@@ -701,7 +701,7 @@ impl<'a> BookDotRenderer<'a> {
     }
 
     fn render(mut self, root: usize) -> String {
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = crate::fastmap::HashSet::default();
         self.emit_subtree(root, None, 0, &mut visited);
         self.output.push_str("}\n");
         self.output
@@ -712,7 +712,7 @@ impl<'a> BookDotRenderer<'a> {
         node_idx: usize,
         incoming_color: Option<&'static str>,
         depth: usize,
-        visited: &mut std::collections::HashSet<usize>,
+        visited: &mut crate::fastmap::HashSet<usize>,
     ) {
         const ROOT_COLOR: &str = "#222222";
         const PALETTE: [&str; 8] = [

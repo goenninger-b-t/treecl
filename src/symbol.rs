@@ -2,7 +2,12 @@
 //
 // Implements ANSI CL symbol/package semantics with O(1) comparison.
 
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
+use dashmap::DashMap;
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindSymbolStatus {
@@ -72,16 +77,78 @@ pub struct Package {
     // shadowing: Vec<SymbolId>,
 }
 
+#[derive(Default, Debug, Clone)]
+pub struct SymbolCounters {
+    pub find_package_calls: u64,
+    pub find_package_ns: u64,
+    pub find_symbol_calls: u64,
+    pub find_symbol_ns: u64,
+    pub intern_calls: u64,
+}
+
+#[derive(Debug)]
+struct LookupCacheBucket {
+    gen: u64,
+    map: HashMap<String, Option<(SymbolId, FindSymbolStatus)>>,
+}
+
+impl LookupCacheBucket {
+    fn new(gen: u64) -> Self {
+        Self {
+            gen,
+            map: HashMap::default(),
+        }
+    }
+}
+
+static COUNTERS_ENABLED: OnceLock<bool> = OnceLock::new();
+static COUNTERS_FORCE_ENABLE: AtomicBool = AtomicBool::new(false);
+static FIND_PACKAGE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FIND_PACKAGE_NS: AtomicU64 = AtomicU64::new(0);
+static FIND_SYMBOL_CALLS: AtomicU64 = AtomicU64::new(0);
+static FIND_SYMBOL_NS: AtomicU64 = AtomicU64::new(0);
+static INTERN_CALLS: AtomicU64 = AtomicU64::new(0);
+
+fn counters_enabled() -> bool {
+    if COUNTERS_FORCE_ENABLE.load(Ordering::Relaxed) {
+        return true;
+    }
+    *COUNTERS_ENABLED.get_or_init(|| std::env::var("TREECL_DEBUG_COUNTERS").is_ok())
+}
+
+pub fn snapshot_counters() -> SymbolCounters {
+    SymbolCounters {
+        find_package_calls: FIND_PACKAGE_CALLS.load(Ordering::Relaxed),
+        find_package_ns: FIND_PACKAGE_NS.load(Ordering::Relaxed),
+        find_symbol_calls: FIND_SYMBOL_CALLS.load(Ordering::Relaxed),
+        find_symbol_ns: FIND_SYMBOL_NS.load(Ordering::Relaxed),
+        intern_calls: INTERN_CALLS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_counters() {
+    FIND_PACKAGE_CALLS.store(0, Ordering::Relaxed);
+    FIND_PACKAGE_NS.store(0, Ordering::Relaxed);
+    FIND_SYMBOL_CALLS.store(0, Ordering::Relaxed);
+    FIND_SYMBOL_NS.store(0, Ordering::Relaxed);
+    INTERN_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn force_enable_counters() {
+    COUNTERS_FORCE_ENABLE.store(true, Ordering::Relaxed);
+}
+
 impl Package {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_uppercase(),
             nicknames: Vec::new(),
-            internal: HashMap::new(),
-            external: HashMap::new(),
+            internal: HashMap::default(),
+            external: HashMap::default(),
             use_list: Vec::new(),
             used_by_list: Vec::new(),
-            shadowing: HashMap::new(),
+            shadowing: HashMap::default(),
             documentation: None,
             deleted: false,
         }
@@ -220,6 +287,8 @@ pub struct SymbolTable {
     package_names: HashMap<String, PackageId>,
     /// Current package (*package*)
     current_package: PackageId,
+    lookup_gen: AtomicU64,
+    lookup_cache: DashMap<PackageId, LookupCacheBucket>,
 }
 
 impl SymbolTable {
@@ -227,8 +296,10 @@ impl SymbolTable {
         let mut table = Self {
             symbols: Vec::new(),
             packages: Vec::new(),
-            package_names: HashMap::new(),
+            package_names: HashMap::default(),
             current_package: PackageId(1), // CL-USER by default
+            lookup_gen: AtomicU64::new(0),
+            lookup_cache: DashMap::new(),
         };
 
         // Create standard packages
@@ -289,6 +360,62 @@ impl SymbolTable {
 
     fn normalize_package_name(name: &str) -> String {
         name.to_uppercase()
+    }
+
+    fn normalize_package_lookup(name: &str) -> Cow<'_, str> {
+        if name
+            .bytes()
+            .all(|b| !b.is_ascii_lowercase())
+        {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(name.to_ascii_uppercase())
+        }
+    }
+
+    fn lookup_gen(&self) -> u64 {
+        self.lookup_gen.load(Ordering::Relaxed)
+    }
+
+    fn bump_lookup_gen(&self) {
+        self.lookup_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lookup_cache_get(
+        &self,
+        pkg_id: PackageId,
+        name: &str,
+    ) -> Option<Option<(SymbolId, FindSymbolStatus)>> {
+        let gen = self.lookup_gen();
+        if let Some(bucket) = self.lookup_cache.get(&pkg_id) {
+            if bucket.gen == gen {
+                if let Some(value) = bucket.map.get(name) {
+                    return Some(*value);
+                }
+            }
+        }
+        None
+    }
+
+    fn lookup_cache_insert(
+        &self,
+        pkg_id: PackageId,
+        name: &str,
+        value: Option<(SymbolId, FindSymbolStatus)>,
+    ) {
+        let gen = self.lookup_gen();
+        if let Some(mut bucket) = self.lookup_cache.get_mut(&pkg_id) {
+            if bucket.gen != gen {
+                bucket.gen = gen;
+                bucket.map.clear();
+            }
+            bucket.map.insert(name.to_string(), value);
+            return;
+        }
+
+        let mut bucket = LookupCacheBucket::new(gen);
+        bucket.map.insert(name.to_string(), value);
+        self.lookup_cache.insert(pkg_id, bucket);
     }
 
     pub fn make_package(
@@ -378,14 +505,27 @@ impl SymbolTable {
         if let Some(pkg) = self.packages.get_mut(id.0 as usize) {
             pkg.mark_deleted();
         }
+        self.bump_lookup_gen();
         Ok(true)
     }
 
     /// Find a package by name
     pub fn find_package(&self, name: &str) -> Option<PackageId> {
-        self.package_names
-            .get(&Self::normalize_package_name(name))
-            .copied()
+        let enabled = counters_enabled();
+        let start = if enabled { Some(Instant::now()) } else { None };
+        if enabled {
+            FIND_PACKAGE_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let key = Self::normalize_package_lookup(name);
+        let result = self.package_names.get(key.as_ref()).copied();
+
+        if let Some(start) = start {
+            let elapsed = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            FIND_PACKAGE_NS.fetch_add(elapsed, Ordering::Relaxed);
+        }
+
+        result
     }
 
     /// Get the current package
@@ -447,12 +587,14 @@ impl SymbolTable {
         name: &str,
         pkg_id: PackageId,
     ) -> (SymbolId, Option<FindSymbolStatus>) {
-        let name = name.to_string();
-
-        if let Some((sym, status)) = self.find_symbol_in_package(pkg_id, &name) {
+        if counters_enabled() {
+            INTERN_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some((sym, status)) = self.find_symbol_in_package(pkg_id, name) {
             return (sym, Some(status));
         }
 
+        let name = name.to_string();
         let sym_id = SymbolId(self.symbols.len() as u32);
         let symbol = Symbol::new(name.clone(), Some(pkg_id));
         self.symbols.push(symbol);
@@ -463,6 +605,7 @@ impl SymbolTable {
             } else {
                 pkg.insert_internal(&name, sym_id);
             }
+            self.bump_lookup_gen();
         }
 
         (sym_id, None)
@@ -478,6 +621,7 @@ impl SymbolTable {
             } else {
                 pkg.insert_internal(name, sym_id);
             }
+            self.bump_lookup_gen();
         }
         sym_id
     }
@@ -507,13 +651,18 @@ impl SymbolTable {
 
     /// Export a symbol from its home package
     pub fn export_symbol(&mut self, id: SymbolId) {
+        let mut did_export = false;
         if let Some(sym) = self.get_symbol(id) {
             if let Some(pkg_id) = sym.package {
                 let name = sym.name.clone();
                 if let Some(pkg) = self.get_package_mut(pkg_id) {
                     pkg.export(&name, id);
+                    did_export = true;
                 }
             }
+        }
+        if did_export {
+            self.bump_lookup_gen();
         }
     }
 
@@ -533,6 +682,7 @@ impl SymbolTable {
             return Err("Package deleted".into());
         }
         pkg.export(&sym_name, sym_id);
+        self.bump_lookup_gen();
         Ok(())
     }
 
@@ -551,7 +701,11 @@ impl SymbolTable {
         if pkg.is_deleted() {
             return Ok(false);
         }
-        Ok(pkg.unexport(&sym_name, sym_id))
+        let removed = pkg.unexport(&sym_name, sym_id);
+        if removed {
+            self.bump_lookup_gen();
+        }
+        Ok(removed)
     }
 
     pub fn import_into_package(
@@ -570,6 +724,7 @@ impl SymbolTable {
             return Err("Package deleted".into());
         }
         pkg.insert_internal(&sym_name, sym_id);
+        self.bump_lookup_gen();
         Ok(())
     }
 
@@ -588,7 +743,11 @@ impl SymbolTable {
         if pkg.is_deleted() {
             return Ok(false);
         }
-        Ok(pkg.remove_symbol(&sym_name))
+        let removed = pkg.remove_symbol(&sym_name);
+        if removed {
+            self.bump_lookup_gen();
+        }
+        Ok(removed)
     }
 
     pub fn add_shadowing_symbol(
@@ -607,6 +766,7 @@ impl SymbolTable {
             return Err("Package deleted".into());
         }
         pkg.add_shadowing(&sym_name, sym_id);
+        self.bump_lookup_gen();
         Ok(())
     }
 
@@ -615,28 +775,49 @@ impl SymbolTable {
         pkg_id: PackageId,
         name: &str,
     ) -> Option<(SymbolId, FindSymbolStatus)> {
-        let pkg = self.packages.get(pkg_id.0 as usize)?;
-        if pkg.is_deleted() {
-            return None;
+        let enabled = counters_enabled();
+        let start = if enabled { Some(Instant::now()) } else { None };
+        if enabled {
+            FIND_SYMBOL_CALLS.fetch_add(1, Ordering::Relaxed);
         }
 
-        if let Some(sym) = pkg.find_external(name) {
-            return Some((sym, FindSymbolStatus::External));
+        let cached = self.lookup_cache_get(pkg_id, name);
+        let result = if let Some(cached) = cached {
+            cached
+        } else {
+            let result = if let Some(pkg) = self.packages.get(pkg_id.0 as usize) {
+                if pkg.is_deleted() {
+                    None
+                } else if let Some(sym) = pkg.find_external(name) {
+                    Some((sym, FindSymbolStatus::External))
+                } else if let Some(sym) = pkg.find_symbol(name) {
+                    Some((sym, FindSymbolStatus::Internal))
+                } else {
+                    let mut inherited = None;
+                    for &used_id in pkg.use_list() {
+                        if let Some(used_pkg) = self.packages.get(used_id.0 as usize) {
+                            if used_pkg.is_deleted() {
+                                continue;
+                            }
+                            if let Some(sym) = used_pkg.find_external(name) {
+                                inherited = Some((sym, FindSymbolStatus::Inherited));
+                                break;
+                            }
+                        }
+                    }
+                    inherited
+                }
+            } else {
+                None
+            };
+            self.lookup_cache_insert(pkg_id, name, result);
+            result
+        };
+        if let Some(start) = start {
+            let elapsed = start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            FIND_SYMBOL_NS.fetch_add(elapsed, Ordering::Relaxed);
         }
-        if let Some(sym) = pkg.find_symbol(name) {
-            return Some((sym, FindSymbolStatus::Internal));
-        }
-
-        for &used_id in pkg.use_list() {
-            let used_pkg = self.packages.get(used_id.0 as usize)?;
-            if used_pkg.is_deleted() {
-                continue;
-            }
-            if let Some(sym) = used_pkg.find_external(name) {
-                return Some((sym, FindSymbolStatus::Inherited));
-            }
-        }
-        None
+        result
     }
 
     pub fn use_package(&mut self, pkg_id: PackageId, use_pkg: PackageId) -> Result<(), String> {
@@ -683,6 +864,7 @@ impl SymbolTable {
         if let Some(used) = self.get_package_mut(use_pkg) {
             used.add_used_by(pkg_id);
         }
+        self.bump_lookup_gen();
         Ok(())
     }
 
@@ -695,6 +877,7 @@ impl SymbolTable {
             if let Some(used) = self.get_package_mut(use_pkg) {
                 used.remove_used_by(pkg_id);
             }
+            self.bump_lookup_gen();
         }
         Ok(removed)
     }
@@ -816,5 +999,35 @@ mod tests {
         // Verify via intern_in
         let foo_user_2 = table.intern_in("FOO", PackageId(2));
         assert_eq!(foo_cl, foo_user_2, "FOO via intern_in should be inherited");
+    }
+
+    #[test]
+    fn test_symbol_counters_increment() {
+        force_enable_counters();
+        reset_counters();
+
+        let mut table = SymbolTable::new();
+        let _ = table.find_package("CL");
+        let _ = table.intern_in("CAR", PackageId(1));
+        let _ = table.find_symbol_in_package(PackageId(1), "CAR");
+        let _ = table.intern("FOO");
+
+        let counters = snapshot_counters();
+        assert!(counters.find_package_calls >= 1);
+        assert!(counters.find_symbol_calls >= 1);
+        assert!(counters.intern_calls >= 1);
+    }
+
+    #[test]
+    fn test_find_symbol_cache_invalidation_after_intern() {
+        let mut table = SymbolTable::new();
+        let pkg = PackageId(2);
+
+        let miss = table.find_symbol_in_package(pkg, "CACHE-MISS-1");
+        assert!(miss.is_none());
+
+        let sym = table.intern_in("CACHE-MISS-1", pkg);
+        let found = table.find_symbol_in_package(pkg, "CACHE-MISS-1");
+        assert_eq!(found, Some((sym, FindSymbolStatus::Internal)));
     }
 }

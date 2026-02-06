@@ -3,7 +3,7 @@ use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
 use crossbeam_deque::{Injector, Stealer, Worker};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 use std::iter;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -287,7 +287,7 @@ fn match_receive_pattern(
 ) -> Option<HashMap<crate::symbol::SymbolId, NodeId>> {
     let pat = match pattern {
         Some(pat) => pat,
-        None => return Some(HashMap::new()),
+        None => return Some(HashMap::default()),
     };
 
     let bindings = crate::pattern::match_pattern(
@@ -444,7 +444,7 @@ fn handle_syscall(
                     // Delivery logic
                     let symbols = globals.symbols.read().unwrap();
                     let mut wake = false;
-                    let mut bindings = HashMap::new();
+                    let mut bindings = HashMap::default();
                     if let Status::Waiting(pat) = &target_proc.status {
                         if let Some(found) =
                             match_receive_pattern(&target_proc, *pat, copied, &symbols, globals)

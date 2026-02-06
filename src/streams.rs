@@ -100,7 +100,7 @@ pub struct StreamManager {
     streams: Vec<Option<Stream>>,
     free_list: Vec<u32>,
     /// Current column position for fresh-line (per output stream)
-    column_positions: std::collections::HashMap<u32, usize>,
+    column_positions: crate::fastmap::HashMap<u32, usize>,
 }
 
 impl Default for StreamManager {
@@ -115,7 +115,7 @@ impl StreamManager {
         let mut manager = Self {
             streams: Vec::new(),
             free_list: Vec::new(),
-            column_positions: std::collections::HashMap::new(),
+            column_positions: crate::fastmap::HashMap::default(),
         };
         
         // Allocate standard streams (IDs 0, 1, 2)

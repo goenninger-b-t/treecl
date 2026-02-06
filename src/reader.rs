@@ -9,7 +9,7 @@ use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
 use num_traits::{Signed, ToPrimitive};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 pub(crate) struct ReaderInput {
     chars: Vec<char>,
@@ -183,7 +183,7 @@ impl<'a> Reader<'a> {
                 .into_iter()
                 .map(|s| s.to_uppercase())
                 .collect(),
-            label_map: HashMap::new(),
+            label_map: HashMap::default(),
             list_depth: 0,
             skip_next_in_list: false,
             allow_unknown_packages: false,
@@ -218,7 +218,7 @@ impl<'a> Reader<'a> {
                 .into_iter()
                 .map(|s| s.to_uppercase())
                 .collect(),
-            label_map: HashMap::new(),
+            label_map: HashMap::default(),
             list_depth: 0,
             skip_next_in_list: false,
             allow_unknown_packages: false,

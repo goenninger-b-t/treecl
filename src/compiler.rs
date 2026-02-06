@@ -16,14 +16,14 @@ enum BExpr {
 impl BExpr {
     #[allow(dead_code)]
     fn occurs(&self, sym: SymbolId) -> bool {
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = crate::fastmap::HashMap::default();
         self.occurs_cached(sym, &mut cache)
     }
 
     fn occurs_cached(
         &self,
         sym: SymbolId,
-        cache: &mut std::collections::HashMap<(usize, SymbolId), bool>,
+        cache: &mut crate::fastmap::HashMap<(usize, SymbolId), bool>,
     ) -> bool {
         let key = (self as *const _ as usize, sym);
         if let Some(&res) = cache.get(&key) {
@@ -44,7 +44,7 @@ use std::sync::RwLock;
 pub struct Compiler<'a> {
     arena: &'a mut Arena,
     symbols: &'a RwLock<SymbolTable>,
-    primitives: &'a std::collections::HashMap<SymbolId, crate::context::PrimitiveFn>,
+    primitives: &'a crate::fastmap::HashMap<SymbolId, crate::context::PrimitiveFn>,
     nil_node: NodeId,
     k_node: NodeId,
     i_node: NodeId,
@@ -122,7 +122,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn abstract_var(&mut self, name: SymbolId, e: &BExpr) -> BExpr {
-        let mut occurs_cache = std::collections::HashMap::new();
+        let mut occurs_cache = crate::fastmap::HashMap::default();
         self.abstract_var_cached(name, e, &mut occurs_cache)
     }
 
@@ -130,7 +130,7 @@ impl<'a> Compiler<'a> {
         &mut self,
         name: SymbolId,
         e: &BExpr,
-        occurs_cache: &mut std::collections::HashMap<(usize, SymbolId), bool>,
+        occurs_cache: &mut crate::fastmap::HashMap<(usize, SymbolId), bool>,
     ) -> BExpr {
         if !e.occurs_cached(name, occurs_cache) {
             self.bexpr_k(e.clone())
