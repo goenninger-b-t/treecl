@@ -40,6 +40,13 @@ fn node_to_symbol(proc: &Process, node: NodeId) -> Option<SymbolId> {
     }
 }
 
+fn node_is_nil(proc: &Process, node: NodeId) -> bool {
+    matches!(
+        proc.arena.inner.get_unchecked(node),
+        Node::Leaf(OpaqueValue::Nil)
+    )
+}
+
 fn node_to_hash_handle(proc: &Process, node: NodeId) -> Option<crate::types::HashHandle> {
     if let Node::Leaf(OpaqueValue::HashHandle(id)) = proc.arena.inner.get_unchecked(node) {
         Some(crate::types::HashHandle(*id))
@@ -1349,11 +1356,15 @@ fn prim_load(
 
         // If relative with no explicit directory, try default pathname defaults or load pathname.
         if !filename.contains('/') && !filename.contains('\\') {
-            let default_sym = ctx
-                .symbols
-                .write()
-                .unwrap()
-                .intern_in("*DEFAULT-PATHNAME-DEFAULTS*", crate::symbol::PackageId(1));
+            let default_sym = {
+                let mut symbols = ctx.symbols.write().unwrap();
+                let sym = symbols.intern_in(
+                    "*DEFAULT-PATHNAME-DEFAULTS*",
+                    crate::symbol::PackageId(1),
+                );
+                symbols.export_symbol(sym);
+                sym
+            };
             if let Some(base_node) = proc.get_value(default_sym) {
                 if let Some(base_str) = string_from_designator(proc, ctx, base_node) {
                     let candidate = std::path::Path::new(&base_str).join(&filename);
@@ -1397,16 +1408,14 @@ fn prim_load(
         let full_path_str = full_path.to_string_lossy().into_owned();
 
         // Bind *LOAD-PATHNAME* and *LOAD-TRUENAME*
-        let load_pn_sym = ctx
-            .symbols
-            .write()
-            .unwrap()
-            .intern_in("*LOAD-PATHNAME*", crate::symbol::PackageId(1));
-        let load_tn_sym = ctx
-            .symbols
-            .write()
-            .unwrap()
-            .intern_in("*LOAD-TRUENAME*", crate::symbol::PackageId(1));
+        let (load_pn_sym, load_tn_sym) = {
+            let mut symbols = ctx.symbols.write().unwrap();
+            let pn = symbols.intern_in("*LOAD-PATHNAME*", crate::symbol::PackageId(1));
+            let tn = symbols.intern_in("*LOAD-TRUENAME*", crate::symbol::PackageId(1));
+            symbols.export_symbol(pn);
+            symbols.export_symbol(tn);
+            (pn, tn)
+        };
 
         let old_pn = proc.get_value(load_pn_sym);
         let old_tn = proc.get_value(load_tn_sym);
@@ -1430,53 +1439,6 @@ fn prim_load(
         // We need to use Reader and Interpreter
         let env = crate::eval::Environment::new();
 
-        let mut exprs = Vec::new();
-        // Scope for reader
-        let read_result: Result<(), ControlSignal> = {
-            let mut interpreter = Interpreter::new(proc, ctx);
-            let options = build_reader_options(&interpreter.process, ctx, false);
-            let rt_id = current_readtable_id(&interpreter.process, ctx);
-            let readtable = interpreter
-                .process
-                .readtable_by_id(rt_id)
-                .expect("readtable missing")
-                .clone();
-            let mut symbols_guard = ctx.symbols.write().unwrap();
-            // Enable read-time eval for #. while loading
-            crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
-                proc_ptr: interpreter.process as *mut _,
-                globals_ptr: ctx as *const _,
-                env_ptr: &env as *const _,
-            }));
-            let mut reader = crate::reader::Reader::new_with_options(
-                &content,
-                &mut interpreter.process.arena.inner,
-                &mut *symbols_guard,
-                &readtable,
-                Some(&mut interpreter.process.arrays),
-                options,
-            );
-
-            loop {
-                match reader.read() {
-                    Ok(expr) => exprs.push(expr),
-                    Err(crate::reader::ReaderError::UnexpectedEof) => break,
-                    Err(e) => {
-                        crate::reader::set_read_eval_context(None);
-                        let pos = reader.position();
-                        return Err(ControlSignal::Error(format!(
-                            "LOAD: read error at byte {}: {}",
-                            pos, e
-                        )));
-                    }
-                }
-            }
-            Ok(())
-        };
-        crate::reader::set_read_eval_context(None);
-        read_result?;
-        crate::reader::set_read_eval_context(None);
-
         // Preserve caller state so LOAD doesn't clobber it.
         let saved_program = proc.program;
         let saved_mode = proc.execution_mode.clone();
@@ -1486,17 +1448,59 @@ fn prim_load(
         let saved_next_methods = std::mem::take(&mut proc.next_method_states);
 
         let eval_result = (|| {
-            let mut interpreter = Interpreter::new(proc, ctx);
-            for expr in exprs {
+            let mut input = crate::reader::ReaderInput::new(&content);
+            // Enable read-time eval for #. while loading
+            crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
+                proc_ptr: proc as *mut _,
+                globals_ptr: ctx as *const _,
+                env_ptr: &env as *const _,
+            }));
+
+            loop {
+                let options = build_reader_options(proc, ctx, false);
+                let rt_id = current_readtable_id(proc, ctx);
+                let readtable = proc
+                    .readtable_by_id(rt_id)
+                    .expect("readtable missing")
+                    .clone();
+                let mut symbols_guard = ctx.symbols.write().unwrap();
+                let mut reader = crate::reader::Reader::new_with_options_from_input(
+                    input,
+                    &mut proc.arena.inner,
+                    &mut *symbols_guard,
+                    &readtable,
+                    Some(&mut proc.arrays),
+                    options,
+                );
+
+                let read_result = reader.read();
+                let pos = reader.position();
+                input = reader.into_input();
+                drop(symbols_guard);
+
+                let expr = match read_result {
+                    Ok(expr) => expr,
+                    Err(crate::reader::ReaderError::UnexpectedEof) => break,
+                    Err(e) => {
+                        return Err(ControlSignal::Error(format!(
+                            "LOAD: read error at byte {}: {}",
+                            pos, e
+                        )));
+                    }
+                };
+
+                let mut interpreter = Interpreter::new(proc, ctx);
                 if std::env::var("TREECL_DEBUG_LOAD").is_ok() {
                     let symbols = ctx.symbols.read().unwrap();
-                    let printed = crate::printer::print_to_string(&interpreter.process.arena.inner, &symbols, expr);
+                    let printed =
+                        crate::printer::print_to_string(&interpreter.process.arena.inner, &symbols, expr);
                     eprintln!("LOAD DEBUG: {}", printed);
                 }
                 interpreter.eval(expr, &env)?;
             }
             Ok::<(), ControlSignal>(())
         })();
+        crate::reader::set_read_eval_context(None);
 
         proc.program = saved_program;
         proc.execution_mode = saved_mode;
@@ -4170,6 +4174,155 @@ fn prim_symbol_value(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AssocOptions {
+    test: Option<NodeId>,
+    test_not: Option<NodeId>,
+    key: Option<NodeId>,
+}
+
+fn parse_assoc_kwargs(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+    name: &str,
+) -> Result<AssocOptions, ControlSignal> {
+    let mut options = AssocOptions {
+        test: None,
+        test_not: None,
+        key: None,
+    };
+
+    if args.is_empty() {
+        return Ok(options);
+    }
+
+    if args.len() % 2 != 0 {
+        return Err(ControlSignal::Error(format!(
+            "{name}: odd number of keyword arguments"
+        )));
+    }
+
+    let syms = ctx.symbols.read().unwrap();
+    let keyword_pkg = syms.get_package(PackageId(0));
+    let kw_test = keyword_pkg.and_then(|p| p.find_external("TEST"));
+    let kw_test_not = keyword_pkg.and_then(|p| p.find_external("TEST-NOT"));
+    let kw_key = keyword_pkg.and_then(|p| p.find_external("KEY"));
+    let kw_allow_other_keys = keyword_pkg.and_then(|p| p.find_external("ALLOW-OTHER-KEYS"));
+
+    let mut allow_other_keys = false;
+    let mut unknown = false;
+
+    for pair in args.chunks(2) {
+        let key_node = pair[0];
+        let val_node = pair[1];
+        let key_sym = node_to_symbol(proc, key_node).ok_or_else(|| {
+            ControlSignal::Error(format!("{name}: keyword must be a symbol"))
+        })?;
+
+        if Some(key_sym) == kw_test {
+            if options.test.is_none() {
+                options.test = Some(val_node);
+            }
+            continue;
+        }
+        if Some(key_sym) == kw_test_not {
+            if options.test_not.is_none() {
+                options.test_not = Some(val_node);
+            }
+            continue;
+        }
+        if Some(key_sym) == kw_key {
+            if options.key.is_none() {
+                options.key = Some(val_node);
+            }
+            continue;
+        }
+        if Some(key_sym) == kw_allow_other_keys {
+            if !allow_other_keys {
+                allow_other_keys = !node_is_nil(proc, val_node);
+            }
+            continue;
+        }
+
+        unknown = true;
+    }
+
+    if unknown && !allow_other_keys {
+        return Err(ControlSignal::Error(format!(
+            "{name}: invalid keyword argument"
+        )));
+    }
+
+    if options.test.is_some() && options.test_not.is_some() {
+        return Err(ControlSignal::Error(format!(
+            "{name}: cannot supply both :test and :test-not"
+        )));
+    }
+
+    Ok(options)
+}
+
+fn assoc_search(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    item: NodeId,
+    list: NodeId,
+    options: AssocOptions,
+    use_cdr: bool,
+    name: &str,
+) -> EvalResult {
+    let mut cur = list;
+
+    loop {
+        match proc.arena.inner.get_unchecked(cur) {
+            Node::Leaf(OpaqueValue::Nil) => return Ok(proc.make_nil()),
+            Node::Fork(car, cdr) => {
+                let entry = *car;
+                cur = *cdr;
+                match proc.arena.inner.get_unchecked(entry) {
+                    Node::Leaf(OpaqueValue::Nil) => continue,
+                    Node::Fork(pair_car, pair_cdr) => {
+                        let value = if use_cdr { *pair_cdr } else { *pair_car };
+                        let key_val = match options.key {
+                            Some(k) if !node_is_nil(proc, k) => {
+                                call_function_node(proc, ctx, k, &[value])?
+                            }
+                            _ => value,
+                        };
+
+                        let matched = if let Some(test_fn) = options.test {
+                            let res = call_function_node(proc, ctx, test_fn, &[item, key_val])?;
+                            !node_is_nil(proc, res)
+                        } else if let Some(test_not_fn) = options.test_not {
+                            let res =
+                                call_function_node(proc, ctx, test_not_fn, &[item, key_val])?;
+                            node_is_nil(proc, res)
+                        } else {
+                            let res = prim_eql(proc, ctx, &[item, key_val])?;
+                            !node_is_nil(proc, res)
+                        };
+
+                        if matched {
+                            return Ok(entry);
+                        }
+                    }
+                    _ => {
+                        return Err(ControlSignal::Error(format!(
+                            "{name}: list element is not a cons"
+                        )))
+                    }
+                }
+            }
+            _ => {
+                return Err(ControlSignal::Error(format!(
+                    "{name}: requires a proper list"
+                )))
+            }
+        }
+    }
+}
+
 fn prim_assoc(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
@@ -4179,21 +4332,9 @@ fn prim_assoc(
         return err_helper("ASSOC: requires item and list");
     }
     let item = args[0];
-    let mut list = args[1];
-
-    while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(list).clone() {
-        if let Node::Fork(pair_car, _) = proc.arena.inner.get_unchecked(car).clone() {
-            let eq = prim_eql(proc, ctx, &[item, pair_car])?;
-            if let Node::Leaf(OpaqueValue::Nil) = proc.arena.inner.get_unchecked(eq) {
-                // continue
-            } else {
-                return Ok(car);
-            }
-        }
-        list = cdr;
-    }
-
-    Ok(proc.make_nil())
+    let list = args[1];
+    let options = parse_assoc_kwargs(proc, ctx, &args[2..], "ASSOC")?;
+    assoc_search(proc, ctx, item, list, options, false, "ASSOC")
 }
 
 fn prim_rassoc(
@@ -4205,21 +4346,9 @@ fn prim_rassoc(
         return err_helper("RASSOC: requires item and list");
     }
     let item = args[0];
-    let mut list = args[1];
-
-    while let Node::Fork(car, cdr) = proc.arena.inner.get_unchecked(list).clone() {
-        if let Node::Fork(_, pair_cdr) = proc.arena.inner.get_unchecked(car).clone() {
-            let eq = prim_eql(proc, ctx, &[item, pair_cdr])?;
-            if let Node::Leaf(OpaqueValue::Nil) = proc.arena.inner.get_unchecked(eq) {
-                // continue
-            } else {
-                return Ok(car);
-            }
-        }
-        list = cdr;
-    }
-
-    Ok(proc.make_nil())
+    let list = args[1];
+    let options = parse_assoc_kwargs(proc, ctx, &args[2..], "RASSOC")?;
+    assoc_search(proc, ctx, item, list, options, true, "RASSOC")
 }
 
 fn bigint_to_node(proc: &mut crate::process::Process, val: &BigInt) -> NodeId {
@@ -5289,30 +5418,6 @@ fn prim_sys_defpackage(
         pkg.set_documentation(documentation);
     }
 
-    // Reset use-list if specified
-    if let Some(use_pkgs) = use_specs {
-        let current_use = ctx
-            .symbols
-            .read()
-            .unwrap()
-            .get_package(pkg_id)
-            .map(|p| p.use_list().to_vec())
-            .unwrap_or_default();
-        for used in current_use {
-            let _ = ctx.symbols.write().unwrap().unuse_package(pkg_id, used);
-        }
-        for used in use_pkgs {
-            ctx.symbols
-                .write()
-                .unwrap()
-                .use_package(pkg_id, used)
-                .map_err(ControlSignal::Error)?;
-        }
-    }
-    if debug {
-        eprintln!("DEFPACKAGE use list set: {}", name);
-    }
-
     // Shadow
     if !shadow.is_empty() {
         for name in shadow {
@@ -5379,6 +5484,30 @@ fn prim_sys_defpackage(
     }
     if debug {
         eprintln!("DEFPACKAGE shadowing-import done: {}", name);
+    }
+
+    // Reset use-list if specified (after shadow/shadowing-import to avoid conflicts)
+    if let Some(use_pkgs) = use_specs {
+        let current_use = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .get_package(pkg_id)
+            .map(|p| p.use_list().to_vec())
+            .unwrap_or_default();
+        for used in current_use {
+            let _ = ctx.symbols.write().unwrap().unuse_package(pkg_id, used);
+        }
+        for used in use_pkgs {
+            ctx.symbols
+                .write()
+                .unwrap()
+                .use_package(pkg_id, used)
+                .map_err(ControlSignal::Error)?;
+        }
+    }
+    if debug {
+        eprintln!("DEFPACKAGE use list set: {}", name);
     }
 
     // Import-from
@@ -13371,6 +13500,7 @@ fn prim_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reader::read_from_string;
 
     #[test]
     fn test_add() {
@@ -13440,6 +13570,56 @@ mod tests {
             Node::Leaf(OpaqueValue::Integer(3)) => {}
             _ => panic!("Expected length 3"),
         }
+    }
+
+    #[test]
+    fn test_defpackage_shadowing_import_before_use() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let name1 = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("DS1-ORDER-TEST".to_string())));
+        let opts1 = read_from_string(
+            "((:use) (:export \"A\"))",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        prim_sys_defpackage(&mut proc, &globals, &[name1, opts1]).unwrap();
+
+        let name2 = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("DS2-ORDER-TEST".to_string())));
+        let opts2 = read_from_string(
+            "((:use) (:export \"A\"))",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        prim_sys_defpackage(&mut proc, &globals, &[name2, opts2]).unwrap();
+
+        let name3 = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("DS3-ORDER-TEST".to_string())));
+        let opts3 = read_from_string(
+            "((:shadowing-import-from \"DS1-ORDER-TEST\" \"A\") (:use \"DS1-ORDER-TEST\" \"DS2-ORDER-TEST\"))",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        prim_sys_defpackage(&mut proc, &globals, &[name3, opts3]).unwrap();
     }
 
     // === Extensive Arithmetic Tests ===

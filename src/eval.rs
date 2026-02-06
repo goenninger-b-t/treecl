@@ -1582,7 +1582,7 @@ impl<'a> Interpreter<'a> {
     }
 
     fn step_let(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
-        self.process.current_env = Some(env);
+        self.process.current_env = Some(env.clone());
         // (let bindings &rest body)
         // Expand to ((lambda (vars...) body...) vals...)
         let args_vec = self.cons_to_vec(args);
@@ -1628,6 +1628,24 @@ impl<'a> Interpreter<'a> {
             } else {
                 break;
             }
+        }
+
+        // If any binding is special, fall back to the full let evaluator so
+        // dynamic bindings (e.g. *package*) are handled correctly.
+        let mut has_special = false;
+        for var_node in &vars {
+            if let Some(sym) = self.node_to_symbol(*var_node) {
+                if self.is_special_symbol(sym) {
+                    has_special = true;
+                    break;
+                }
+            }
+        }
+        if has_special {
+            let result = self.eval_let(args, &env)?;
+            self.process.program = result;
+            self.process.execution_mode = crate::process::ExecutionMode::Return;
+            return Ok(true);
         }
 
         // Construct Body (progn ...)
@@ -2426,17 +2444,23 @@ impl<'a> Interpreter<'a> {
                 }
                 self.process.closures[idx].clone()
             } else {
-                // Fallthrough to error
-                // Debug node type
-                let node = self.process.arena.get_unchecked(effective_func_node);
-                let printed = {
-                    let symbols = self.globals.symbols.read().unwrap();
-                    crate::printer::print_to_string(&self.process.arena.inner, &symbols, effective_func_node)
-                };
-                return Err(ControlSignal::Error(format!(
-                    "TCO Apply not fully implemented for {:?} (Node ID: {:?} - {:?}) form={}",
-                    effective_func_node, effective_func_node, node, printed
-                )));
+                // Fall back to tree calculus reduction for non-closure function objects.
+                use crate::search::reduce;
+
+                let mut result = effective_func_node;
+                for arg in &args {
+                    let app = self.process.arena.alloc(Node::Fork(result, *arg));
+                    result = reduce(
+                        &mut self.process.arena.inner,
+                        app,
+                        &mut self.process.eval_context,
+                    );
+                }
+
+                let reduced = self.try_reduce_primitive(result, &env);
+                self.process.program = reduced;
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                return Ok(true);
             }
         };
 
@@ -4323,15 +4347,36 @@ impl<'a> Interpreter<'a> {
     }
 
     fn maybe_update_current_package(&mut self, sym: SymbolId, val: NodeId) {
-        if sym != self.globals.package_sym {
+        let is_package_sym = sym == self.globals.package_sym;
+        let is_named_package = !is_package_sym
+            && self
+                .globals
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .map(|name| name == "*PACKAGE*")
+                .unwrap_or(false);
+
+        if !is_package_sym && !is_named_package {
             return;
         }
+
         if let Some(pkg_id) = self.package_id_from_node(val) {
             self.globals
                 .symbols
                 .write()
                 .unwrap()
                 .set_current_package(pkg_id);
+
+            if !is_package_sym {
+                let pkg_node = self
+                    .process
+                    .arena
+                    .inner
+                    .alloc(Node::Leaf(OpaqueValue::Package(pkg_id.0)));
+                self.process.set_value(self.globals.package_sym, pkg_node);
+            }
         }
     }
 
@@ -5930,9 +5975,13 @@ mod tests {
     use super::*;
     use crate::process::Pid;
     use crate::reader::read_from_string;
+    use crate::reader::Reader;
+    use crate::reader::ReaderError;
+    use crate::tree_calculus;
 
     fn setup_env() -> (Process, GlobalContext) {
         let mut globals = GlobalContext::new();
+        crate::primitives::register_primitives(&mut globals);
         // Register primitives if needed, but for special forms handled in eval, maybe not strictly required
         // unless compiled code uses them.
         let proc = Process::new(
@@ -5945,6 +5994,74 @@ mod tests {
             &mut globals,
         );
         (proc, globals)
+    }
+
+    fn load_init_lisp(proc: &mut Process, globals: &GlobalContext) {
+        let init_src = include_str!("init_new.lisp");
+        globals
+            .symbols
+            .write()
+            .unwrap()
+            .set_current_package(PackageId(1));
+
+        let mut exprs = Vec::new();
+        {
+            let readtable = proc.current_readtable().clone();
+            let mut symbols_guard = globals.symbols.write().unwrap();
+            let mut reader = Reader::new(
+                init_src,
+                &mut proc.arena.inner,
+                &mut *symbols_guard,
+                &readtable,
+                Some(&mut proc.arrays),
+            );
+            loop {
+                match reader.read() {
+                    Ok(expr) => exprs.push(expr),
+                    Err(ReaderError::UnexpectedEof) => break,
+                    Err(e) => panic!("init_new.lisp read error: {:?}", e),
+                }
+            }
+        }
+
+        let mut interpreter = Interpreter::new(proc, globals);
+        let env = Environment::new();
+        for expr in exprs {
+            interpreter.eval(expr, &env).unwrap();
+        }
+
+        globals
+            .symbols
+            .write()
+            .unwrap()
+            .set_current_package(PackageId(2));
+        let pkg_node = interpreter
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Package(2)));
+        interpreter
+            .process
+            .set_value(globals.package_sym, pkg_node);
+    }
+
+    fn list_to_ints(proc: &Process, list: NodeId) -> Vec<i64> {
+        let mut out = Vec::new();
+        let mut cur = list;
+        loop {
+            match proc.arena.inner.get_unchecked(cur) {
+                Node::Fork(car, cdr) => {
+                    match proc.arena.inner.get_unchecked(*car) {
+                        Node::Leaf(OpaqueValue::Integer(n)) => out.push(*n),
+                        other => panic!("Expected integer list item, got {:?}", other),
+                    }
+                    cur = *cdr;
+                }
+                Node::Leaf(OpaqueValue::Nil) => break,
+                other => panic!("Expected list, got {:?}", other),
+            }
+        }
+        out
     }
 
     #[test]
@@ -6010,6 +6127,164 @@ mod tests {
         let result = interpreter.eval(expr, &env);
         // Should succeed (returns 1)
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_special_package_symbol_updates_current_package() {
+        let (mut proc, globals) = setup_env();
+
+        let reg_pkg = globals
+            .symbols
+            .write()
+            .unwrap()
+            .make_package("REGRESSION-TEST", Vec::new(), vec![PackageId(1)], None)
+            .expect("failed to make REGRESSION-TEST package");
+
+        let reg_pkg_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .create_symbol_in_package("*PACKAGE*", reg_pkg);
+
+        let pkg_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Package(reg_pkg.0)));
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        interpreter.maybe_update_current_package(reg_pkg_sym, pkg_node);
+
+        let current_pkg = globals.symbols.read().unwrap().current_package();
+        assert_eq!(current_pkg, reg_pkg);
+
+        let cl_pkg_val = proc.get_value(globals.package_sym).expect("missing *PACKAGE*");
+        match proc.arena.inner.get_unchecked(cl_pkg_val) {
+            Node::Leaf(OpaqueValue::Package(id)) => assert_eq!(*id, reg_pkg.0),
+            other => panic!("Expected package node, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_let_special_binding_updates_dynamic_value() {
+        let (mut proc, globals) = setup_env();
+
+        let expr = read_from_string(
+            "(progn (setq *foo* 1) (let ((*foo* 2)) (symbol-value '*foo*)))",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+
+        let expr2 = read_from_string(
+            "(symbol-value '*foo*)",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+        let result = interpreter.eval(expr, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Integer(2)) => {}
+            other => panic!("Expected 2 from special binding, got {:?}", other),
+        }
+
+        let result2 = interpreter.eval(expr2, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result2) {
+            Node::Leaf(OpaqueValue::Integer(1)) => {}
+            other => panic!("Expected 1 after binding restore, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_loop_macro_subset() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(loop for i from 0 below 3 collect i)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result), vec![0, 1, 2]);
+
+        let expr2 = read_from_string(
+            "(loop for x in '(1 2 1) count (= x 1))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result2 = interpreter.eval(expr2, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result2) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 2),
+            other => panic!("Expected count integer, got {:?}", other),
+        }
+
+        let expr3 = read_from_string(
+            "(loop repeat 3 collect 7)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result3 = interpreter.eval(expr3, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result3), vec![7, 7, 7]);
+
+        let expr4 = read_from_string(
+            "(loop for x in '(nil nil 5) thereis x)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result4 = interpreter.eval(expr4, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result4) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 5),
+            other => panic!("Expected thereis result 5, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_defstruct_copier() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(progn (defstruct foo a b) (let* ((x (make-foo :a 1 :b 2)) (y (copy-foo x))) (list (foo-a y) (foo-b y))))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_step_apply_tree_calculus_fallback() {
+        let (mut proc, globals) = setup_env();
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+
+        // Apply K combinator to two delta arguments; result should be a delta (nil).
+        let k_node = tree_calculus::k(&mut interpreter.process.arena.inner);
+        let arg1 = tree_calculus::delta(&mut interpreter.process.arena.inner);
+        let arg2 = tree_calculus::delta(&mut interpreter.process.arena.inner);
+
+        let env = Environment::new();
+        let res = interpreter.step_apply(k_node, vec![arg1, arg2], env);
+        assert!(res.is_ok());
+
+        let result_node = interpreter.process.program;
+        match interpreter.process.arena.inner.get_unchecked(result_node) {
+            Node::Leaf(OpaqueValue::Nil) => {}
+            other => panic!("Expected nil from tree calculus fallback, got {:?}", other),
+        }
     }
 
     #[test]

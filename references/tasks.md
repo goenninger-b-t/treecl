@@ -72,6 +72,7 @@ Report: Status DONE. Validity: `cargo check -q` passes. Implementation quality: 
 - Missing features: `cond`, `case`, `ecase`, `ccase`, `typecase`, `etypecase`, `progn` variants, `prog`/`prog*`, `do`/`do*`, full `loop` macro, `return`, `return-from` edge cases, `prog1`/`prog2` correctness. Note: `multiple-value-prog1` now implemented.
 - Files: `src/eval.rs`, `src/init.lisp`.
 - Tests: `tests/ansi-test/data-and-control-flow`, `tests/ansi-test/iteration`.
+Report: Status TODO. Implemented a minimal `loop` macro in `src/init_new.lisp` without relying on `labels`, covering `for/in/on/from/to/below/=/repeat`, `while`/`until`, `when`/`unless`, `do`, `collect`/`append`/`count`/`sum`/`always`/`thereis`/`return`, and keyword clause variants. Validity: `cargo test -q` passes and the loop subset unit tests in `src/eval.rs` pass; ANSI package/symbol regression harness (`/tmp/ansi_packages_symbols.lsp`) now loads through `packages/load.lsp` but times out after 120s (exit 124), so further triage is still needed. Implementation quality: minimal translation to `let` + `tagbody`, intentionally incomplete vs full ANSI LOOP.
 
 ## Task 12 - Types and Type System (TODO)
 - Goal: ANSI type system and declarations.
@@ -84,6 +85,7 @@ Report: Status DONE. Validity: `cargo check -q` passes. Implementation quality: 
 - Missing features: `defstruct` macro, structure class integration, copier/predicate, print function, slot defaults, and type integration.
 - Files: `src/eval.rs`, `src/init.lisp`, CLOS integration.
 - Tests: `tests/ansi-test/structures`.
+Report: Status TODO. `defstruct` now emits a `copy-<name>` copier using `sys-struct-ref` + `sys-make-struct`, and a unit test `test_defstruct_copier` was added in `src/eval.rs`; the rest of ANSI structure semantics (slot defaults, type integration, printer) remain unimplemented.
 
 ## Task 14 - Printer and Pretty Printing (TODO)
 - Goal: ANSI printing functions and `*print-*` control variables.

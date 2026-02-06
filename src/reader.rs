@@ -11,13 +11,13 @@ use num_traits::{Signed, ToPrimitive};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-struct ReaderInput {
+pub(crate) struct ReaderInput {
     chars: Vec<char>,
     index: usize,
 }
 
 impl ReaderInput {
-    fn new(input: &str) -> Self {
+    pub(crate) fn new(input: &str) -> Self {
         Self {
             chars: input.chars().collect(),
             index: 0,
@@ -155,6 +155,40 @@ impl<'a> Reader<'a> {
         )
     }
 
+    pub(crate) fn new_with_options_from_input(
+        input: ReaderInput,
+        arena: &'a mut Arena,
+        symbols: &'a mut SymbolTable,
+        readtable: &'a Readtable,
+        arrays: Option<&'a mut ArrayStore>,
+        options: ReaderOptions,
+    ) -> Self {
+        // Create or get NIL node
+        let nil_node = arena.alloc(Node::Leaf(OpaqueValue::Nil));
+
+        Self {
+            input,
+            arena,
+            symbols,
+            readtable,
+            arrays,
+            nil_node,
+            read_base: options.read_base,
+            read_eval: options.read_eval,
+            read_suppress: options.read_suppress,
+            preserve_whitespace: options.preserve_whitespace,
+            features: options
+                .features
+                .into_iter()
+                .map(|s| s.to_uppercase())
+                .collect(),
+            label_map: HashMap::new(),
+            list_depth: 0,
+            skip_next_in_list: false,
+            allow_unknown_packages: false,
+        }
+    }
+
     pub fn new_with_options(
         input: &'a str,
         arena: &'a mut Arena,
@@ -187,6 +221,10 @@ impl<'a> Reader<'a> {
             skip_next_in_list: false,
             allow_unknown_packages: false,
         }
+    }
+
+    pub(crate) fn into_input(self) -> ReaderInput {
+        self.input
     }
 
     pub fn position(&self) -> usize {

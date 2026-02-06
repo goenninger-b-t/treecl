@@ -4,8 +4,10 @@ This file captures facts and implementation-relevant notes extracted from the PD
 `references/`. It is meant to be a stable, local summary for TreeCL development.
 
 --------------------------------------------------------------------------------
+
 Source: tree_book.pdf (Barry Jay, "Tree Calculus")
 --------------------------------------------------------------------------------
+
 - Syntax (BNF): M, N ::= 4 | M N. Application is left-associative; each "4" is a node,
   and each application M N adds an edge from the root of M to the root of N.
 - Natural tree classes:
@@ -45,7 +47,7 @@ Source: tree_book.pdf (Barry Jay, "Tree Calculus")
   - isFork2 = lambda* z. 4 z (K K) (K (K 4))
     - Maps forks to 4 and maps leaves/stems to forks.
 - Triage combinator (Chapter 5):
-  - triage_comb = lambda* f0. lambda* f1. lambda* f2. lambda* z.
+  - triage_comb = lambda*f0. lambda* f1. lambda*f2. lambda* z.
     isStem2 z (4 z f0 f2) (4 (z 4) 4 (lambda* x. K (f1 x)))
   - Semantics: triage{f0,f1,f2} 4 = f0; triage{f0,f1,f2} (4 x) = f1 x;
     triage{f0,f1,f2} (4 x y) = f2 x y.
@@ -57,8 +59,10 @@ Source: tree_book.pdf (Barry Jay, "Tree Calculus")
   These strategies are used to build self-evaluators.
 
 --------------------------------------------------------------------------------
+
 Source: Graham, Paul - ANSI Common Lisp.pdf
 --------------------------------------------------------------------------------
+
 - Evaluation rule for function calls:
   - Evaluate arguments left-to-right.
   - Apply the operator (function) to the evaluated arguments.
@@ -75,8 +79,10 @@ Source: Graham, Paul - ANSI Common Lisp.pdf
     variables persist as long as the closure does.
 
 --------------------------------------------------------------------------------
+
 Source: Art of Metaobject Protocol.txt
 --------------------------------------------------------------------------------
+
 - OCR text is available (see `Art of Metaobject Protocol.txt`). The index enumerates
   the full MOP surface area: class/generic/method metaobject accessors, class
   finalization and CPL computation, slot definition protocols (direct/effective),
@@ -84,8 +90,10 @@ Source: Art of Metaobject Protocol.txt
   (compute-discriminating-function/effective-method, etc.).
 
 --------------------------------------------------------------------------------
+
 MOP implementation status (TreeCL)
 --------------------------------------------------------------------------------
+
 - Current MOP is a mini-MOP. It supports basic classes, generics, methods, and a subset of method combination.
 - Added class metaobject slots in `standard-class` with slot-visible metadata: name, direct-superclasses/subclasses, direct/effective slots, CPL, finalized-p, instance-size.
 - Class objects now map to metaobject instances for slot access; unbound slot values are tracked explicitly.
@@ -114,8 +122,10 @@ MOP implementation status (TreeCL)
 - Process-level caching: NIL/T/UNBOUND nodes are cached per process arena (`make_nil`, `make_t`, `make_unbound`) to reduce allocations and stabilize identity for NIL/T; instance allocation reuses the cached UNBOUND node.
 
 --------------------------------------------------------------------------------
+
 ANSI Common Lisp compliance status (TreeCL, Feb 4 2026)
 --------------------------------------------------------------------------------
+
 - Status summary: TreeCL is an experimental CL with a working evaluator, basic reader, minimal standard library, and a mostly-complete MOP, but it is far from full ANSI compliance. Many ANSI test categories are missing or partially stubbed.
 - Special forms and evaluator: core forms like `quote`, `if`, `progn`, `setq`, `let`, `lambda`, `function`, `block`, `return-from`, `tagbody`, `go`, `catch`, `throw`, `unwind-protect`, `defmacro`, multiple values (`values`, `values-list`, `multiple-value-bind`, `multiple-value-call`, `multiple-value-prog1`, `multiple-value-list`, `nth-value`), `flet`, `labels`, `macrolet`, `symbol-macrolet`, `load-time-value`, `progv` exist, but some ANSI forms are missing or incomplete, notably `eval-when`, `the`, and full declaration handling (`locally`/`declare`) in `src/eval.rs`.
 - Reader/readtable: `src/reader.rs` supports lists, strings, quote/quasiquote/unquote, line and block comments, `#'`, `#\` character literals (stored as integers), `#(` vectors, `#:` gensyms, `#x/#o/#b` radix ints (including ratios parsed to float), `#P` pathnames (pass-through), `#+/-` feature checks using `*FEATURES*`, `#.` read-time eval (gated by `*read-eval*`), `#n=`/`#n#` labels, `#nR` radix integers/ratios (ratios coerced to float), plus `#*` and `#nA` parsing (currently mapped to nested vectors via `ArrayStore`). Numeric tokens now parse integers, ratios, and floats in base 10 (ratios still coerced to float). Readtables support case modes, `*readtable*`, and macro/dispatch tables (including numeric arguments to dispatch macros). Missing or incomplete: `#S` and `#C` still rely on structures/complex numbers (not yet implemented), full `#R` for floats/complex and exact rationals, float subtype integration (`*read-default-float-format*`), and proper character type integration.
@@ -134,8 +144,10 @@ ANSI Common Lisp compliance status (TreeCL, Feb 4 2026)
 - ASDF: `src/asdf.lisp` is now present, but loading it still requires full ANSI reader behavior, package system, pathnames/files/streams, `eval-when`/`load-time-value`, and condition handling.
 
 --------------------------------------------------------------------------------
+
 Progress update (Feb 4 2026)
 --------------------------------------------------------------------------------
+
 - Added `src/asdf.lisp` (vendor drop-in) for ASDF bootstrap work.
 - Multiple values now supported (`values`, `values-list`, `multiple-value-bind`, `multiple-value-call`, `multiple-value-prog1`, `multiple-value-list`, `nth-value`); `macroexpand-1` returns multiple values.
 - Reader/readtable upgrades: readtable case modes, `*readtable*`/`*read-base*`/`*read-eval*`/`*read-suppress*`/`*features*` defaults, readtable macro/dispatch tables, `read`/`read-preserving-whitespace`/`read-from-string`/`read-delimited-list`, dispatch macros `#.`/`#| |#`/`#n=`/`#n#`/`#nR` (integers/ratios) with numeric dispatch arguments, plus `#*` bit-vectors and `#nA` arrays (nested vectors). Numeric token parsing now handles ratios/floats in base 10 (ratios coerced to float) and dot tokens require escapes. `#C`/`#S` now parse and attempt construction via `COMPLEX` or `MAKE-<STRUCT>` when available. Feature expressions now consult `*features*`.
@@ -143,14 +155,17 @@ Progress update (Feb 4 2026)
 - Remaining gaps for ANSI reader compliance: `#S`/`#A`/`#*`/`#C`, full numeric token grammar (ratios/floats/exponents), and full stream integration for reader entry points.
 
 --------------------------------------------------------------------------------
+
 Progress update (Feb 5 2026)
 --------------------------------------------------------------------------------
+
 - Added an `in-package` macro in `src/init_new.lisp` so the designator is not evaluated (ANSI behavior); it calls the `IN-PACKAGE` primitive via `funcall`.
 - Reader harness `tests/ansi-test/reader/load.lsp` now emits progress prints. Running it with a 300s timeout fails after `compile-and-load` with `IN-PACKAGE: unknown package` because `CL-TEST` is not created yet. This confirms Task 2 package system work is required (make-package, use-package, shadow/import/export, etc.) before running the reader suite standalone.
 - Regression: `cargo test -q` passes.
 
 Progress update (Feb 5 2026, Task 2)
 --------------------------------------------------------------------------------
+
 - Package system expanded in `src/symbol.rs`: packages now track use-lists, used-by lists, shadowing symbols, deletion state, and documentation; new helpers support package creation, deletion, renaming, shadowing, and symbol lookup status (:internal/:external/:inherited).
 - New package/symbol primitives added in `src/primitives.rs` for `make-package`, `delete-package`, `rename-package`, `packagep`, `find-symbol`, `find-all-symbols`, `export`/`unexport`, `import`, `shadow`/`shadowing-import`, `unintern`, `use-package`/`unuse-package`, package accessors, `gentemp`, and a `sys-package-iterator-entries` helper to drive `with-package-iterator`.
 - `gensym` now supports integer arguments and big counters (separate from `gentemp`), `copy-symbol` supports optional plist/value/function copying, and `boundp` treats `NIL`, `T`, and keywords as bound.
@@ -160,6 +175,7 @@ Progress update (Feb 5 2026, Task 2)
 
 Progress update (Feb 5 2026, ANSI package/symbol tests attempt)
 --------------------------------------------------------------------------------
+
 - Attempted to run `tests/ansi-test/packages` and `tests/ansi-test/symbols` via a minimal harness (`cargo run --bin treecl -- /tmp/ansi_packages_symbols.lsp`).
 - First run failed at read time because the harness referenced `regression-test:do-tests`; TreeCL reads the entire file before evaluation, so package-prefixed symbols must already exist at read time (workaround: use `(intern "DO-TESTS" "REGRESSION-TEST")` or avoid package prefixes in the harness file).
 - After adjusting the harness to avoid package-prefixed symbols, load failed while reading `tests/ansi-test/rt-package.lsp` with `LOAD: read error: Unexpected character: ')'`. This indicates a reader incompatibility with the RT harness file before package/symbol tests can run.
@@ -167,6 +183,7 @@ Progress update (Feb 5 2026, ANSI package/symbol tests attempt)
 
 Progress update (Feb 5 2026, reader conditionals and comments)
 --------------------------------------------------------------------------------
+
 - Fixed reader behavior for `#+/-` inside lists and for line/block comments inside lists. Added list-depth tracking and a skip flag so `;` comments and `#+/-` false branches no longer force an immediate `read()` that trips over list-closing `)`.
 - Added a guard for conditional-read skips to tolerate unknown packages (e.g., `sb-ext:` inside `#+sbcl` blocks) by temporarily allowing unknown packages while skipping the form.
 - Updated `readtable` comment macro to use a list-aware comment handler.
@@ -175,11 +192,25 @@ Progress update (Feb 5 2026, reader conditionals and comments)
 
 Progress update (Feb 5 2026, RT harness blockers)
 --------------------------------------------------------------------------------
+
 - Added a stub `declaim` macro and ported the simple `defstruct` macro into `src/init_new.lisp` (plus helpers). `char-code-limit` is now a `defparameter` to avoid macro ordering issues during bootstrap.
 - Running the package/symbol harness now progresses past `declaim` and `defstruct` but fails in `rt.lsp` at `(make-hash-table ...)` because TreeCL currently lacks hash table primitives. This is the current hard blocker for executing the ANSI package/symbol tests end-to-end.
 
 Progress update (Feb 5 2026, hash table stubs)
 --------------------------------------------------------------------------------
+Progress update (Feb 5 2026, RT harness + package/symbol triage)
+--------------------------------------------------------------------------------
+
+- `LOAD` now reads/evals forms sequentially (instead of reading an entire file before eval), so `in-package` and `*package*` changes affect subsequent reads during a load. This was required for the RT harness files (`rt.lsp`, `ansi-aux-macros.lsp`) to intern symbols in the correct package.
+- TCO `step_let` now detects special variables and falls back to the full `eval_let` path to preserve dynamic bindings (fixes `*package*` and other `*...*` specials in `let` forms). Without this, `cl-test-package.lsp` shadowed symbols were being added to `REGRESSION-TEST` instead of `CL-TEST`, which made `handler-case` macroexpansion recursive and caused stack overflows.
+- `defpackage` now applies `shadow`/`shadowing-import-from` before `:use` so name conflicts (e.g., `DS3` in `packages00-aux.lsp`) no longer abort with “Name conflict on A”.
+- `*LOAD-PATHNAME*`, `*LOAD-TRUENAME*`, and `*DEFAULT-PATHNAME-DEFAULTS*` are now exported from `COMMON-LISP` to ensure packages that use `CL` see the same special variables during load.
+- New regression tests:
+  - `test_let_special_binding_updates_dynamic_value` in `src/eval.rs` (verifies special bindings in `let` update dynamic values).
+  - `test_defpackage_shadowing_import_before_use` in `src/primitives.rs` (verifies `defpackage` ordering prevents name conflicts).
+- `cargo test -q` passes.
+- ANSI package/symbol harness now gets past earlier stack overflow and defpackage conflicts, but stops with an unhandled error `Variable 'WHILE' is not bound` due to the minimal `loop` macro lacking ANSI clauses (`while`, `for`, `in`, etc.). Implementing a proper `loop` macro (Task 11) is the next blocker to run the suite end-to-end.
+
 - Added minimal hash table primitives: `make-hash-table`, `gethash` (multiple values), `set-gethash` (for `(setf (gethash ...))`), `remhash`, `clrhash`, and `maphash`. Hash tables use a linear-scan store backed by `HashTableStore`.
 - Added `(defsetf gethash set-gethash)` to `src/init_new.lisp`.
 - `defstruct` now accepts `(name (:conc-name ...))` forms and honors `:conc-name nil` so accessors match RT expectations.
@@ -187,12 +218,42 @@ Progress update (Feb 5 2026, hash table stubs)
 
 Progress update (Feb 5 2026, assoc/rassoc)
 --------------------------------------------------------------------------------
-- Added minimal `assoc` and `rassoc` primitives (EQL-based, no keyword args). RT harness now progresses further but fails with `TCO Apply not fully implemented for NodeId(...)`, indicating a non-hash/reader issue in the evaluator’s TCO apply path.
+
+- `assoc` and `rassoc` now parse `:test`, `:test-not`, `:key`, and `:allow-other-keys` keyword arguments, with leftmost keyword wins and unknown keywords rejected unless `:allow-other-keys` is true.
+- `:key` of NIL is treated as identity (per ANSI tests). Default test remains `eql`.
+- Improper lists or non-cons elements (other than NIL) now signal errors; results still use the generic error path (no dedicated type-error signaling yet).
+- Fixed TCO apply path to fall back to tree-calculus reduction when the function object is not a lambda/closure (matching the non-TCO apply fallback). Added a regression test covering tree-calculus fallback in `step_apply`.
+
+Progress update (Feb 5 2026, RT harness run)
+--------------------------------------------------------------------------------
+- Re-ran `/tmp/ansi_packages_symbols.lsp`; it now loads through `packages/load.lsp` but crashes with a stack overflow (`thread 'worker-0' has overflowed its stack`) before completing the package tests. No additional form context yet.
+
+Progress update (Feb 5 2026, RT harness stack overflow triage)
+--------------------------------------------------------------------------------
+- Root cause: `cl-test-package.lsp` binds `*package*` using a non-CL `*PACKAGE*` symbol (created via read-before-eval). `maybe_update_current_package` only updated the global current package when the CL `*PACKAGE*` symbol was set, so the binding did not affect the current package and `shadow` ran in REGRESSION-TEST instead of CL-TEST. That left CL-TEST without shadowing symbols, so `handler-case` macro definitions collided with CL and recursed.
+- Fix: `maybe_update_current_package` now updates the global current package when *any* symbol named `*PACKAGE*` is set, and mirrors the value into CL:*PACKAGE*. Added a regression test to ensure non-CL `*PACKAGE*` bindings still update current package.
+
+--------------------------------------------------------------------------------
+
+Testing policy (Feb 5 2026)
+--------------------------------------------------------------------------------
+
+- Tests have to be created for every new feature being implemented. A task is only completed if such tests and all regression tests have passed. The respective feature tests and all regression tests MUST be run and passed when reporting results.
 
 Progress update (Feb 5 2026, ANSI package/symbol triage)
 --------------------------------------------------------------------------------
+
 - Bootstrap now reads `init_new.lisp` with the current package forced to `COMMON-LISP`, then resets the reader package back to `COMMON-LISP-USER` after bootstrap. This makes init macros/functions land in CL (so exported symbols resolve correctly in CL-USER/tests).
 - `init_new.lisp` now exports the core macro/function surface and adds stubs: `eval-when`, `declare`, `handler-case`, plus test helpers (`notnot`, `notnot-mv`, `not-mv`, `eqt`/`eqlt`/`equalt`/`equalpt`, `safely-delete-package`, `+fail-count-limit+`).
 - Added `TREECL_DEBUG_DEFPACKAGE` env hook in `prim_sys_defpackage` to trace progress.
 - Updated ANSI package/symbol harness to skip `ansi-aux.lsp` (too heavy without full LOOP/conditions) and set `*package*` to `REGRESSION-TEST`/`CL-TEST` before load.
 - Current blocker: loading `packages00-aux.lsp` hangs on the first `(report-and-ignore-errors (defpackage "A" ...))`. `TREECL_DEBUG_LOAD=1` shows evaluation stops at that form; likely a `defpackage`/package-system hang that needs further investigation.
+
+Progress update (Feb 6 2026, LOOP + defstruct copier)
+--------------------------------------------------------------------------------
+
+- Rewrote the minimal `loop` macro in `src/init_new.lisp` to avoid `labels` (not implemented in the evaluator). The new expansion parses clauses and emits a `let` + `tagbody` loop; it supports `for/in/on/from/to/below/=/repeat`, `while`/`until`, `when`/`unless`, `do`, `collect`/`append`/`count`/`sum`/`always`/`thereis`/`return`, and keyword clause variants.
+- `defstruct` now emits a `copy-<name>` copier using `sys-struct-ref` + `sys-make-struct` (helper `%defstruct-copier-args`), fixing the missing `copy-entry` in the RT harness.
+- Added `test_defstruct_copier` in `src/eval.rs` to verify copier behavior; existing loop subset tests remain in place.
+- Tests: `cargo test -q` passes (still emits warnings about unused `ctx` parameters, `unused_mut`, and `ReaderInput::unread`).
+- ANSI package/symbol harness (`timeout 120s target/debug/treecl /tmp/ansi_packages_symbols.lsp`) now loads through `packages/load.lsp` but still times out after 120s (exit 124) with no further output, indicating a remaining hang during package tests that needs further triage.
