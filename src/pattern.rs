@@ -260,16 +260,18 @@ impl<'a> PatternMatcher<'a> {
         let Some(val_table) = self.hashtables.get(crate::types::HashHandle(*val_map)) else {
             return false;
         };
-        if pat_table.entries.is_empty() {
+        let pat_entries = pat_table.entries();
+        let val_entries = val_table.entries();
+        if pat_entries.is_empty() {
             return true;
         }
 
         let checkpoint = self.bind_stack.len();
-        let mut used = vec![false; val_table.entries.len()];
+        let mut used = vec![false; val_entries.len()];
 
-        for (p_key, p_val) in &pat_table.entries {
+        for (p_key, p_val) in &pat_entries {
             let mut matched = false;
-            for (idx, (v_key, v_val)) in val_table.entries.iter().enumerate() {
+            for (idx, (v_key, v_val)) in val_entries.iter().enumerate() {
                 if used[idx] {
                     continue;
                 }
@@ -407,11 +409,13 @@ fn literal_equal_internal(
                 let Some(b_table) = hashtables.get(crate::types::HashHandle(*b)) else {
                     return false;
                 };
-                if a_table.entries.len() != b_table.entries.len() {
+                let a_entries = a_table.entries();
+                let b_entries = b_table.entries();
+                if a_entries.len() != b_entries.len() {
                     return false;
                 }
-                a_table.entries.iter().all(|(ak, av)| {
-                    b_table.entries.iter().any(|(bk, bv)| {
+                a_entries.iter().all(|(ak, av)| {
+                    b_entries.iter().any(|(bk, bv)| {
                         literal_equal_internal(arena, arrays, hashtables, shape, *ak, *bk)
                             && literal_equal_internal(arena, arrays, hashtables, shape, *av, *bv)
                     })

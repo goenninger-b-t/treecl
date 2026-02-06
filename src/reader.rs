@@ -135,6 +135,7 @@ pub struct Reader<'a> {
     list_depth: usize,
     skip_next_in_list: bool,
     allow_unknown_packages: bool,
+    read_eval_hit: bool,
 }
 
 impl<'a> Reader<'a> {
@@ -186,6 +187,7 @@ impl<'a> Reader<'a> {
             list_depth: 0,
             skip_next_in_list: false,
             allow_unknown_packages: false,
+            read_eval_hit: false,
         }
     }
 
@@ -220,6 +222,7 @@ impl<'a> Reader<'a> {
             list_depth: 0,
             skip_next_in_list: false,
             allow_unknown_packages: false,
+            read_eval_hit: false,
         }
     }
 
@@ -413,26 +416,10 @@ impl<'a> Reader<'a> {
     }
 
     fn read_eval_form(&mut self, form: NodeId) -> ReaderResult {
-        let result = READ_EVAL_CONTEXT.with(|cell| {
-            cell.borrow().as_ref().map(|ctx| unsafe {
-                let proc = &mut *ctx.proc_ptr;
-                let globals = &*ctx.globals_ptr;
-                let env = &*ctx.env_ptr;
-                let mut interp = crate::eval::Interpreter::new(proc, globals);
-                interp.eval(form, env)
-            })
-        });
-
-        match result {
-            Some(Ok(v)) => Ok(v),
-            Some(Err(e)) => Err(ReaderError::InvalidChar(format!(
-                "READ-EVAL error: {:?}",
-                e
-            ))),
-            None => Err(ReaderError::InvalidChar(
-                "READ-EVAL context not available".to_string(),
-            )),
-        }
+        // Defer read-time eval to the loader to avoid deadlocks on symbol table locks.
+        // Represent #.form as (%READ-EVAL% form) with an uninterned marker symbol.
+        let marker = self.make_uninterned_symbol("%READ-EVAL%");
+        Ok(self.list(&[marker, form]))
     }
 
     /// Read a list: (a b c)
@@ -595,6 +582,7 @@ impl<'a> Reader<'a> {
                     ));
                 }
                 let form = self.read()?;
+                self.read_eval_hit = true;
                 self.read_eval_form(form)
             }
             Some('|') => {
@@ -1912,6 +1900,12 @@ impl<'a> Reader<'a> {
         self.arena.alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0)))
     }
 
+    /// Create an uninterned symbol node from name
+    fn make_uninterned_symbol(&mut self, name: &str) -> NodeId {
+        let sym_id = self.symbols.make_symbol(name);
+        self.arena.alloc(Node::Leaf(OpaqueValue::Symbol(sym_id.0)))
+    }
+
     /// Build a list from nodes
     fn list(&mut self, items: &[NodeId]) -> NodeId {
         let mut result = self.nil_node;
@@ -1919,6 +1913,10 @@ impl<'a> Reader<'a> {
             result = self.arena.alloc(Node::Fork(item, result));
         }
         result
+    }
+
+    pub fn read_eval_hit(&self) -> bool {
+        self.read_eval_hit
     }
 }
 

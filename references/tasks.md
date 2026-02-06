@@ -10,6 +10,7 @@ These tasks are ordered with ASDF bootstrap requirements first. When a task is c
 - Files: `src/reader.rs`, `src/readtable.rs`, `src/primitives.rs` (reader macros and setters).
 - Tests: `tests/ansi-test/reader`.
 Report: Status DONE. Validity: `cargo test -q` (TreeCL Rust tests) passed. ANSI reader tests not run yet; remaining gaps moved to other tasks (numeric tower, arrays, pathnames, streams, types, structures). Implementation quality: solid for reader macro plumbing and character integration; some behaviors intentionally deferred (pathname object semantics, read-default-float-format, full feature expression semantics).
+Report update (Feb 6 2026): Added regression test `test_read_eval_resolves_nested_forms` in `src/primitives.rs` to cover nested `#.` read-time eval resolution via `read_one_from_str`. Validity: `cargo test -q` passes.
 Remaining subtask: reader harness `tests/ansi-test/reader/load.lsp` still fails at `(in-package #:cl-test)` with `IN-PACKAGE: unknown package` because CL-TEST is not created yet (package system work in Task 2). Re-run this file after package system fixes.
 
 ## Task 2 - Package and Symbol System Compliance (DONE)
@@ -73,6 +74,8 @@ Report: Status DONE. Validity: `cargo check -q` passes. Implementation quality: 
 - Files: `src/eval.rs`, `src/init.lisp`.
 - Tests: `tests/ansi-test/data-and-control-flow`, `tests/ansi-test/iteration`.
 Report: Status TODO. Implemented a minimal `loop` macro in `src/init_new.lisp` without relying on `labels`, covering `for/in/on/from/to/below/=/repeat`, `while`/`until`, `when`/`unless`, `do`, `collect`/`append`/`count`/`sum`/`always`/`thereis`/`return`, and keyword clause variants. Validity: `cargo test -q` passes and the loop subset unit tests in `src/eval.rs` pass; ANSI package/symbol regression harness (`/tmp/ansi_packages_symbols.lsp`) now loads through `packages/load.lsp` but times out after 120s (exit 124), so further triage is still needed. Implementation quality: minimal translation to `let` + `tagbody`, intentionally incomplete vs full ANSI LOOP.
+Report update (Feb 6 2026): After hash table fixes and struct-ref optimization, `timeout 120s target/debug/treecl /tmp/ansi_packages_symbols.lsp` still exits 124. A 10s debug run (`TREECL_DEBUG_LOAD=1`) processes ~90 forms and is still in the early package tests (find-symbol); overall load performance remains the blocking issue.
+Report update (Feb 6 2026): `perf record` (30s) on the package/symbol harness shows most CPU time in SipHash/`hashbrown` lookups (`RandomState::build_hasher`, `Sip13Rounds::d_rounds`, `rotate_left`). This suggests symbol/package/environment HashMap hashing is the primary hotspot; optimizing or changing the hasher may be required to move the timeout.
 
 ## Task 12 - Types and Type System (TODO)
 - Goal: ANSI type system and declarations.
@@ -98,6 +101,7 @@ Report: Status TODO. `defstruct` now emits a `copy-<name>` copier using `sys-str
 - Missing features: `make-hash-table` options (size, rehash-size, rehash-threshold), `gethash` multiple values, `remhash`, `maphash`, `clrhash`, hash-table accessors, `sxhash`, proper `equalp` hashing.
 - Files: `src/hashtables.rs`, `src/primitives.rs`.
 - Tests: `tests/ansi-test/hash-tables`.
+Report: Status TODO. Hash tables now use bucketed hashing; fixed `eql` hashing to be value-based so equal numeric keys land in the same bucket, and added regression tests `hash_eql_matches_numeric_value` and `hash_equal_matches_cons_structure` in `src/hashtables.rs`. Validity: `cargo test -q` passes. Implementation quality: improved correctness/performance for eq/eql/equal hashing, but ANSI options/accessors and `sxhash` are still missing.
 
 ## Task 16 - CLOS and Object System (TODO)
 - Goal: Complete ANSI object system integration beyond the MOP core.

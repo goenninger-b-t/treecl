@@ -1474,6 +1474,7 @@ fn prim_load(
                 );
 
                 let read_result = reader.read();
+                let needs_read_eval = reader.read_eval_hit();
                 let pos = reader.position();
                 input = reader.into_input();
                 drop(symbols_guard);
@@ -1489,6 +1490,11 @@ fn prim_load(
                     }
                 };
 
+                let expr = if needs_read_eval {
+                    resolve_read_eval(proc, ctx, &env, expr)?
+                } else {
+                    expr
+                };
                 let mut interpreter = Interpreter::new(proc, ctx);
                 if std::env::var("TREECL_DEBUG_LOAD").is_ok() {
                     let symbols = ctx.symbols.read().unwrap();
@@ -2747,14 +2753,8 @@ fn prim_sys_struct_ref(
         NumVal::Int(n) if n >= 0 => n as usize,
         _ => return err_helper("SYS-STRUCT-REF: invalid index"),
     };
-    let type_name = match proc.arena.inner.get_unchecked(args[2]) {
-        Node::Leaf(OpaqueValue::Symbol(id)) => ctx
-            .symbols
-            .read()
-            .unwrap()
-            .symbol_name(SymbolId(*id))
-            .unwrap_or("")
-            .to_uppercase(),
+    let type_sym = match proc.arena.inner.get_unchecked(args[2]) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => SymbolId(*id),
         _ => return err_helper("SYS-STRUCT-REF: invalid type"),
     };
 
@@ -2769,14 +2769,13 @@ fn prim_sys_struct_ref(
     if arr.elements.is_empty() {
         return err_helper("SYS-STRUCT-REF: invalid structure");
     }
-    if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(arr.elements[0]) {
-        if let Some(name) = ctx
-            .symbols
-            .read()
-            .unwrap()
-            .symbol_name(SymbolId(*id))
-        {
-            if !name.eq_ignore_ascii_case(&type_name) {
+    if let Node::Leaf(OpaqueValue::Symbol(id)) = proc.arena.inner.get_unchecked(arr.elements[0])
+    {
+        if *id != type_sym.0 {
+            let symbols = ctx.symbols.read().unwrap();
+            let expected = symbols.symbol_name(type_sym).unwrap_or("");
+            let actual = symbols.symbol_name(SymbolId(*id)).unwrap_or("");
+            if !actual.eq_ignore_ascii_case(expected) {
                 return err_helper("SYS-STRUCT-REF: type mismatch");
             }
         }
@@ -3005,7 +3004,7 @@ fn prim_maphash(
             .hashtables
             .get(handle)
             .ok_or_else(|| ControlSignal::Error("MAPHASH: invalid hash-table".to_string()))?;
-        table.entries.clone()
+        table.entries()
     };
 
     let mut interpreter = Interpreter::new(proc, ctx);
@@ -6333,6 +6332,61 @@ fn prim_sys_time_eval(
     Ok(result)
 }
 
+fn read_eval_marker_form(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Option<NodeId> {
+    let (car, cdr) = match proc.arena.inner.get_unchecked(node) {
+        Node::Fork(car, cdr) => (*car, *cdr),
+        _ => return None,
+    };
+    let sym_id = match proc.arena.inner.get_unchecked(car) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => SymbolId(*id),
+        _ => return None,
+    };
+    let symbols = ctx.symbols.read().unwrap();
+    if symbols.symbol_package(sym_id).is_some() {
+        return None;
+    }
+    if symbols.symbol_name(sym_id) != Some("%READ-EVAL%") {
+        return None;
+    }
+    match proc.arena.inner.get_unchecked(cdr) {
+        Node::Fork(form, rest) => match proc.arena.inner.get_unchecked(*rest) {
+            Node::Leaf(OpaqueValue::Nil) => Some(*form),
+            _ => Some(*form),
+        },
+        _ => None,
+    }
+}
+
+fn resolve_read_eval(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    env: &Environment,
+    node: NodeId,
+) -> EvalResult {
+    if let Some(form) = read_eval_marker_form(proc, ctx, node) {
+        let resolved_form = resolve_read_eval(proc, ctx, env, form)?;
+        let mut interp = Interpreter::new(proc, ctx);
+        return interp.eval(resolved_form, env);
+    }
+
+    match proc.arena.inner.get_unchecked(node).clone() {
+        Node::Fork(car, cdr) => {
+            let new_car = resolve_read_eval(proc, ctx, env, car)?;
+            let new_cdr = resolve_read_eval(proc, ctx, env, cdr)?;
+            if new_car == car && new_cdr == cdr {
+                Ok(node)
+            } else {
+                Ok(proc.arena.inner.alloc(Node::Fork(new_car, new_cdr)))
+            }
+        }
+        _ => Ok(node),
+    }
+}
+
 fn read_one_from_str(
     proc: &mut Process,
     ctx: &crate::context::GlobalContext,
@@ -6349,31 +6403,42 @@ fn read_one_from_str(
     let env = Environment::new();
     let proc_ptr = proc as *mut Process;
     let globals_ptr = ctx as *const _;
-    let mut symbols_guard = ctx.symbols.write().unwrap();
-    let mut reader = crate::reader::Reader::new_with_options(
-        input,
-        &mut proc.arena.inner,
-        &mut *symbols_guard,
-        &readtable,
-        Some(&mut proc.arrays),
-        options,
-    );
+    let (mut value_opt, consumed, needs_read_eval) = {
+        let mut symbols_guard = ctx.symbols.write().unwrap();
+        let mut reader = crate::reader::Reader::new_with_options(
+            input,
+            &mut proc.arena.inner,
+            &mut *symbols_guard,
+            &readtable,
+            Some(&mut proc.arrays),
+            options,
+        );
 
-    crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
-        proc_ptr,
-        globals_ptr,
-        env_ptr: &env as *const _,
-    }));
+        crate::reader::set_read_eval_context(Some(crate::reader::ReadEvalContext {
+            proc_ptr,
+            globals_ptr,
+            env_ptr: &env as *const _,
+        }));
 
-    let result = if reader.eof_after_whitespace() {
-        Ok((None, reader.position()))
-    } else {
-        reader.read().map(|v| (Some(v), reader.position()))
+        let result = if reader.eof_after_whitespace() {
+            Ok((None, reader.position(), reader.read_eval_hit()))
+        } else {
+            let read_result = reader.read();
+            let needs_read_eval = reader.read_eval_hit();
+            read_result.map(|v| (Some(v), reader.position(), needs_read_eval))
+        };
+
+        crate::reader::set_read_eval_context(None);
+        result.map_err(|e| ControlSignal::Error(format!("READ: read error: {}", e)))?
     };
 
-    crate::reader::set_read_eval_context(None);
+    if needs_read_eval {
+        if let Some(value) = value_opt {
+            value_opt = Some(resolve_read_eval(proc, ctx, &env, value)?);
+        }
+    }
 
-    result.map_err(|e| ControlSignal::Error(format!("READ: read error: {}", e)))
+    Ok((value_opt, consumed))
 }
 
 fn prim_read(
@@ -13620,6 +13685,36 @@ mod tests {
         )
         .unwrap();
         prim_sys_defpackage(&mut proc, &globals, &[name3, opts3]).unwrap();
+    }
+
+    #[test]
+    fn test_read_eval_resolves_nested_forms() {
+        let mut globals = crate::context::GlobalContext::new();
+        register_primitives(&mut globals);
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let (value_opt, _) =
+            read_one_from_str(&mut proc, &globals, "#.(list 1 #.(+ 1 1))", false).unwrap();
+        let value = value_opt.expect("expected a value");
+        let items = list_to_vec(&proc, value);
+
+        assert_eq!(items.len(), 2);
+        match proc.arena.inner.get_unchecked(items[0]) {
+            Node::Leaf(OpaqueValue::Integer(1)) => {}
+            _ => panic!("Expected integer 1"),
+        }
+        match proc.arena.inner.get_unchecked(items[1]) {
+            Node::Leaf(OpaqueValue::Integer(2)) => {}
+            _ => panic!("Expected integer 2"),
+        }
     }
 
     // === Extensive Arithmetic Tests ===

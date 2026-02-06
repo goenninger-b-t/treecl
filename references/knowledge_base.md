@@ -257,3 +257,18 @@ Progress update (Feb 6 2026, LOOP + defstruct copier)
 - Added `test_defstruct_copier` in `src/eval.rs` to verify copier behavior; existing loop subset tests remain in place.
 - Tests: `cargo test -q` passes (still emits warnings about unused `ctx` parameters, `unused_mut`, and `ReaderInput::unread`).
 - ANSI package/symbol harness (`timeout 120s target/debug/treecl /tmp/ansi_packages_symbols.lsp`) now loads through `packages/load.lsp` but still times out after 120s (exit 124) with no further output, indicating a remaining hang during package tests that needs further triage.
+
+Progress update (Feb 6 2026, hash table hashing + read-eval test)
+--------------------------------------------------------------------------------
+
+- Fixed hash table `eql` hashing to be value-based (numeric/char/symbol/string) so equal keys hash to the same bucket; added regression tests `hash_eql_matches_numeric_value` and `hash_equal_matches_cons_structure` in `src/hashtables.rs`.
+- Added `test_read_eval_resolves_nested_forms` in `src/primitives.rs` to cover nested `#.` read-time eval resolution via `read_one_from_str`.
+- `SYS-STRUCT-REF` now compares type symbols by id first (falling back to case-insensitive name comparison) to reduce symbol-name lookup overhead.
+- Tests: `cargo test -q` passes (warnings unchanged).
+- ANSI package/symbol harness: `timeout 120s target/debug/treecl /tmp/ansi_packages_symbols.lsp` still exits 124. A 10s debug run (`TREECL_DEBUG_LOAD=1`) processes ~90 forms and is still in early package tests (find-symbol), so overall load performance remains the blocker.
+
+Progress update (Feb 6 2026, perf profile of ANSI package/symbol load)
+--------------------------------------------------------------------------------
+
+- Ran `perf record` for 30s on `/tmp/ansi_packages_symbols.lsp` and captured a report. The hottest samples are in SipHash (`core::intrinsics::rotate_left`, `Sip13Rounds::d_rounds`, `RandomState::build_hasher`, `SipHasher13::new_with_keys`) and `hashbrown` lookups, with smaller time in `treecl::arena::Arena::get_unchecked` and a few tree-calculus helpers.
+- Interpretation: load-time work is dominated by HashMap hashing/lookup overhead (likely `SymbolTable` and env/package maps) rather than evaluator reduction. This suggests profiling/optimizing symbol and package lookup paths (and possibly switching to a faster hasher) is the next lever for reducing load timeouts.

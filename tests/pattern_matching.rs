@@ -209,13 +209,13 @@ fn pattern_vector_and_map() {
     let key_c = sym_node(&mut proc, kw_c);
 
     let mut pat_table = HashTable::new(TestMode::Equal);
-    pat_table.entries.push((key_a, x_node));
-    pat_table.entries.push((key_b, two));
+    pat_table.insert(key_a, x_node, &proc.arena.inner);
+    pat_table.insert(key_b, two, &proc.arena.inner);
 
     let mut val_table = HashTable::new(TestMode::Equal);
-    val_table.entries.push((key_b, two));
-    val_table.entries.push((key_a, one));
-    val_table.entries.push((key_c, three));
+    val_table.insert(key_b, two, &proc.arena.inner);
+    val_table.insert(key_a, one, &proc.arena.inner);
+    val_table.insert(key_c, three, &proc.arena.inner);
 
     let pat_handle = proc.hashtables.alloc(pat_table);
     let val_handle = proc.hashtables.alloc(val_table);
