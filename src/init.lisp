@@ -161,6 +161,13 @@
      (unwind-protect (progn ,@body)
        (close ,var))))
 
+(defmacro with-open-file ((var filespec &rest options) &rest body)
+  `(let ((,var (open ,filespec ,@options)))
+     (unwind-protect
+         (progn ,@body)
+       (when ,var
+         (close ,var)))))
+
 (defmacro with-input-from-string ((var string) &rest body)
   (let ((stream (gensym "STREAM"))
         (old (gensym "OLD")))
