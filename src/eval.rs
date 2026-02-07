@@ -110,6 +110,19 @@ pub struct Closure {
     pub env: Environment,
 }
 
+impl Closure {
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        roots.push(self.body);
+        roots.extend(self.env.iter_roots());
+        roots.extend(self.lambda_list.iter_roots());
+        if let Some(d) = &self.destructuring {
+            roots.extend(d.iter_roots());
+        }
+        roots
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ParsedLambdaList {
     /// Required parameters (Symbol or Destructuring Pattern)
@@ -130,9 +143,34 @@ pub struct ParsedLambdaList {
     pub allow_other_keys: bool,
 }
 
+impl ParsedLambdaList {
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        roots.extend(self.req.iter().copied());
+        for (var, init, _) in &self.opt {
+            roots.push(*var);
+            roots.push(*init);
+        }
+        for (_, var, init, _) in &self.key {
+            roots.push(*var);
+            roots.push(*init);
+        }
+        for (_, init) in &self.aux {
+            roots.push(*init);
+        }
+        roots
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DestructuringLambdaList {
     pattern: DListPattern,
+}
+
+impl DestructuringLambdaList {
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        self.pattern.iter_roots()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,11 +183,43 @@ struct DListPattern {
     allow_other_keys: bool,
 }
 
+impl DListPattern {
+    fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        for req in &self.req {
+            roots.extend(req.iter_roots());
+        }
+        for opt in &self.opt {
+            roots.extend(opt.iter_roots());
+        }
+        if let Some(rest) = &self.rest {
+            roots.extend(rest.iter_roots());
+        }
+        for key in &self.key {
+            roots.extend(key.iter_roots());
+        }
+        for aux in &self.aux {
+            roots.extend(aux.iter_roots());
+        }
+        roots
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DOptSpec {
     pattern: DPattern,
     init: Option<NodeId>,
     supplied: Option<SymbolId>,
+}
+
+impl DOptSpec {
+    fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = self.pattern.iter_roots();
+        if let Some(init) = self.init {
+            roots.push(init);
+        }
+        roots
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,10 +230,30 @@ struct DKeySpec {
     supplied: Option<SymbolId>,
 }
 
+impl DKeySpec {
+    fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = self.pattern.iter_roots();
+        if let Some(init) = self.init {
+            roots.push(init);
+        }
+        roots
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DAuxSpec {
     sym: SymbolId,
     init: Option<NodeId>,
+}
+
+impl DAuxSpec {
+    fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        if let Some(init) = self.init {
+            roots.push(init);
+        }
+        roots
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +262,16 @@ enum DPattern {
     Wildcard,
     Literal(NodeId),
     List(DListPattern),
+}
+
+impl DPattern {
+    fn iter_roots(&self) -> Vec<NodeId> {
+        match self {
+            DPattern::Var(_) | DPattern::Wildcard => Vec::new(),
+            DPattern::Literal(node) => vec![*node],
+            DPattern::List(list) => list.iter_roots(),
+        }
+    }
 }
 
 /// Control flow signals for non-local exits

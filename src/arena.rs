@@ -1,4 +1,5 @@
 use crate::types::{NodeId, OpaqueValue};
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
@@ -12,18 +13,49 @@ enum Entry {
     Free { next: Option<u32> },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeGeneration {
+    Young,
+    Old,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepMode {
+    Minor,
+    Major,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SweepReport {
+    pub freed: usize,
+    pub promoted: usize,
+    pub examined: usize,
+    pub workers: usize,
+}
+
 /// Statistics about Arena memory usage
 #[derive(Debug, Clone)]
 pub struct ArenaStats {
     pub total_slots: usize,
     pub free_slots: usize,
     pub allocs_since_gc: usize,
+    pub allocs_since_major_gc: usize,
+    pub young_live_slots: usize,
+    pub old_live_slots: usize,
+    pub remembered_set_size: usize,
+    pub dirty_card_count: usize,
 }
 
 pub struct Arena {
     nodes: Vec<Entry>,
     free_head: Option<u32>,
     allocs_since_gc: usize,
+    allocs_since_major_gc: usize,
+    generations: Vec<NodeGeneration>,
+    survivor_ages: Vec<u8>,
+    remembered_set: crate::fastmap::HashSet<u32>,
+    dirty_cards: crate::fastmap::HashSet<u32>,
+    promote_age: u8,
     epoch: u64,
 }
 
@@ -33,6 +65,12 @@ impl Arena {
             nodes: Vec::with_capacity(1024),
             free_head: None,
             allocs_since_gc: 0,
+            allocs_since_major_gc: 0,
+            generations: Vec::with_capacity(1024),
+            survivor_ages: Vec::with_capacity(1024),
+            remembered_set: crate::fastmap::HashSet::default(),
+            dirty_cards: crate::fastmap::HashSet::default(),
+            promote_age: 2,
             epoch: 0,
         }
     }
@@ -47,13 +85,21 @@ impl Arena {
                 };
                 self.free_head = next_free;
                 *entry = Entry::Occupied(node);
+                self.generations[idx as usize] = NodeGeneration::Young;
+                self.survivor_ages[idx as usize] = 0;
+                self.remembered_set.remove(&idx);
+                self.dirty_cards.remove(&idx);
                 self.allocs_since_gc += 1;
+                self.allocs_since_major_gc += 1;
                 NodeId(idx)
             }
             None => {
                 let idx = self.nodes.len() as u32;
                 self.nodes.push(Entry::Occupied(node));
+                self.generations.push(NodeGeneration::Young);
+                self.survivor_ages.push(0);
                 self.allocs_since_gc += 1;
+                self.allocs_since_major_gc += 1;
                 NodeId(idx)
             }
         }
@@ -62,6 +108,14 @@ impl Arena {
     pub fn overwrite(&mut self, id: NodeId, node: Node) {
         let idx = id.0 as usize;
         if idx < self.nodes.len() {
+            if matches!(self.nodes[idx], Entry::Occupied(_))
+                && self.generations[idx] == NodeGeneration::Old
+            {
+                // Coarse write barrier: treat any old-node mutation as potentially
+                // introducing an old->young edge; track at card/node granularity.
+                self.remembered_set.insert(id.0);
+                self.dirty_cards.insert(id.0);
+            }
             // Ensure slot is occupied? Or force?
             // Safe to force.
             self.nodes[idx] = Entry::Occupied(node);
@@ -89,23 +143,114 @@ impl Arena {
     /// Reclaims all Occupied nodes whose indices are NOT in the `marked` set.
     /// Returns the number of nodes freed.
     pub fn sweep(&mut self, marked: &crate::fastmap::HashSet<u32>) -> usize {
-        let mut freed_count = 0;
-        for idx in 0..self.nodes.len() {
-            let u_idx = idx as u32;
-            // If node is NOT marked and IS occupied, free it.
-            if !marked.contains(&u_idx) {
-                if let Entry::Occupied(_) = self.nodes[idx] {
-                     // Convert to Free entry pointing to current free_head
-                     self.nodes[idx] = Entry::Free { next: self.free_head };
-                     self.free_head = Some(u_idx);
-                     freed_count += 1;
-                }
-            }
+        self.sweep_generation(marked, SweepMode::Major).freed
+    }
+
+    pub fn sweep_generation(
+        &mut self,
+        marked: &crate::fastmap::HashSet<u32>,
+        mode: SweepMode,
+    ) -> SweepReport {
+        #[derive(Default)]
+        struct LocalSweep {
+            freed: Vec<u32>,
+            promoted: usize,
+            examined: usize,
         }
-        if freed_count > 0 {
+
+        let mark_bits: Vec<bool> = (0..self.nodes.len())
+            .map(|idx| marked.contains(&(idx as u32)))
+            .collect();
+        let workers = rayon::current_num_threads().max(1);
+        let promote_age = self.promote_age;
+
+        let mut local = self
+            .nodes
+            .par_iter_mut()
+            .zip(self.generations.par_iter_mut())
+            .zip(self.survivor_ages.par_iter_mut())
+            .enumerate()
+            .map(|(idx, ((entry, generation), age))| {
+                let mut out = LocalSweep::default();
+                if !matches!(entry, Entry::Occupied(_)) {
+                    return out;
+                }
+                out.examined += 1;
+
+                let marked_here = mark_bits[idx];
+                match mode {
+                    SweepMode::Minor => {
+                        if *generation == NodeGeneration::Young {
+                            if marked_here {
+                                *age = age.saturating_add(1);
+                                if *age >= promote_age {
+                                    *generation = NodeGeneration::Old;
+                                    *age = 0;
+                                    out.promoted += 1;
+                                }
+                            } else {
+                                *entry = Entry::Free { next: None };
+                                *generation = NodeGeneration::Young;
+                                *age = 0;
+                                out.freed.push(idx as u32);
+                            }
+                        }
+                    }
+                    SweepMode::Major => {
+                        if marked_here {
+                            if *generation == NodeGeneration::Young {
+                                *age = age.saturating_add(1);
+                                if *age >= promote_age {
+                                    *generation = NodeGeneration::Old;
+                                    *age = 0;
+                                    out.promoted += 1;
+                                }
+                            }
+                        } else {
+                            *entry = Entry::Free { next: None };
+                            *generation = NodeGeneration::Young;
+                            *age = 0;
+                            out.freed.push(idx as u32);
+                        }
+                    }
+                }
+                out
+            })
+            .reduce(LocalSweep::default, |mut a, mut b| {
+                a.freed.append(&mut b.freed);
+                a.promoted += b.promoted;
+                a.examined += b.examined;
+                a
+            });
+
+        let freed_count = local.freed.len();
+        for idx in local.freed.drain(..) {
+            self.nodes[idx as usize] = Entry::Free { next: self.free_head };
+            self.free_head = Some(idx);
+            self.remembered_set.remove(&idx);
+            self.dirty_cards.remove(&idx);
+        }
+
+        if matches!(mode, SweepMode::Major) {
+            self.remembered_set.clear();
+            self.dirty_cards.clear();
+        } else {
+            self.remembered_set
+                .retain(|idx| matches!(self.generations.get(*idx as usize), Some(NodeGeneration::Old)));
+            self.dirty_cards
+                .retain(|idx| matches!(self.generations.get(*idx as usize), Some(NodeGeneration::Old)));
+        }
+
+        if freed_count > 0 || local.promoted > 0 {
             self.epoch = self.epoch.wrapping_add(1);
         }
-        freed_count
+
+        SweepReport {
+            freed: freed_count,
+            promoted: local.promoted,
+            examined: local.examined,
+            workers,
+        }
     }
     
     pub fn len(&self) -> usize {
@@ -118,10 +263,22 @@ impl Arena {
         self.allocs_since_gc = 0;
         count
     }
+
+    /// Get allocation count since last MAJOR GC and reset it
+    pub fn reset_major_alloc_count(&mut self) -> usize {
+        let count = self.allocs_since_major_gc;
+        self.allocs_since_major_gc = 0;
+        count
+    }
     
     /// Get allocation count since last GC (without reset)
     pub fn allocs_since_gc(&self) -> usize {
         self.allocs_since_gc
+    }
+
+    /// Get allocation count since last MAJOR GC (without reset)
+    pub fn allocs_since_major_gc(&self) -> usize {
+        self.allocs_since_major_gc
     }
     
     /// Get memory statistics
@@ -137,11 +294,27 @@ impl Arena {
                 break;
             }
         }
+
+        let mut young_live = 0usize;
+        let mut old_live = 0usize;
+        for (idx, entry) in self.nodes.iter().enumerate() {
+            if matches!(entry, Entry::Occupied(_)) {
+                match self.generations[idx] {
+                    NodeGeneration::Young => young_live += 1,
+                    NodeGeneration::Old => old_live += 1,
+                }
+            }
+        }
         
         ArenaStats {
             total_slots: self.nodes.len(),
             free_slots: free_count,
             allocs_since_gc: self.allocs_since_gc,
+            allocs_since_major_gc: self.allocs_since_major_gc,
+            young_live_slots: young_live,
+            old_live_slots: old_live,
+            remembered_set_size: self.remembered_set.len(),
+            dirty_card_count: self.dirty_cards.len(),
         }
     }
 
@@ -153,6 +326,14 @@ impl Arena {
     /// Total heap size in bytes for arena node storage.
     pub fn total_bytes(&self) -> usize {
         self.nodes.len().saturating_mul(std::mem::size_of::<Entry>())
+    }
+
+    pub fn remembered_set_size(&self) -> usize {
+        self.remembered_set.len()
+    }
+
+    pub fn dirty_card_count(&self) -> usize {
+        self.dirty_cards.len()
     }
 }
 

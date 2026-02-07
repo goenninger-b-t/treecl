@@ -29,6 +29,7 @@ pub mod tree_calculus;
 // pub mod parser;
 pub mod compiler;
 pub mod context;
+pub mod gc;
 pub mod mp;
 pub mod process;
 pub mod scheduler;

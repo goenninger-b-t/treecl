@@ -1,7 +1,9 @@
-use crate::arena::{Arena, Node};
+use crate::arena::{Arena, Node, SweepMode};
+use crate::gc::{GcCollectionKind, GcCycleReport, GcRuntimeStats};
 use crate::search::EvalContext;
 use crate::types::{NodeId, OpaqueValue, SymbolId};
 use crate::fastmap::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::collections::VecDeque;
 
 /// Process ID
@@ -129,6 +131,7 @@ pub struct Process {
     pub gc_count: u64,
     pub gc_time_sec: f64,
     pub gc_freed_total: usize,
+    pub gc_runtime_stats: GcRuntimeStats,
 
     /// Program Counter (Pointer to current root of reduction)
     pub program: NodeId,
@@ -255,6 +258,7 @@ impl Process {
             gc_count: 0,
             gc_time_sec: 0.0,
             gc_freed_total: 0,
+            gc_runtime_stats: GcRuntimeStats::default(),
             program,
             mailbox: VecDeque::new(),
             dictionary,
@@ -449,109 +453,210 @@ impl Process {
     }
 
     pub fn collect_garbage(&mut self) -> usize {
+        self.collect_garbage_with_kind(GcCollectionKind::Major, true)
+            .freed_nodes
+    }
+
+    pub fn collect_garbage_with_kind(
+        &mut self,
+        kind: GcCollectionKind,
+        manual_trigger: bool,
+    ) -> GcCycleReport {
+        let before = self.arena.inner.stats();
+        let live_before = before.total_slots.saturating_sub(before.free_slots);
         let start = std::time::Instant::now();
-        let mut marked = HashSet::default();
 
-        // 1. Mark Roots
-        self.mark_node(self.nil_node, &mut marked);
-        self.mark_node(self.t_node, &mut marked);
-        self.mark_node(self.unbound_node, &mut marked);
+        let roots = self.collect_gc_roots();
+        let (marked, mark_workers) = self.mark_roots_parallel(&roots);
+        let sweep_mode = match kind {
+            GcCollectionKind::Minor => SweepMode::Minor,
+            GcCollectionKind::Major => SweepMode::Major,
+        };
+        let sweep = self.arena.inner.sweep_generation(&marked, sweep_mode);
 
-        // Program Counter
-        self.mark_node(self.program, &mut marked);
+        self.arena.inner.reset_alloc_count();
+        if matches!(kind, GcCollectionKind::Major) {
+            self.arena.inner.reset_major_alloc_count();
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        self.gc_count = self.gc_count.saturating_add(1);
+        self.gc_time_sec += elapsed;
+        self.gc_freed_total = self.gc_freed_total.saturating_add(sweep.freed);
+
+        let after = self.arena.inner.stats();
+        let live_after = after.total_slots.saturating_sub(after.free_slots);
+        let worker_threads = mark_workers.max(sweep.workers).max(1);
+        let report = GcCycleReport {
+            kind: Some(kind),
+            marked_nodes: marked.len(),
+            freed_nodes: sweep.freed,
+            promoted_nodes: sweep.promoted,
+            live_nodes_before: live_before,
+            live_nodes_after: live_after,
+            young_live_before: before.young_live_slots,
+            young_live_after: after.young_live_slots,
+            old_live_before: before.old_live_slots,
+            old_live_after: after.old_live_slots,
+            elapsed_sec: elapsed,
+            worker_threads,
+        };
+        self.gc_runtime_stats.record_cycle(&report, manual_trigger);
+        report
+    }
+
+    pub fn maybe_auto_collect(&mut self) -> Option<GcCycleReport> {
+        let allocs_since_gc = self.arena.inner.allocs_since_gc();
+        if allocs_since_gc < self.arena.gc_threshold {
+            return None;
+        }
+
+        let arena_stats = self.arena.inner.stats();
+        let need_major = self.gc_runtime_stats.minor_since_major
+            >= self.gc_runtime_stats.major_every_minor
+            || arena_stats.old_live_slots >= self.gc_runtime_stats.old_generation_soft_limit
+            || self.arena.inner.allocs_since_major_gc()
+                >= self
+                    .arena
+                    .gc_threshold
+                    .saturating_mul(self.gc_runtime_stats.major_every_minor as usize);
+        let kind = if need_major {
+            GcCollectionKind::Major
+        } else {
+            GcCollectionKind::Minor
+        };
+        Some(self.collect_garbage_with_kind(kind, false))
+    }
+
+    fn collect_gc_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+
+        // Base process roots
+        roots.push(self.nil_node);
+        roots.push(self.t_node);
+        roots.push(self.unbound_node);
+        roots.push(self.program);
 
         // Mailbox
         for msg in &self.mailbox {
-            self.mark_node(msg.payload, &mut marked);
+            roots.push(msg.payload);
         }
 
         // Waiting receive pattern
         if let Status::Waiting(Some(pat)) = &self.status {
-            self.mark_node(*pat, &mut marked);
+            roots.push(*pat);
         }
 
         // Dictionary (Symbol Values/Functions)
         for binding in self.dictionary.values() {
             if let Some(val) = binding.value {
-                self.mark_node(val, &mut marked);
+                roots.push(val);
             }
             if let Some(func) = binding.function {
-                self.mark_node(func, &mut marked);
+                roots.push(func);
             }
             if let Some(plist) = binding.plist {
-                self.mark_node(plist, &mut marked);
+                roots.push(plist);
             }
         }
 
         // Multiple values
-        for &val in &self.values {
-            self.mark_node(val, &mut marked);
-        }
+        roots.extend(self.values.iter().copied());
 
-        // Mark Condition System Roots
-        for root in self.conditions.iter_roots() {
-            self.mark_node(root, &mut marked);
-        }
+        // Condition System Roots
+        roots.extend(self.conditions.iter_roots());
 
         if let Status::Debugger(cond) = &self.status {
-            self.mark_condition(cond, &mut marked);
+            self.collect_condition_roots(cond, &mut roots);
         }
         for cond in &self.debugger_stack {
-            self.mark_condition(cond, &mut marked);
+            self.collect_condition_roots(cond, &mut roots);
         }
 
-        // Mark MOP Roots
-        for root in self.mop.iter_roots() {
-            self.mark_node(root, &mut marked);
-        }
+        // MOP roots
+        roots.extend(self.mop.iter_roots());
 
-        // Mark Macros
+        // Macro and function closures + env roots
         for &closure_idx in self.macros.values() {
             if let Some(closure) = self.closures.get(closure_idx) {
-                // Mark macro body
-                self.mark_node(closure.body, &mut marked);
-                // Mark macro environment
-                for root in closure.env.iter_roots() {
-                    self.mark_node(root, &mut marked);
-                }
+                roots.extend(closure.iter_roots());
             }
         }
-
-        // Mark Global Functions
-        // Note: Functions in 'functions' map are usually also in 'dictionary',
-        // but we mark them here for safety/completeness if not bound to symbol in dict.
         for &closure_idx in self.functions.values() {
             if let Some(closure) = self.closures.get(closure_idx) {
-                self.mark_node(closure.body, &mut marked);
-                for root in closure.env.iter_roots() {
-                    self.mark_node(root, &mut marked);
-                }
+                roots.extend(closure.iter_roots());
             }
         }
 
-        // Mark SETF Functions
-        for &func in self.setf_functions.values() {
-            self.mark_node(func, &mut marked);
-        }
+        // SETF functions
+        roots.extend(self.setf_functions.values().copied());
 
-        // Mark Next Method States
+        // Next Method states
         for state in &self.next_method_states {
-            for &arg in &state.args {
-                self.mark_node(arg, &mut marked);
+            roots.extend(state.args.iter().copied());
+        }
+
+        // Active execution state
+        if let Some(env) = &self.current_env {
+            roots.extend(env.iter_roots());
+        }
+        if let Some(redex) = self.pending_redex {
+            roots.push(redex);
+        }
+        if let Some(syscall) = &self.pending_syscall {
+            match syscall {
+                crate::syscall::SysCall::Spawn(node) => roots.push(*node),
+                crate::syscall::SysCall::Send { message, .. } => roots.push(*message),
+                crate::syscall::SysCall::Receive { pattern } => {
+                    if let Some(node) = pattern {
+                        roots.push(*node);
+                    }
+                }
+                crate::syscall::SysCall::Sleep(_) | crate::syscall::SysCall::SelfPid => {}
             }
         }
 
-        // Closures are now traced via reachability in mark_node.
-        // We do NOT scan all closures to allow collecting unreachable ones.
+        // Continuation stack frames (critical for auto-GC during execution).
+        for frame in &self.continuation_stack {
+            self.collect_continuation_roots(frame, &mut roots);
+        }
 
-        // 2. Sweep
-        let freed = self.arena.inner.sweep(&marked);
-        self.arena.inner.reset_alloc_count();
-        let elapsed = start.elapsed().as_secs_f64();
-        self.gc_count = self.gc_count.saturating_add(1);
-        self.gc_time_sec += elapsed;
-        self.gc_freed_total = self.gc_freed_total.saturating_add(freed);
-        freed
+        roots
+    }
+
+    fn mark_roots_parallel(
+        &self,
+        roots: &[NodeId],
+    ) -> (HashSet<u32>, usize) {
+        if roots.is_empty() {
+            return (HashSet::default(), 1);
+        }
+
+        let workers = usize::min(roots.len(), rayon::current_num_threads().max(1));
+        if workers <= 1 || roots.len() < 4 {
+            let mut marked = HashSet::default();
+            for &root in roots {
+                self.mark_node(root, &mut marked);
+            }
+            return (marked, 1);
+        }
+
+        let partial: Vec<HashSet<u32>> = roots
+            .par_iter()
+            .map(|&root| {
+                let mut local = HashSet::default();
+                self.mark_node(root, &mut local);
+                local
+            })
+            .collect();
+
+        let mut marked = HashSet::default();
+        for set in partial {
+            for id in set {
+                marked.insert(id);
+            }
+        }
+        (marked, workers)
     }
 
     fn mark_node(&self, node_id: NodeId, marked: &mut HashSet<u32>) {
@@ -586,6 +691,22 @@ impl Process {
                                     }
                                 }
                             }
+                            OpaqueValue::HashHandle(id) => {
+                                if let Some(table) = self
+                                    .hashtables
+                                    .get(crate::types::HashHandle(*id))
+                                {
+                                    for (k, v) in table.entries() {
+                                        stack.push(k);
+                                        stack.push(v);
+                                    }
+                                }
+                            }
+                            OpaqueValue::Readtable(id) => {
+                                for root in self.readtables.iter_roots(crate::readtable::ReadtableId(*id)) {
+                                    stack.push(root);
+                                }
+                            }
                             OpaqueValue::Instance(id) => {
                                 // Trace instance slots
                                 if let Some(inst) = self.mop.get_instance(*id as usize) {
@@ -597,8 +718,29 @@ impl Process {
                             OpaqueValue::Closure(id) => {
                                 // Trace closure environment
                                 if let Some(closure) = self.closures.get(*id as usize) {
-                                    for root in closure.env.iter_roots() {
+                                    for root in closure.iter_roots() {
                                         stack.push(root);
+                                    }
+                                }
+                            }
+                            OpaqueValue::MethodWrapper(closure_id, next_idx) => {
+                                if let Some(closure) = self.closures.get(*closure_id as usize) {
+                                    for root in closure.iter_roots() {
+                                        stack.push(root);
+                                    }
+                                }
+                                if let Some(state) = self.next_method_states.get(*next_idx as usize) {
+                                    for &arg in &state.args {
+                                        stack.push(arg);
+                                    }
+                                }
+                            }
+                            OpaqueValue::NextMethod(state_idx)
+                            | OpaqueValue::NextMethodP(state_idx)
+                            | OpaqueValue::CallMethod(state_idx) => {
+                                if let Some(state) = self.next_method_states.get(*state_idx as usize) {
+                                    for &arg in &state.args {
+                                        stack.push(arg);
                                     }
                                 }
                             }
@@ -610,16 +752,84 @@ impl Process {
         }
     }
 
-    fn mark_condition(
+    fn collect_condition_roots(
         &self,
         condition: &crate::conditions::Condition,
-        marked: &mut HashSet<u32>,
+        roots: &mut Vec<NodeId>,
     ) {
-        for &arg in &condition.format_arguments {
-            self.mark_node(arg, marked);
-        }
-        for &val in condition.slots.values() {
-            self.mark_node(val, marked);
+        roots.extend(condition.format_arguments.iter().copied());
+        roots.extend(condition.slots.values().copied());
+    }
+
+    fn collect_continuation_roots(
+        &self,
+        frame: &crate::eval::Continuation,
+        roots: &mut Vec<NodeId>,
+    ) {
+        match frame {
+            crate::eval::Continuation::Done => {}
+            crate::eval::Continuation::EvArgs { op, args, vals, env } => {
+                roots.push(*op);
+                roots.extend(args.iter().copied());
+                roots.extend(vals.iter().copied());
+                roots.extend(env.iter_roots());
+            }
+            crate::eval::Continuation::Apply { saved_env } => {
+                roots.extend(saved_env.iter_roots());
+            }
+            crate::eval::Continuation::MacroTiming { .. } => {}
+            crate::eval::Continuation::EvProgn { rest } => {
+                roots.extend(rest.iter().copied());
+            }
+            crate::eval::Continuation::EvIf {
+                then_branch,
+                else_branch,
+                env,
+            } => {
+                roots.push(*then_branch);
+                roots.push(*else_branch);
+                roots.extend(env.iter_roots());
+            }
+            crate::eval::Continuation::EvMvb { vars, body, env } => {
+                roots.push(*vars);
+                roots.push(*body);
+                roots.extend(env.iter_roots());
+            }
+            crate::eval::Continuation::EvMvcFunc { forms, env } => {
+                roots.extend(forms.iter().copied());
+                roots.extend(env.iter_roots());
+            }
+            crate::eval::Continuation::EvMvcArgs {
+                func,
+                forms,
+                collected,
+                env,
+            } => {
+                roots.push(*func);
+                roots.extend(forms.iter().copied());
+                roots.extend(collected.iter().copied());
+                roots.extend(env.iter_roots());
+            }
+            crate::eval::Continuation::EvSetq { rest, .. } => {
+                roots.extend(rest.iter().copied());
+            }
+            crate::eval::Continuation::Defun { name } => {
+                roots.push(*name);
+            }
+            crate::eval::Continuation::Tagbody { rest, tag_map, env } => {
+                roots.extend(rest.iter().copied());
+                for branch in tag_map.values() {
+                    roots.extend(branch.iter().copied());
+                }
+                roots.extend(env.iter_roots());
+            }
+            crate::eval::Continuation::Block { rest, .. } => {
+                roots.extend(rest.iter().copied());
+            }
+            crate::eval::Continuation::ReturnFrom { .. } => {}
+            crate::eval::Continuation::DebuggerRest { condition } => {
+                self.collect_condition_roots(condition, roots);
+            }
         }
     }
 
@@ -735,8 +945,15 @@ impl Process {
                     steps += 1;
                     interpreter.process.reduction_count += 1;
 
+                    // Automatic GC trigger for generational collection.
+                    // Check periodically to keep scheduler latency stable.
+                    if steps % 64 == 0 {
+                        let _ = interpreter.process.maybe_auto_collect();
+                    }
+
                     if !continue_exec {
                         // Execution Finished
+                        let _ = interpreter.process.maybe_auto_collect();
                         return ExecutionResult::Terminated;
                     }
                 }

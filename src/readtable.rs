@@ -181,6 +181,15 @@ impl Readtable {
     pub fn set_readtable_case(&mut self, mode: ReadtableCase) {
         self.case_mode = mode;
     }
+
+    pub fn iter_roots(&self) -> Vec<NodeId> {
+        let mut roots = Vec::new();
+        roots.extend(self.lisp_macro_functions.values().copied());
+        for table in self.dispatch_tables.values() {
+            roots.extend(table.values().copied());
+        }
+        roots
+    }
 }
 
 fn macro_left_paren(reader: &mut Reader, _c: char) -> ReaderResult {
@@ -246,5 +255,11 @@ impl ReadtableStore {
 
     pub fn get_mut(&mut self, id: ReadtableId) -> Option<&mut Readtable> {
         self.tables.get_mut(id.0 as usize)
+    }
+
+    pub fn iter_roots(&self, id: ReadtableId) -> Vec<NodeId> {
+        self.get(id)
+            .map(|rt| rt.iter_roots())
+            .unwrap_or_default()
     }
 }

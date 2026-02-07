@@ -13710,10 +13710,37 @@ fn prim_error(
 
 fn prim_gc(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
 ) -> EvalResult {
-    let freed = proc.collect_garbage();
+    let kind = if args.is_empty() {
+        crate::gc::GcCollectionKind::Major
+    } else if args.len() == 1 {
+        let arg = args[0];
+        if node_is_nil(proc, arg) {
+            crate::gc::GcCollectionKind::Minor
+        } else if let Some(sym) = node_to_symbol(proc, arg) {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .unwrap_or("")
+                .to_uppercase();
+            if name == "MINOR" {
+                crate::gc::GcCollectionKind::Minor
+            } else {
+                crate::gc::GcCollectionKind::Major
+            }
+        } else {
+            crate::gc::GcCollectionKind::Major
+        }
+    } else {
+        return err_helper("GC accepts at most one argument");
+    };
+
+    let report = proc.collect_garbage_with_kind(kind, true);
+    let freed = report.freed_nodes;
     // Return freed count as integer
     let val = OpaqueValue::Integer(freed as i64);
     Ok(proc.arena.inner.alloc(Node::Leaf(val)))
@@ -13738,6 +13765,8 @@ fn prim_room(
         "  Live nodes:      {}",
         stats.total_slots - stats.free_slots
     );
+    println!("  Young live:      {}", stats.young_live_slots);
+    println!("  Old live:        {}", stats.old_live_slots);
     println!(
         "Vectors:           {} ({} elements)",
         array_count, array_elements
@@ -13745,8 +13774,45 @@ fn prim_room(
     println!("Closures:          {}", closure_count);
     println!("Symbols:           {}", symbol_count);
     println!("GC:");
-    println!("  Threshold:       {}", proc.arena.gc_threshold);
+    println!("  Minor threshold: {}", proc.arena.gc_threshold);
+    println!("  Major interval:  {} minor collections", proc.gc_runtime_stats.major_every_minor);
+    println!("  Old soft limit:  {}", proc.gc_runtime_stats.old_generation_soft_limit);
     println!("  Allocs since GC: {}", stats.allocs_since_gc);
+    println!("  Allocs since major GC: {}", stats.allocs_since_major_gc);
+    println!("  Remembered set:  {}", stats.remembered_set_size);
+    println!("  Dirty cards:     {}", stats.dirty_card_count);
+    println!("  Collections:     {}", proc.gc_runtime_stats.total_collections);
+    println!(
+        "    Minor: {}  Major: {}",
+        proc.gc_runtime_stats.minor_collections, proc.gc_runtime_stats.major_collections
+    );
+    println!(
+        "  Triggers:        auto={} manual={}",
+        proc.gc_runtime_stats.auto_triggers, proc.gc_runtime_stats.manual_triggers
+    );
+    if let Some(kind) = proc.gc_runtime_stats.last_collection_kind {
+        println!(
+            "  Last cycle:      kind={} pause={:.6}s marked={} freed={} promoted={} live={}",
+            kind.as_str(),
+            proc.gc_runtime_stats.last_pause_sec,
+            proc.gc_runtime_stats.last_marked_nodes,
+            proc.gc_runtime_stats.last_freed_nodes,
+            proc.gc_runtime_stats.last_promoted_nodes,
+            proc.gc_runtime_stats.last_live_nodes
+        );
+    } else {
+        println!("  Last cycle:      <none>");
+    }
+    println!(
+        "  Total GC time:   {:.6}s (legacy aggregate {:.6}s)",
+        proc.gc_runtime_stats.total_gc_time_sec, proc.gc_time_sec
+    );
+    println!("  Total freed:     {}", proc.gc_runtime_stats.total_nodes_freed);
+    println!("  Total promoted:  {}", proc.gc_runtime_stats.total_nodes_promoted);
+    println!(
+        "  Max GC workers:  {}",
+        proc.gc_runtime_stats.max_parallel_workers_observed
+    );
 
     Ok(proc.make_nil())
 }
@@ -16252,6 +16318,81 @@ mod tests {
             .replace('\\', "/");
         assert!(out.contains("tmp/out"));
         assert!(out.ends_with("src/unit/a.lsp"));
+    }
+
+    #[test]
+    fn test_gc_minor_and_major_update_runtime_stats() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        for _ in 0..200 {
+            let a = proc.make_integer(1);
+            let b = proc.make_integer(2);
+            let _ = proc.arena.inner.alloc(Node::Fork(a, b));
+        }
+
+        let kw_minor = globals.symbols.write().unwrap().intern_keyword("MINOR");
+        let minor_arg = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_minor.0)));
+        let minor_freed = prim_gc(&mut proc, &globals, &[minor_arg]).unwrap();
+        let minor_freed = match proc.arena.inner.get_unchecked(minor_freed) {
+            Node::Leaf(OpaqueValue::Integer(n)) => *n,
+            other => panic!("Expected integer freed count, got {:?}", other),
+        };
+        assert!(minor_freed >= 0);
+        assert_eq!(proc.gc_runtime_stats.total_collections, 1);
+        assert_eq!(proc.gc_runtime_stats.minor_collections, 1);
+
+        for _ in 0..200 {
+            let a = proc.make_integer(3);
+            let b = proc.make_integer(4);
+            let _ = proc.arena.inner.alloc(Node::Fork(a, b));
+        }
+        let t_node = proc.make_t(&globals);
+        let major_freed = prim_gc(&mut proc, &globals, &[t_node]).unwrap();
+        let major_freed = match proc.arena.inner.get_unchecked(major_freed) {
+            Node::Leaf(OpaqueValue::Integer(n)) => *n,
+            other => panic!("Expected integer freed count, got {:?}", other),
+        };
+        assert!(major_freed >= 0);
+        assert_eq!(proc.gc_runtime_stats.total_collections, 2);
+        assert_eq!(proc.gc_runtime_stats.major_collections, 1);
+    }
+
+    #[test]
+    fn test_gc_auto_trigger_collects_when_threshold_reached() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        proc.arena.gc_threshold = 16;
+        proc.gc_runtime_stats.major_every_minor = 16;
+
+        for _ in 0..80 {
+            let a = proc.make_integer(7);
+            let b = proc.make_integer(8);
+            let _ = proc.arena.inner.alloc(Node::Fork(a, b));
+        }
+        let report = proc.maybe_auto_collect();
+        assert!(report.is_some(), "auto GC should trigger");
+        assert_eq!(proc.gc_runtime_stats.auto_triggers, 1);
     }
 
     #[test]
