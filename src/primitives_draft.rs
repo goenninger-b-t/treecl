@@ -1,5 +1,5 @@
 fn parse_keywords_list(proc: &Process, args: &[NodeId]) -> HashMap<SymbolId, NodeId> {
-    let mut keywords = HashMap::new();
+    let mut keywords = HashMap::default();
     let mut i = 0;
     while i < args.len() {
         if i + 1 >= args.len() {
@@ -50,13 +50,17 @@ fn parse_slot_def(
     // Look up keyword symbols
     let syms = ctx.symbols.read().unwrap();
     let k_initform = syms.find("INITFORM").unwrap_or(SymbolId(0));
+    let k_initfunction = syms.find("INITFUNCTION").unwrap_or(SymbolId(0));
     let k_initarg = syms.find("INITARG").unwrap_or(SymbolId(0));
     let k_reader = syms.find("READER").unwrap_or(SymbolId(0));
     let k_writer = syms.find("WRITER").unwrap_or(SymbolId(0));
     let k_accessor = syms.find("ACCESSOR").unwrap_or(SymbolId(0));
+    let k_allocation = syms.find("ALLOCATION").unwrap_or(SymbolId(0));
+    let k_type = syms.find("TYPE").unwrap_or(SymbolId(0));
     drop(syms);
 
     let initform = props.get(&k_initform).copied();
+    let initfunction = props.get(&k_initfunction).copied();
     let initarg = props.get(&k_initarg).and_then(|&n| node_to_symbol(proc, n));
 
     let mut readers = Vec::new();
@@ -79,12 +83,39 @@ fn parse_slot_def(
         }
     }
 
+    let allocation = if let Some(&alloc_node) = props.get(&k_allocation) {
+        if let Some(sym) = node_to_symbol(proc, alloc_node) {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .unwrap_or("")
+                .to_string();
+            if name == "CLASS" {
+                crate::clos::SlotAllocation::Class
+            } else {
+                crate::clos::SlotAllocation::Instance
+            }
+        } else {
+            crate::clos::SlotAllocation::Instance
+        }
+    } else {
+        crate::clos::SlotAllocation::Instance
+    };
+
+    let slot_type = props.get(&k_type).copied();
+
     Ok(SlotDefinition {
         name,
         initform,
+        initfunction,
         initarg,
         readers,
         writers,
+        allocation,
+        slot_type,
+        class_value: None,
         index,
     })
 }
@@ -234,7 +265,7 @@ fn prim_ensure_method(
     let kw_specializers = syms.find("SPECIALIZERS").unwrap_or(SymbolId(0));
     let kw_qualifiers = syms.find("QUALIFIERS").unwrap_or(SymbolId(0));
     let kw_body = syms.find("BODY").unwrap_or(SymbolId(0));
-    // let kw_lambda_list = syms.find("LAMBDA-LIST").unwrap_or(SymbolId(0)); -- needed?
+    let kw_lambda_list = syms.find("LAMBDA-LIST").unwrap_or(SymbolId(0));
     drop(syms);
 
     let mut specializers = Vec::new();
@@ -265,7 +296,18 @@ fn prim_ensure_method(
 
     let body = *kwargs.get(&kw_body).unwrap_or(&proc.make_nil());
 
-    let mid = proc.mop.add_method(gf_id, specializers, qualifiers, body);
+    let mut lambda_list = Vec::new();
+    if let Some(&ll_node) = kwargs.get(&kw_lambda_list) {
+        for head in list_to_vec(proc, ll_node) {
+            if let Some(sym) = node_to_symbol(proc, head) {
+                lambda_list.push(sym);
+            }
+        }
+    }
+
+    let mid = proc
+        .mop
+        .add_method(gf_id, specializers, qualifiers, lambda_list, body);
 
     // Return method object?
     Ok(proc.make_nil()) // TODO: Return Method object appropriately

@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use crate::pathname::Pathname;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Added Copy/Clone/Eq/Hash
 pub struct ForeignHandle(pub *mut c_void);
@@ -17,9 +18,12 @@ pub struct HashHandle(pub u32);
 #[derive(Clone, Debug, PartialEq)] // Removed Copy because StringHandle/VectorHandle might imply ownership semantics later, but for now they are indices.
 pub enum OpaqueValue {
     Nil,
+    Unbound,
     Integer(i64),
     Float(f64),
+    Char(char),
     String(String),             // String content
+    Pathname(Pathname),         // Pathname object
     Closure(u32),               // Handle to Closure
     VectorHandle(u32),          // Index into Vector Storage
     ForeignPtr(ForeignHandle),  // FFI Handle
@@ -28,6 +32,7 @@ pub enum OpaqueValue {
     Class(u32),                 // Handle to Class (CLOS)
     Symbol(u32),                // Symbol ID
     BigInt(num_bigint::BigInt), // Arbitrary precision integer
+    Ratio(num_bigint::BigInt, num_bigint::BigInt), // Rational number (num/den, normalized)
     StreamHandle(u32),          // Handle to Stream
     Pid(crate::process::Pid),   // Process ID
     HashHandle(u32),            // Handle to Hash Table
@@ -37,6 +42,10 @@ pub enum OpaqueValue {
     CallMethod(u32),            // Handle to Call-Method state (CLOS)
     MethodWrapper(u32, u32),    // (ClosureIndex, NextMethodIndex)
     Method(u32),                // Handle to Method (CLOS)
+    EqlSpecializer(u32),        // Handle to EQL specializer (CLOS)
+    SlotDefinition(u32, u32, bool), // (ClassId, SlotIndex, Direct?)
+    Readtable(u32),             // Handle to Readtable
+    Complex(NodeId, NodeId),    // (real, imag)
 }
 
 // Implement partial_cmp for Float to allow it in some contexts (careful with NaN)
@@ -72,6 +81,29 @@ impl PartialOrd for OpaqueValue {
             (OpaqueValue::Float(a), OpaqueValue::BigInt(b)) => {
                 a.partial_cmp(&b.to_f64().unwrap_or(f64::INFINITY))
             }
+            (OpaqueValue::Ratio(a_num, a_den), OpaqueValue::Ratio(b_num, b_den)) => {
+                Some((a_num * b_den).cmp(&(b_num * a_den)))
+            }
+            (OpaqueValue::Ratio(a_num, a_den), OpaqueValue::Integer(b)) => {
+                Some(a_num.cmp(&(num_bigint::BigInt::from(*b) * a_den)))
+            }
+            (OpaqueValue::Integer(a), OpaqueValue::Ratio(b_num, b_den)) => {
+                Some((num_bigint::BigInt::from(*a) * b_den).cmp(b_num))
+            }
+            (OpaqueValue::Ratio(a_num, a_den), OpaqueValue::BigInt(b)) => {
+                Some(a_num.cmp(&(b * a_den)))
+            }
+            (OpaqueValue::BigInt(a), OpaqueValue::Ratio(b_num, b_den)) => {
+                Some((a * b_den).cmp(b_num))
+            }
+            (OpaqueValue::Ratio(a_num, a_den), OpaqueValue::Float(b)) => a_num
+                .to_f64()
+                .and_then(|n| a_den.to_f64().map(|d| n / d))
+                .and_then(|v| v.partial_cmp(b)),
+            (OpaqueValue::Float(a), OpaqueValue::Ratio(b_num, b_den)) => b_num
+                .to_f64()
+                .and_then(|n| b_den.to_f64().map(|d| n / d))
+                .and_then(|v| a.partial_cmp(&v)),
             _ => None,
         }
     }

@@ -151,6 +151,7 @@ impl<'a> Printer<'a> {
     fn print_leaf(&mut self, val: OpaqueValue) {
         match val {
             OpaqueValue::Nil => self.output.push_str("NIL"),
+            OpaqueValue::Unbound => self.output.push_str("#<unbound>"),
             OpaqueValue::Integer(n) => {
                 self.output.push_str(&n.to_string());
             }
@@ -165,6 +166,29 @@ impl<'a> Printer<'a> {
                     }
                 } else {
                     self.output.push_str(&format!("{}", f));
+                }
+            }
+            OpaqueValue::Char(c) => {
+                if self.options.escape {
+                    self.output.push_str("#\\");
+                    let name = match c {
+                        ' ' => Some("SPACE"),
+                        '\n' => Some("NEWLINE"),
+                        '\t' => Some("TAB"),
+                        '\r' => Some("RETURN"),
+                        '\x0c' => Some("PAGE"),
+                        '\x7f' => Some("RUBOUT"),
+                        '\x08' => Some("BACKSPACE"),
+                        '\0' => Some("NULL"),
+                        _ => None,
+                    };
+                    if let Some(n) = name {
+                        self.output.push_str(n);
+                    } else {
+                        self.output.push(c);
+                    }
+                } else {
+                    self.output.push(c);
                 }
             }
             OpaqueValue::String(s) => {
@@ -182,8 +206,30 @@ impl<'a> Printer<'a> {
                     self.output.push_str(&s);
                 }
             }
+            OpaqueValue::Pathname(p) => {
+                if self.options.escape {
+                    self.output.push_str("#P");
+                    self.output.push('"');
+                    for c in p.namestring().chars() {
+                        if c == '"' || c == '\\' {
+                            self.output.push('\\');
+                        }
+                        self.output.push(c);
+                    }
+                    self.output.push('"');
+                } else {
+                    self.output.push_str(p.namestring());
+                }
+            }
             OpaqueValue::VectorHandle(h) => {
                 self.output.push_str(&format!("#<vector:{}>", h));
+            }
+            OpaqueValue::Complex(real, imag) => {
+                self.output.push_str("#C(");
+                self.print_node(real);
+                self.output.push(' ');
+                self.print_node(imag);
+                self.output.push(')');
             }
             OpaqueValue::ForeignPtr(ptr) => {
                 self.output.push_str(&format!("#<foreign:{:?}>", ptr));
@@ -226,6 +272,11 @@ impl<'a> Printer<'a> {
             OpaqueValue::BigInt(n) => {
                 self.output.push_str(&n.to_string());
             }
+            OpaqueValue::Ratio(n, d) => {
+                self.output.push_str(&n.to_string());
+                self.output.push('/');
+                self.output.push_str(&d.to_string());
+            }
             OpaqueValue::StreamHandle(id) => {
                 self.output.push_str(&format!("#<stream:{}>", id));
             }
@@ -254,6 +305,19 @@ impl<'a> Printer<'a> {
             }
             OpaqueValue::Method(id) => {
                 self.output.push_str(&format!("#<method:{}>", id));
+            }
+            OpaqueValue::EqlSpecializer(id) => {
+                self.output.push_str(&format!("#<eql-specializer:{}>", id));
+            }
+            OpaqueValue::SlotDefinition(class_id, slot_idx, direct) => {
+                let tag = if direct { ":direct" } else { "" };
+                self.output.push_str(&format!(
+                    "#<slot-definition:{}:{}{}>",
+                    class_id, slot_idx, tag
+                ));
+            }
+            OpaqueValue::Readtable(id) => {
+                self.output.push_str(&format!("#<readtable:{}>", id));
             }
         }
     }
@@ -489,6 +553,8 @@ impl<'a> DotPrinter<'a> {
                     OpaqueValue::Integer(i) => i.to_string(),
                     OpaqueValue::Float(f) => f.to_string(),
                     OpaqueValue::String(s) => format!("{:?}", s),
+                    OpaqueValue::Pathname(p) => format!("#P{:?}", p.namestring()),
+                    OpaqueValue::Ratio(n, d) => format!("{}/{}", n, d),
                     _ => "?".to_string(),
                 };
                 self.output
@@ -547,7 +613,7 @@ impl<'a> BookTreeBuilder<'a> {
     }
 
     fn build(&mut self, node: NodeId) -> usize {
-        let mut active = std::collections::HashSet::new();
+        let mut active = crate::fastmap::HashSet::default();
         self.build_inner(node, 0, &mut active)
     }
 
@@ -555,7 +621,7 @@ impl<'a> BookTreeBuilder<'a> {
         &mut self,
         node: NodeId,
         depth: usize,
-        active: &mut std::collections::HashSet<NodeId>,
+        active: &mut crate::fastmap::HashSet<NodeId>,
     ) -> usize {
         if depth > self.max_depth {
             return self.new_node(Some("...".to_string()));
@@ -609,8 +675,10 @@ impl<'a> BookTreeBuilder<'a> {
             ),
             OpaqueValue::Integer(i) => Some(i.to_string()),
             OpaqueValue::BigInt(i) => Some(i.to_string()),
+            OpaqueValue::Ratio(n, d) => Some(format!("{}/{}", n, d)),
             OpaqueValue::Float(f) => Some(f.to_string()),
             OpaqueValue::String(s) => Some(format!("\"{}\"", s)),
+            OpaqueValue::Pathname(p) => Some(format!("#P\"{}\"", p.namestring())),
             _ => Some("atom".to_string()),
         }
     }
@@ -650,7 +718,7 @@ impl<'a> BookDotRenderer<'a> {
     }
 
     fn render(mut self, root: usize) -> String {
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = crate::fastmap::HashSet::default();
         self.emit_subtree(root, None, 0, &mut visited);
         self.output.push_str("}\n");
         self.output
@@ -661,7 +729,7 @@ impl<'a> BookDotRenderer<'a> {
         node_idx: usize,
         incoming_color: Option<&'static str>,
         depth: usize,
-        visited: &mut std::collections::HashSet<usize>,
+        visited: &mut crate::fastmap::HashSet<usize>,
     ) {
         const ROOT_COLOR: &str = "#222222";
         const PALETTE: [&str; 8] = [

@@ -2,13 +2,17 @@
 //
 // Implements a minimal MOP-compliant object system.
 
+use crate::arena::{Arena, Node};
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
-use crate::types::NodeId;
-use std::collections::HashMap;
+use crate::types::{NodeId, OpaqueValue};
+use num_traits::ToPrimitive;
+use crate::fastmap::HashMap;
 
 /// Unique identifier for a class
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClassId(pub u32);
+
+pub const STANDALONE_SLOT_DEF_CLASS_ID: u32 = u32::MAX;
 
 /// Unique identifier for a generic function
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,14 +27,32 @@ pub struct MethodId(pub u32);
 pub struct Class {
     /// Class name
     pub name: SymbolId,
+    /// Metaclass (class of this class)
+    pub metaclass: ClassId,
     /// Direct superclasses
     pub supers: Vec<ClassId>,
+    /// Direct slot definitions
+    pub direct_slots: Vec<SlotDefinition>,
     /// Direct slots (slot-name -> slot-definition)
     pub slots: Vec<SlotDefinition>,
     /// Class precedence list (computed)
     pub cpl: Vec<ClassId>,
     /// Number of instance slots
     pub instance_size: usize,
+    /// Direct subclasses
+    pub direct_subclasses: Vec<ClassId>,
+    /// Whether class is finalized
+    pub finalized: bool,
+    /// Direct default initargs (as keyword/value pairs)
+    pub direct_default_initargs: Vec<(SymbolId, NodeId)>,
+    /// Effective default initargs (computed)
+    pub default_initargs: Vec<(SymbolId, NodeId)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAllocation {
+    Instance,
+    Class,
 }
 
 /// A slot definition
@@ -38,30 +60,72 @@ pub struct Class {
 pub struct SlotDefinition {
     pub name: SymbolId,
     pub initform: Option<NodeId>,
+    pub initfunction: Option<NodeId>,
     pub initarg: Option<SymbolId>,
     pub readers: Vec<SymbolId>,
     pub writers: Vec<SymbolId>,
+    pub allocation: SlotAllocation,
+    pub slot_type: Option<NodeId>,
+    pub class_value: Option<NodeId>,
     pub index: usize,
 }
 
 /// A generic function
 #[derive(Debug, Clone)]
 pub struct GenericFunction {
-    pub name: SymbolId,
+    pub name: GenericName,
     pub lambda_list: Vec<SymbolId>,
+    pub required_parameters: Vec<SymbolId>,
+    pub argument_precedence_order: Option<Vec<SymbolId>>,
+    pub discriminating_function: Option<NodeId>,
+    pub method_cache: HashMap<Vec<ClassId>, NodeId>,
     pub methods: Vec<MethodId>,
     pub method_combination: MethodCombination,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenericName {
+    Symbol(SymbolId),
+    Setf(SymbolId),
+}
+
+impl GenericName {
+    pub fn base_symbol(self) -> SymbolId {
+        match self {
+            GenericName::Symbol(sym) => sym,
+            GenericName::Setf(sym) => sym,
+        }
+    }
+
+    pub fn is_setf(self) -> bool {
+        matches!(self, GenericName::Setf(_))
+    }
 }
 
 /// A method
 #[derive(Debug, Clone)]
 pub struct Method {
-    /// Specializers (ClassIds for each parameter)
-    pub specializers: Vec<ClassId>,
+    /// Specializers (ClassIds or EQL specializers for each parameter)
+    pub specializers: Vec<Specializer>,
     /// Method qualifiers (:before, :after, :around, or primary)
     pub qualifiers: Vec<SymbolId>,
+    /// Method lambda list (symbols)
+    pub lambda_list: Vec<SymbolId>,
     /// Method body as a closure index or NodeId
     pub body: NodeId,
+    /// Generic function this method is attached to
+    pub generic: Option<GenericId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Specializer {
+    Class(ClassId),
+    Eql(u32),
+}
+
+#[derive(Debug, Clone)]
+pub struct EqlSpecializer {
+    pub object: NodeId,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +164,7 @@ pub enum WrapperKind {
 pub struct Instance {
     pub class: ClassId,
     pub slots: Vec<NodeId>,
+    pub funcallable_function: Option<NodeId>,
 }
 
 /// State for call-next-method
@@ -115,18 +180,39 @@ pub struct MetaObjectProtocol {
     classes: Vec<Class>,
     /// Class name -> ClassId lookup
     class_names: HashMap<SymbolId, ClassId>,
+    /// ClassId -> metaobject instance index
+    class_meta_instances: HashMap<ClassId, usize>,
     /// Built-in class IDs
     pub t_class: ClassId,
     pub standard_object: ClassId,
     pub standard_class: ClassId,
+    pub funcallable_standard_class: ClassId,
+    pub funcallable_standard_object: ClassId,
+    pub standard_generic_function: ClassId,
+    pub standard_method: ClassId,
+    pub standard_direct_slot_definition: ClassId,
+    pub standard_effective_slot_definition: ClassId,
+    pub eql_specializer_class: ClassId,
     pub symbol_class: ClassId,
     pub integer_class: ClassId,
     /// All generic functions
     generics: Vec<GenericFunction>,
     /// Generic name -> GenericId
     generic_names: HashMap<SymbolId, GenericId>,
+    /// Setf generic name -> GenericId
+    setf_generic_names: HashMap<SymbolId, GenericId>,
+    /// Symbol ID for SETF
+    pub setf_symbol: SymbolId,
     /// All methods
     methods: Vec<Method>,
+    /// GenericId -> metaobject instance index
+    generic_meta_instances: HashMap<GenericId, usize>,
+    /// MethodId -> metaobject instance index
+    method_meta_instances: HashMap<MethodId, usize>,
+    /// Slot-definition key -> metaobject instance index
+    slot_def_meta_instances: HashMap<(ClassId, u32, bool), usize>,
+    /// Standalone slot definitions (not attached to a class)
+    standalone_slot_defs: Vec<SlotDefinition>,
     /// Cached wrapper methods for standard method combination
     before_wrappers: HashMap<MethodId, MethodId>,
     after_wrappers: HashMap<MethodId, MethodId>,
@@ -134,6 +220,39 @@ pub struct MetaObjectProtocol {
     method_combinations: HashMap<SymbolId, MethodCombinationDef>,
     /// All instances
     instances: Vec<Instance>,
+    /// Interned EQL specializers
+    eql_specializers: Vec<EqlSpecializer>,
+    /// Dependents tracked for classes
+    class_dependents: HashMap<ClassId, Vec<NodeId>>,
+    /// Dependents tracked for generic functions
+    generic_dependents: HashMap<GenericId, Vec<NodeId>>,
+}
+
+fn nodes_eq(arena: &Arena, a: NodeId, b: NodeId) -> bool {
+    if a == b {
+        return true;
+    }
+    match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+        (Node::Leaf(OpaqueValue::Symbol(id1)), Node::Leaf(OpaqueValue::Symbol(id2))) => id1 == id2,
+        (Node::Leaf(OpaqueValue::Class(id1)), Node::Leaf(OpaqueValue::Class(id2))) => id1 == id2,
+        (Node::Leaf(OpaqueValue::Instance(id1)), Node::Leaf(OpaqueValue::Instance(id2))) => {
+            id1 == id2
+        }
+        (Node::Leaf(OpaqueValue::Generic(id1)), Node::Leaf(OpaqueValue::Generic(id2))) => {
+            id1 == id2
+        }
+        (Node::Leaf(OpaqueValue::Method(id1)), Node::Leaf(OpaqueValue::Method(id2))) => id1 == id2,
+        (
+            Node::Leaf(OpaqueValue::SlotDefinition(c1, s1, d1)),
+            Node::Leaf(OpaqueValue::SlotDefinition(c2, s2, d2)),
+        ) => c1 == c2 && s1 == s2 && d1 == d2,
+        (
+            Node::Leaf(OpaqueValue::EqlSpecializer(id1)),
+            Node::Leaf(OpaqueValue::EqlSpecializer(id2)),
+        ) => id1 == id2,
+        (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil)) => true,
+        _ => false,
+    }
 }
 
 impl MetaObjectProtocol {
@@ -156,33 +275,60 @@ impl MetaObjectProtocol {
     pub fn new(symbols: &mut SymbolTable) -> Self {
         let mut mop = Self {
             classes: Vec::new(),
-            class_names: HashMap::new(),
+            class_names: HashMap::default(),
+            class_meta_instances: HashMap::default(),
             t_class: ClassId(0),
             standard_object: ClassId(1),
             standard_class: ClassId(2),
+            funcallable_standard_class: ClassId(0),
+            funcallable_standard_object: ClassId(0),
+            standard_generic_function: ClassId(0),
+            standard_method: ClassId(0),
+            standard_direct_slot_definition: ClassId(0),
+            standard_effective_slot_definition: ClassId(0),
+            eql_specializer_class: ClassId(0),
             symbol_class: ClassId(3),
             integer_class: ClassId(4),
             generics: Vec::new(),
-            generic_names: HashMap::new(),
+            generic_names: HashMap::default(),
+            setf_generic_names: HashMap::default(),
+            setf_symbol: SymbolId(0),
             methods: Vec::new(),
-            before_wrappers: HashMap::new(),
-            after_wrappers: HashMap::new(),
-            method_combinations: HashMap::new(),
+            generic_meta_instances: HashMap::default(),
+            method_meta_instances: HashMap::default(),
+            slot_def_meta_instances: HashMap::default(),
+            standalone_slot_defs: Vec::new(),
+            before_wrappers: HashMap::default(),
+            after_wrappers: HashMap::default(),
+            method_combinations: HashMap::default(),
             instances: Vec::new(),
+            eql_specializers: Vec::new(),
+            class_dependents: HashMap::default(),
+            generic_dependents: HashMap::default(),
         };
 
         // Bootstrap the class hierarchy
         let cl = PackageId(1);
+
+        // SETF symbol (for setf function names)
+        mop.setf_symbol = symbols.intern_in("SETF", cl);
+        symbols.export_symbol(mop.setf_symbol);
 
         // T class (root)
         let t_name = symbols.intern_in("T", cl);
         symbols.export_symbol(t_name);
         mop.classes.push(Class {
             name: t_name,
+            metaclass: ClassId(2),
             supers: Vec::new(),
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
         });
         mop.class_names.insert(t_name, ClassId(0));
 
@@ -191,10 +337,16 @@ impl MetaObjectProtocol {
         symbols.export_symbol(so_name);
         mop.classes.push(Class {
             name: so_name,
+            metaclass: ClassId(2),
             supers: vec![ClassId(0)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(1), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
         });
         mop.class_names.insert(so_name, ClassId(1));
 
@@ -203,10 +355,16 @@ impl MetaObjectProtocol {
         symbols.export_symbol(sc_name);
         mop.classes.push(Class {
             name: sc_name,
+            metaclass: ClassId(2),
             supers: vec![ClassId(1)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(2), ClassId(1), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
         });
         mop.class_names.insert(sc_name, ClassId(2));
 
@@ -215,10 +373,16 @@ impl MetaObjectProtocol {
         symbols.export_symbol(sym_name);
         mop.classes.push(Class {
             name: sym_name,
+            metaclass: ClassId(2),
             supers: vec![ClassId(0)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(3), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
         });
         mop.class_names.insert(sym_name, ClassId(3));
 
@@ -227,34 +391,332 @@ impl MetaObjectProtocol {
         symbols.export_symbol(int_name);
         mop.classes.push(Class {
             name: int_name,
+            metaclass: ClassId(2),
             supers: vec![ClassId(0)],
+            direct_slots: Vec::new(),
             slots: Vec::new(),
             cpl: vec![ClassId(4), ClassId(0)],
             instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
         });
         mop.class_names.insert(int_name, ClassId(4));
+
+        // EQL-SPECIALIZER
+        let eql_spec_name = symbols.intern_in("EQL-SPECIALIZER", cl);
+        symbols.export_symbol(eql_spec_name);
+        let eql_spec_id = ClassId(mop.classes.len() as u32);
+        mop.classes.push(Class {
+            name: eql_spec_name,
+            metaclass: ClassId(2),
+            supers: vec![mop.standard_object],
+            direct_slots: Vec::new(),
+            slots: Vec::new(),
+            cpl: vec![eql_spec_id, mop.standard_object, mop.t_class],
+            instance_size: 0,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs: Vec::new(),
+            default_initargs: Vec::new(),
+        });
+        mop.class_names.insert(eql_spec_name, eql_spec_id);
+        mop.eql_specializer_class = eql_spec_id;
+
+        // Populate direct subclasses for bootstrap classes.
+        let class_count = mop.classes.len();
+        for id in 0..class_count {
+            let supers = mop.classes[id].supers.clone();
+            for super_id in supers {
+                if let Some(cls) = mop.classes.get_mut(super_id.0 as usize) {
+                    let cid = ClassId(id as u32);
+                    if !cls.direct_subclasses.contains(&cid) {
+                        cls.direct_subclasses.push(cid);
+                    }
+                }
+            }
+        }
+
+        // Define standard-class slots for class metaobjects.
+        let kw = PackageId(0);
+        let k_name = symbols.intern_in("NAME", cl);
+        let k_direct_supers = symbols.intern_in("DIRECT-SUPERCLASSES", cl);
+        let k_direct_subs = symbols.intern_in("DIRECT-SUBCLASSES", cl);
+        let k_direct_slots = symbols.intern_in("DIRECT-SLOTS", cl);
+        let k_cpl = symbols.intern_in("CLASS-PRECEDENCE-LIST", cl);
+        let k_slots = symbols.intern_in("SLOTS", cl);
+        let k_finalized = symbols.intern_in("FINALIZED-P", cl);
+        let k_instance_size = symbols.intern_in("INSTANCE-SIZE", cl);
+        let k_direct_default_initargs = symbols.intern_in("DIRECT-DEFAULT-INITARGS", cl);
+        let k_default_initargs = symbols.intern_in("DEFAULT-INITARGS", cl);
+        // Export metaobject slot names so CL-USER inherits them.
+        for sym in [
+            k_name,
+            k_direct_supers,
+            k_direct_subs,
+            k_direct_slots,
+            k_cpl,
+            k_slots,
+            k_finalized,
+            k_instance_size,
+            k_direct_default_initargs,
+            k_default_initargs,
+        ] {
+            symbols.export_symbol(sym);
+        }
+
+        let kw_name = symbols.intern_in("NAME", kw);
+        let kw_direct_supers = symbols.intern_in("DIRECT-SUPERCLASSES", kw);
+        let kw_direct_subs = symbols.intern_in("DIRECT-SUBCLASSES", kw);
+        let kw_direct_slots = symbols.intern_in("DIRECT-SLOTS", kw);
+        let kw_cpl = symbols.intern_in("CLASS-PRECEDENCE-LIST", kw);
+        let kw_slots = symbols.intern_in("SLOTS", kw);
+        let kw_finalized = symbols.intern_in("FINALIZED-P", kw);
+        let kw_instance_size = symbols.intern_in("INSTANCE-SIZE", kw);
+        let kw_direct_default_initargs = symbols.intern_in("DIRECT-DEFAULT-INITARGS", kw);
+        let kw_default_initargs = symbols.intern_in("DEFAULT-INITARGS", kw);
+
+        let mut sc_slots = Vec::new();
+        let mut push_slot = |name: SymbolId, initarg: SymbolId, index: usize| {
+            sc_slots.push(SlotDefinition {
+                name,
+                initform: None,
+                initfunction: None,
+                initarg: Some(initarg),
+                readers: Vec::new(),
+                writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
+                index,
+            });
+        };
+        push_slot(k_name, kw_name, 0);
+        push_slot(k_direct_supers, kw_direct_supers, 1);
+        push_slot(k_direct_subs, kw_direct_subs, 2);
+        push_slot(k_direct_slots, kw_direct_slots, 3);
+        push_slot(k_cpl, kw_cpl, 4);
+        push_slot(k_slots, kw_slots, 5);
+        push_slot(k_finalized, kw_finalized, 6);
+        push_slot(k_instance_size, kw_instance_size, 7);
+        push_slot(k_direct_default_initargs, kw_direct_default_initargs, 8);
+        push_slot(k_default_initargs, kw_default_initargs, 9);
+
+        let _ = mop.define_class(sc_name, vec![mop.standard_object], sc_slots);
+
+        // FUNCALLABLE-STANDARD-CLASS
+        let fsc_name = symbols.intern_in("FUNCALLABLE-STANDARD-CLASS", cl);
+        symbols.export_symbol(fsc_name);
+        let fsc_id = mop.define_class(fsc_name, vec![mop.standard_class], Vec::new());
+        mop.funcallable_standard_class = fsc_id;
+
+        // FUNCALLABLE-STANDARD-OBJECT
+        let fso_name = symbols.intern_in("FUNCALLABLE-STANDARD-OBJECT", cl);
+        symbols.export_symbol(fso_name);
+        let fso_id = mop.define_class_with_meta(
+            fso_name,
+            vec![mop.standard_object],
+            Vec::new(),
+            Some(fsc_id),
+            Vec::new(),
+        );
+        mop.funcallable_standard_object = fso_id;
+
+        // STANDARD-GENERIC-FUNCTION
+        let sgf_name = symbols.intern_in("STANDARD-GENERIC-FUNCTION", cl);
+        symbols.export_symbol(sgf_name);
+        let k_lambda_list = symbols.intern_in("LAMBDA-LIST", cl);
+        let k_methods = symbols.intern_in("METHODS", cl);
+        let k_method_combination = symbols.intern_in("METHOD-COMBINATION", cl);
+        let k_arg_precedence = symbols.intern_in("ARGUMENT-PRECEDENCE-ORDER", cl);
+        for sym in [k_lambda_list, k_methods, k_method_combination, k_arg_precedence] {
+            symbols.export_symbol(sym);
+        }
+        let kw_lambda_list = symbols.intern_in("LAMBDA-LIST", kw);
+        let kw_methods = symbols.intern_in("METHODS", kw);
+        let kw_method_combination = symbols.intern_in("METHOD-COMBINATION", kw);
+        let kw_arg_precedence = symbols.intern_in("ARGUMENT-PRECEDENCE-ORDER", kw);
+
+        let mut sgf_slots = Vec::new();
+        let mut push_sgf_slot = |name: SymbolId, initarg: SymbolId, index: usize| {
+            sgf_slots.push(SlotDefinition {
+                name,
+                initform: None,
+                initfunction: None,
+                initarg: Some(initarg),
+                readers: Vec::new(),
+                writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
+                index,
+            });
+        };
+        push_sgf_slot(k_name, kw_name, 0);
+        push_sgf_slot(k_lambda_list, kw_lambda_list, 1);
+        push_sgf_slot(k_methods, kw_methods, 2);
+        push_sgf_slot(k_method_combination, kw_method_combination, 3);
+        push_sgf_slot(k_arg_precedence, kw_arg_precedence, 4);
+        let sgf_id = mop.define_class_with_meta(
+            sgf_name,
+            vec![mop.funcallable_standard_object],
+            sgf_slots,
+            Some(mop.funcallable_standard_class),
+            Vec::new(),
+        );
+        mop.standard_generic_function = sgf_id;
+
+        // STANDARD-METHOD
+        let sm_name = symbols.intern_in("STANDARD-METHOD", cl);
+        symbols.export_symbol(sm_name);
+        let k_qualifiers = symbols.intern_in("QUALIFIERS", cl);
+        let k_specializers = symbols.intern_in("SPECIALIZERS", cl);
+        let k_generic_function = symbols.intern_in("GENERIC-FUNCTION", cl);
+        let k_function = symbols.intern_in("FUNCTION", cl);
+        for sym in [
+            k_qualifiers,
+            k_specializers,
+            k_generic_function,
+            k_function,
+        ] {
+            symbols.export_symbol(sym);
+        }
+        let kw_qualifiers = symbols.intern_in("QUALIFIERS", kw);
+        let kw_specializers = symbols.intern_in("SPECIALIZERS", kw);
+        let kw_generic_function = symbols.intern_in("GENERIC-FUNCTION", kw);
+        let kw_function = symbols.intern_in("FUNCTION", kw);
+
+        let mut sm_slots = Vec::new();
+        let mut push_sm_slot = |name: SymbolId, initarg: SymbolId, index: usize| {
+            sm_slots.push(SlotDefinition {
+                name,
+                initform: None,
+                initfunction: None,
+                initarg: Some(initarg),
+                readers: Vec::new(),
+                writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
+                index,
+            });
+        };
+        push_sm_slot(k_lambda_list, kw_lambda_list, 0);
+        push_sm_slot(k_qualifiers, kw_qualifiers, 1);
+        push_sm_slot(k_specializers, kw_specializers, 2);
+        push_sm_slot(k_generic_function, kw_generic_function, 3);
+        push_sm_slot(k_function, kw_function, 4);
+        let sm_id = mop.define_class(sm_name, vec![mop.standard_object], sm_slots);
+        mop.standard_method = sm_id;
+
+        // STANDARD-DIRECT-SLOT-DEFINITION / STANDARD-EFFECTIVE-SLOT-DEFINITION
+        let sdsd_name = symbols.intern_in("STANDARD-DIRECT-SLOT-DEFINITION", cl);
+        let sesd_name = symbols.intern_in("STANDARD-EFFECTIVE-SLOT-DEFINITION", cl);
+        symbols.export_symbol(sdsd_name);
+        symbols.export_symbol(sesd_name);
+        let k_initform = symbols.intern_in("INITFORM", cl);
+        let k_initfunction = symbols.intern_in("INITFUNCTION", cl);
+        let k_initargs = symbols.intern_in("INITARGS", cl);
+        let k_readers = symbols.intern_in("READERS", cl);
+        let k_writers = symbols.intern_in("WRITERS", cl);
+        let k_allocation = symbols.intern_in("ALLOCATION", cl);
+        let k_type = symbols.intern_in("TYPE", cl);
+        let k_location = symbols.intern_in("LOCATION", cl);
+        for sym in [
+            k_initform,
+            k_initfunction,
+            k_initargs,
+            k_readers,
+            k_writers,
+            k_allocation,
+            k_type,
+            k_location,
+        ] {
+            symbols.export_symbol(sym);
+        }
+        let kw_initform = symbols.intern_in("INITFORM", kw);
+        let kw_initfunction = symbols.intern_in("INITFUNCTION", kw);
+        let kw_initargs = symbols.intern_in("INITARGS", kw);
+        let kw_readers = symbols.intern_in("READERS", kw);
+        let kw_writers = symbols.intern_in("WRITERS", kw);
+        let kw_allocation = symbols.intern_in("ALLOCATION", kw);
+        let kw_type = symbols.intern_in("TYPE", kw);
+        let kw_location = symbols.intern_in("LOCATION", kw);
+
+        let mut slotdef_slots = Vec::new();
+        let mut push_slotdef_slot = |name: SymbolId, initarg: SymbolId, index: usize| {
+            slotdef_slots.push(SlotDefinition {
+                name,
+                initform: None,
+                initfunction: None,
+                initarg: Some(initarg),
+                readers: Vec::new(),
+                writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
+                index,
+            });
+        };
+        push_slotdef_slot(k_name, kw_name, 0);
+        push_slotdef_slot(k_initform, kw_initform, 1);
+        push_slotdef_slot(k_initfunction, kw_initfunction, 2);
+        push_slotdef_slot(k_initargs, kw_initargs, 3);
+        push_slotdef_slot(k_readers, kw_readers, 4);
+        push_slotdef_slot(k_writers, kw_writers, 5);
+        push_slotdef_slot(k_allocation, kw_allocation, 6);
+        push_slotdef_slot(k_type, kw_type, 7);
+        push_slotdef_slot(k_location, kw_location, 8);
+
+        let sdsd_id = mop.define_class(sdsd_name, vec![mop.standard_object], slotdef_slots.clone());
+        let sesd_id = mop.define_class(sesd_name, vec![mop.standard_object], slotdef_slots);
+        mop.standard_direct_slot_definition = sdsd_id;
+        mop.standard_effective_slot_definition = sesd_id;
 
         mop
     }
 
-    /// Define a new class
-    pub fn define_class(
+    /// Define a new class with optional metaclass and direct default initargs.
+    pub fn define_class_with_meta(
         &mut self,
         name: SymbolId,
         supers: Vec<ClassId>,
         slots: Vec<SlotDefinition>,
+        metaclass: Option<ClassId>,
+        direct_default_initargs: Vec<(SymbolId, NodeId)>,
     ) -> ClassId {
-        let id = if let Some(&existing_id) = self.class_names.get(&name) {
-            existing_id
-        } else {
-            ClassId(self.classes.len() as u32)
-        };
+        let existing_id = self.class_names.get(&name).copied();
+        let id = existing_id.unwrap_or_else(|| ClassId(self.classes.len() as u32));
+
+        let metaclass = metaclass
+            .or_else(|| {
+                existing_id.and_then(|eid| {
+                    self.classes
+                        .get(eid.0 as usize)
+                        .map(|c| c.metaclass)
+                })
+            })
+            .unwrap_or(self.standard_class);
 
         let supers = if supers.is_empty() {
-            vec![self.standard_object]
+            if self.funcallable_standard_class.0 != 0
+                && metaclass == self.funcallable_standard_class
+                && self.funcallable_standard_object.0 != 0
+            {
+                vec![self.funcallable_standard_object]
+            } else {
+                vec![self.standard_object]
+            }
         } else {
             supers
         };
+        let supers_clone = supers.clone();
+
+        // Track old supers for subclass list maintenance.
+        let old_supers = existing_id
+            .and_then(|eid| self.classes.get(eid.0 as usize).map(|c| c.supers.clone()))
+            .unwrap_or_default();
 
         // Compute CPL independent of mutation
         // Simplistic linearization: class + supers linearized
@@ -278,13 +740,12 @@ impl MetaObjectProtocol {
         }
 
         // Compute effective slots
-        // Start with direct slots
-        let mut effective_slots = Vec::new();
+        let mut effective_slots: Vec<SlotDefinition> = Vec::new();
 
         // 1. Collect inherited slots from supers
         // Since supers already have effective slots (if this is sequential), we can use them.
         // Handling multiple inheritance duplicates: simplistically use first found.
-        let mut seen_slots = std::collections::HashSet::new();
+        let mut seen_slots = crate::fastmap::HashSet::default();
 
         // Traverse CPL (excluding self which is first) to gather slots in precedence order?
         // Actually, for instance layout, we want supers first usually (C++ style) or specific?
@@ -295,7 +756,11 @@ impl MetaObjectProtocol {
             if let Some(super_class) = self.classes.get(super_id.0 as usize) {
                 for slot in &super_class.slots {
                     if !seen_slots.contains(&slot.name) {
-                        effective_slots.push(slot.clone());
+                        let mut inherited = slot.clone();
+                        if inherited.allocation == SlotAllocation::Class {
+                            inherited.class_value = None;
+                        }
+                        effective_slots.push(inherited);
                         seen_slots.insert(slot.name);
                     }
                 }
@@ -303,7 +768,7 @@ impl MetaObjectProtocol {
         }
 
         // 2. Add/Merge direct slots
-        for direct_slot in slots {
+        for direct_slot in slots.clone() {
             // Check if we shadow a slot
             if let Some(pos) = effective_slots
                 .iter()
@@ -321,29 +786,100 @@ impl MetaObjectProtocol {
         }
 
         // 3. Re-index
-        for (i, slot) in effective_slots.iter_mut().enumerate() {
-            slot.index = i;
+        let mut instance_index = 0;
+        for slot in effective_slots.iter_mut() {
+            if slot.allocation == SlotAllocation::Instance {
+                slot.index = instance_index;
+                instance_index += 1;
+            } else {
+                slot.index = usize::MAX;
+            }
+            if slot.allocation == SlotAllocation::Class && slot.class_value.is_none() {
+                slot.class_value = slot.initform;
+            }
         }
 
-        let instance_size = effective_slots.len();
+        let instance_size = instance_index;
+
+        // Compute effective default initargs from CPL (general -> specific).
+        let mut default_initargs: Vec<(SymbolId, NodeId)> = Vec::new();
+        let mut initarg_positions: HashMap<SymbolId, usize> = HashMap::default();
+        for &cid in cpl.iter().rev() {
+            let pairs = if cid == id {
+                direct_default_initargs.clone()
+            } else {
+                self.classes
+                    .get(cid.0 as usize)
+                    .map(|c| c.direct_default_initargs.clone())
+                    .unwrap_or_default()
+            };
+            for (key, val) in pairs {
+                if let Some(pos) = initarg_positions.get(&key) {
+                    default_initargs[*pos].1 = val;
+                } else {
+                    initarg_positions.insert(key, default_initargs.len());
+                    default_initargs.push((key, val));
+                }
+            }
+        }
 
         // For now, let's just create/overwrite.
         let class_def = Class {
             name,
-            supers,
+            metaclass,
+            supers: supers.clone(),
+            direct_slots: slots,
             slots: effective_slots,
             cpl,
             instance_size,
+            direct_subclasses: Vec::new(),
+            finalized: true,
+            direct_default_initargs,
+            default_initargs,
         };
 
-        if let Some(&existing_id) = self.class_names.get(&name) {
+        if let Some(existing_id) = existing_id {
+            // Preserve existing direct subclasses list when redefining.
+            let direct_subclasses = self.classes[existing_id.0 as usize]
+                .direct_subclasses
+                .clone();
+            let mut class_def = class_def;
+            class_def.direct_subclasses = direct_subclasses;
             self.classes[existing_id.0 as usize] = class_def;
-            existing_id
         } else {
             self.classes.push(class_def);
             self.class_names.insert(name, id);
-            id
         }
+
+        // Update direct subclass links on supers.
+        // Remove from old supers no longer referenced.
+        for old_super in old_supers.iter() {
+            if !supers.contains(old_super) {
+                if let Some(cls) = self.classes.get_mut(old_super.0 as usize) {
+                    cls.direct_subclasses.retain(|c| *c != id);
+                }
+            }
+        }
+        // Add to new supers.
+        for new_super in supers_clone.iter() {
+            if let Some(cls) = self.classes.get_mut(new_super.0 as usize) {
+                if !cls.direct_subclasses.contains(&id) {
+                    cls.direct_subclasses.push(id);
+                }
+            }
+        }
+
+        id
+    }
+
+    /// Define a new class (default metaclass, no direct default initargs)
+    pub fn define_class(
+        &mut self,
+        name: SymbolId,
+        supers: Vec<ClassId>,
+        slots: Vec<SlotDefinition>,
+    ) -> ClassId {
+        self.define_class_with_meta(name, supers, slots, None, Vec::new())
     }
 
     /// Find class by name
@@ -356,15 +892,189 @@ impl MetaObjectProtocol {
         self.classes.get(id.0 as usize)
     }
 
+    /// Get mutable class by ID
+    pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
+        self.classes.get_mut(id.0 as usize)
+    }
+
+    pub fn get_class_direct_slots(&self, id: ClassId) -> Option<&[SlotDefinition]> {
+        self.classes
+            .get(id.0 as usize)
+            .map(|c| c.direct_slots.as_slice())
+    }
+
+    pub fn get_class_direct_subclasses(&self, id: ClassId) -> Option<&[ClassId]> {
+        self.classes
+            .get(id.0 as usize)
+            .map(|c| c.direct_subclasses.as_slice())
+    }
+
+    pub fn class_ids(&self) -> Vec<ClassId> {
+        (0..self.classes.len())
+            .map(|i| ClassId(i as u32))
+            .collect()
+    }
+
+    pub fn get_class_meta_instance(&self, id: ClassId) -> Option<usize> {
+        self.class_meta_instances.get(&id).copied()
+    }
+
+    pub fn set_class_meta_instance(&mut self, id: ClassId, inst: usize) {
+        self.class_meta_instances.insert(id, inst);
+    }
+
+    pub fn get_generic_meta_instance(&self, id: GenericId) -> Option<usize> {
+        self.generic_meta_instances.get(&id).copied()
+    }
+
+    pub fn set_generic_meta_instance(&mut self, id: GenericId, inst: usize) {
+        self.generic_meta_instances.insert(id, inst);
+    }
+
+    pub fn get_method_meta_instance(&self, id: MethodId) -> Option<usize> {
+        self.method_meta_instances.get(&id).copied()
+    }
+
+    pub fn set_method_meta_instance(&mut self, id: MethodId, inst: usize) {
+        self.method_meta_instances.insert(id, inst);
+    }
+
+    pub fn get_slot_def_meta_instance(
+        &self,
+        class_id: ClassId,
+        slot_idx: u32,
+        direct: bool,
+    ) -> Option<usize> {
+        self.slot_def_meta_instances
+            .get(&(class_id, slot_idx, direct))
+            .copied()
+    }
+
+    pub fn set_slot_def_meta_instance(
+        &mut self,
+        class_id: ClassId,
+        slot_idx: u32,
+        direct: bool,
+        inst: usize,
+    ) {
+        self.slot_def_meta_instances
+            .insert((class_id, slot_idx, direct), inst);
+    }
+
+    pub fn class_id_for_meta_instance(&self, inst_idx: usize) -> Option<ClassId> {
+        self.class_meta_instances
+            .iter()
+            .find(|(_, &idx)| idx == inst_idx)
+            .map(|(cid, _)| *cid)
+    }
+
+    pub fn generic_id_for_meta_instance(&self, inst_idx: usize) -> Option<GenericId> {
+        self.generic_meta_instances
+            .iter()
+            .find(|(_, &idx)| idx == inst_idx)
+            .map(|(gid, _)| *gid)
+    }
+
+    pub fn add_class_dependent(
+        &mut self,
+        class_id: ClassId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = self
+            .class_dependents
+            .entry(class_id)
+            .or_insert_with(Vec::new);
+        if deps.iter().any(|d| nodes_eq(arena, *d, dependent)) {
+            return false;
+        }
+        deps.push(dependent);
+        true
+    }
+
+    pub fn remove_class_dependent(
+        &mut self,
+        class_id: ClassId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = match self.class_dependents.get_mut(&class_id) {
+            Some(deps) => deps,
+            None => return false,
+        };
+        let before = deps.len();
+        deps.retain(|d| !nodes_eq(arena, *d, dependent));
+        before != deps.len()
+    }
+
+    pub fn class_dependents(&self, class_id: ClassId) -> Option<&[NodeId]> {
+        self.class_dependents
+            .get(&class_id)
+            .map(|deps| deps.as_slice())
+    }
+
+    pub fn add_generic_dependent(
+        &mut self,
+        generic_id: GenericId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = self
+            .generic_dependents
+            .entry(generic_id)
+            .or_insert_with(Vec::new);
+        if deps.iter().any(|d| nodes_eq(arena, *d, dependent)) {
+            return false;
+        }
+        deps.push(dependent);
+        true
+    }
+
+    pub fn remove_generic_dependent(
+        &mut self,
+        generic_id: GenericId,
+        dependent: NodeId,
+        arena: &Arena,
+    ) -> bool {
+        let deps = match self.generic_dependents.get_mut(&generic_id) {
+            Some(deps) => deps,
+            None => return false,
+        };
+        let before = deps.len();
+        deps.retain(|d| !nodes_eq(arena, *d, dependent));
+        before != deps.len()
+    }
+
+    pub fn generic_dependents(&self, generic_id: GenericId) -> Option<&[NodeId]> {
+        self.generic_dependents
+            .get(&generic_id)
+            .map(|deps| deps.as_slice())
+    }
+
+    pub fn add_standalone_slot_def(&mut self, slot: SlotDefinition) -> u32 {
+        let idx = self.standalone_slot_defs.len() as u32;
+        self.standalone_slot_defs.push(slot);
+        idx
+    }
+
+    pub fn get_standalone_slot_def(&self, idx: u32) -> Option<&SlotDefinition> {
+        self.standalone_slot_defs.get(idx as usize)
+    }
+
     /// Create an instance of a class
-    pub fn make_instance(&mut self, class_id: ClassId, nil_node: NodeId) -> Option<usize> {
+    pub fn make_instance(
+        &mut self,
+        class_id: ClassId,
+        default_slot_value: NodeId,
+    ) -> Option<usize> {
         let class = self.classes.get(class_id.0 as usize)?;
-        let slots = vec![nil_node; class.instance_size];
+        let slots = vec![default_slot_value; class.instance_size];
 
         let idx = self.instances.len();
         self.instances.push(Instance {
             class: class_id,
             slots,
+            funcallable_function: None,
         });
 
         Some(idx)
@@ -375,9 +1085,38 @@ impl MetaObjectProtocol {
         self.instances.get(idx)
     }
 
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
     /// Get mutable instance by index
     pub fn get_instance_mut(&mut self, idx: usize) -> Option<&mut Instance> {
         self.instances.get_mut(idx)
+    }
+
+    pub fn get_instance_function(&self, idx: usize) -> Option<NodeId> {
+        self.instances
+            .get(idx)
+            .and_then(|inst| inst.funcallable_function)
+    }
+
+    pub fn set_instance_function(&mut self, idx: usize, func: NodeId) -> bool {
+        if let Some(inst) = self.instances.get_mut(idx) {
+            inst.funcallable_function = Some(func);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn class_is_funcallable(&self, class_id: ClassId) -> bool {
+        if self.funcallable_standard_object.0 == 0 {
+            return false;
+        }
+        self.classes
+            .get(class_id.0 as usize)
+            .map(|c| c.cpl.contains(&self.funcallable_standard_object))
+            .unwrap_or(false)
     }
 
     /// Get slot value
@@ -400,12 +1139,28 @@ impl MetaObjectProtocol {
         }
     }
 
-    /// Define a generic function
+    /// Define a generic function (simple form).
     pub fn define_generic(&mut self, name: SymbolId, lambda_list: Vec<SymbolId>) -> GenericId {
+        let required_parameters = lambda_list.clone();
+        self.define_generic_with_options(name, lambda_list, required_parameters, None)
+    }
+
+    /// Define a generic function with lambda-list metadata.
+    pub fn define_generic_with_options(
+        &mut self,
+        name: SymbolId,
+        lambda_list: Vec<SymbolId>,
+        required_parameters: Vec<SymbolId>,
+        argument_precedence_order: Option<Vec<SymbolId>>,
+    ) -> GenericId {
         if let Some(&id) = self.generic_names.get(&name) {
             // Update existing generic (keep methods, update lambda list?)
             if let Some(gf) = self.generics.get_mut(id.0 as usize) {
                 gf.lambda_list = lambda_list;
+                gf.required_parameters = required_parameters;
+                gf.argument_precedence_order = argument_precedence_order;
+                gf.discriminating_function = None;
+                gf.method_cache.clear();
             }
             return id;
         }
@@ -413,8 +1168,12 @@ impl MetaObjectProtocol {
         let id = GenericId(self.generics.len() as u32);
 
         self.generics.push(GenericFunction {
-            name,
+            name: GenericName::Symbol(name),
             lambda_list,
+            required_parameters,
+            argument_precedence_order,
+            discriminating_function: None,
+            method_cache: HashMap::default(),
             methods: Vec::new(),
             method_combination: MethodCombination::Standard,
         });
@@ -423,14 +1182,120 @@ impl MetaObjectProtocol {
         id
     }
 
+    /// Define a setf generic function with lambda-list metadata.
+    pub fn define_setf_generic_with_options(
+        &mut self,
+        name: SymbolId,
+        lambda_list: Vec<SymbolId>,
+        required_parameters: Vec<SymbolId>,
+        argument_precedence_order: Option<Vec<SymbolId>>,
+    ) -> GenericId {
+        if let Some(&id) = self.setf_generic_names.get(&name) {
+            if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+                gf.lambda_list = lambda_list;
+                gf.required_parameters = required_parameters;
+                gf.argument_precedence_order = argument_precedence_order;
+                gf.discriminating_function = None;
+                gf.method_cache.clear();
+            }
+            return id;
+        }
+
+        let id = GenericId(self.generics.len() as u32);
+
+        self.generics.push(GenericFunction {
+            name: GenericName::Setf(name),
+            lambda_list,
+            required_parameters,
+            argument_precedence_order,
+            discriminating_function: None,
+            method_cache: HashMap::default(),
+            methods: Vec::new(),
+            method_combination: MethodCombination::Standard,
+        });
+
+        self.setf_generic_names.insert(name, id);
+        id
+    }
+
     /// Find generic function by name
     pub fn find_generic(&self, name: SymbolId) -> Option<GenericId> {
         self.generic_names.get(&name).copied()
     }
 
+    /// Find setf generic function by name
+    pub fn find_setf_generic(&self, name: SymbolId) -> Option<GenericId> {
+        self.setf_generic_names.get(&name).copied()
+    }
+
     /// Get generic function by ID
     pub fn get_generic(&self, id: GenericId) -> Option<&GenericFunction> {
         self.generics.get(id.0 as usize)
+    }
+
+    pub fn get_generic_argument_precedence_order(
+        &self,
+        id: GenericId,
+    ) -> Option<&[SymbolId]> {
+        self.generics.get(id.0 as usize).and_then(|gf| {
+            gf.argument_precedence_order
+                .as_ref()
+                .map(|order| order.as_slice())
+                .or_else(|| Some(gf.required_parameters.as_slice()))
+        })
+    }
+
+    pub fn get_generic_required_parameters(&self, id: GenericId) -> Option<&[SymbolId]> {
+        self.generics
+            .get(id.0 as usize)
+            .map(|gf| gf.required_parameters.as_slice())
+    }
+
+    pub fn get_generic_discriminating_function(&self, id: GenericId) -> Option<NodeId> {
+        self.generics
+            .get(id.0 as usize)
+            .and_then(|gf| gf.discriminating_function)
+    }
+
+    pub fn set_generic_discriminating_function(&mut self, id: GenericId, df: NodeId) {
+        if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+            gf.discriminating_function = Some(df);
+        }
+    }
+
+    pub fn clear_generic_discriminating_function(&mut self, id: GenericId) {
+        if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+            gf.discriminating_function = None;
+        }
+    }
+
+    pub fn get_cached_effective_method(
+        &self,
+        id: GenericId,
+        arg_classes: &[ClassId],
+    ) -> Option<NodeId> {
+        self.generics.get(id.0 as usize).and_then(|gf| {
+            gf.method_cache
+                .get(arg_classes)
+                .copied()
+        })
+    }
+
+    pub fn set_cached_effective_method(
+        &mut self,
+        id: GenericId,
+        arg_classes: Vec<ClassId>,
+        func: NodeId,
+    ) {
+        if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+            gf.method_cache.insert(arg_classes, func);
+        }
+    }
+
+    pub fn clear_method_cache(&mut self, id: GenericId) {
+        if let Some(gf) = self.generics.get_mut(id.0 as usize) {
+            gf.method_cache.clear();
+        }
     }
 
     pub fn set_generic_method_combination(
@@ -440,6 +1305,8 @@ impl MetaObjectProtocol {
     ) {
         if let Some(gf) = self.generics.get_mut(id.0 as usize) {
             gf.method_combination = method_combination;
+            gf.discriminating_function = None;
+            gf.method_cache.clear();
         }
     }
 
@@ -459,8 +1326,9 @@ impl MetaObjectProtocol {
     pub fn add_method(
         &mut self,
         generic_id: GenericId,
-        specializers: Vec<ClassId>,
+        specializers: Vec<Specializer>,
         qualifiers: Vec<SymbolId>,
+        lambda_list: Vec<SymbolId>,
         body: NodeId,
     ) -> MethodId {
         let method_id = MethodId(self.methods.len() as u32);
@@ -468,11 +1336,34 @@ impl MetaObjectProtocol {
         self.methods.push(Method {
             specializers,
             qualifiers,
+            lambda_list,
             body,
+            generic: Some(generic_id),
         });
 
+        let new_specs = self.methods[method_id.0 as usize].specializers.clone();
+        let new_quals = self.methods[method_id.0 as usize].qualifiers.clone();
+
+        let existing_pos = self
+            .generics
+            .get(generic_id.0 as usize)
+            .and_then(|gf| {
+                gf.methods.iter().position(|mid| {
+                    if let Some(m) = self.methods.get(mid.0 as usize) {
+                        m.specializers == new_specs && m.qualifiers == new_quals
+                    } else {
+                        false
+                    }
+                })
+            });
+
         if let Some(gf) = self.generics.get_mut(generic_id.0 as usize) {
+            if let Some(pos) = existing_pos {
+                gf.methods.remove(pos);
+            }
             gf.methods.push(method_id);
+            gf.discriminating_function = None;
+            gf.method_cache.clear();
         }
 
         method_id
@@ -481,7 +1372,7 @@ impl MetaObjectProtocol {
     /// Add a method without attaching it to a generic function (used for wrappers).
     pub fn add_method_raw(
         &mut self,
-        specializers: Vec<ClassId>,
+        specializers: Vec<Specializer>,
         qualifiers: Vec<SymbolId>,
         body: NodeId,
     ) -> MethodId {
@@ -489,7 +1380,9 @@ impl MetaObjectProtocol {
         self.methods.push(Method {
             specializers,
             qualifiers,
+            lambda_list: Vec::new(),
             body,
+            generic: None,
         });
         method_id
     }
@@ -501,6 +1394,58 @@ impl MetaObjectProtocol {
 
     pub fn get_method_qualifiers(&self, id: MethodId) -> Option<&[SymbolId]> {
         self.methods.get(id.0 as usize).map(|m| m.qualifiers.as_slice())
+    }
+
+    pub fn get_method_specializers(&self, id: MethodId) -> Option<&[Specializer]> {
+        self.methods
+            .get(id.0 as usize)
+            .map(|m| m.specializers.as_slice())
+    }
+
+    pub fn get_method_lambda_list(&self, id: MethodId) -> Option<&[SymbolId]> {
+        self.methods
+            .get(id.0 as usize)
+            .map(|m| m.lambda_list.as_slice())
+    }
+
+    pub fn get_method_generic(&self, id: MethodId) -> Option<GenericId> {
+        self.methods.get(id.0 as usize).and_then(|m| m.generic)
+    }
+
+    pub fn class_direct_methods(&self, class_id: ClassId) -> Vec<MethodId> {
+        let target = Specializer::Class(class_id);
+        self.specializer_direct_methods(&target)
+    }
+
+    pub fn class_direct_generic_functions(&self, class_id: ClassId) -> Vec<GenericId> {
+        let target = Specializer::Class(class_id);
+        self.specializer_direct_generic_functions(&target)
+    }
+
+    pub fn specializer_direct_methods(&self, spec: &Specializer) -> Vec<MethodId> {
+        let mut methods = Vec::new();
+        for (idx, method) in self.methods.iter().enumerate() {
+            if method.specializers.iter().any(|s| s == spec) {
+                methods.push(MethodId(idx as u32));
+            }
+        }
+        methods
+    }
+
+    pub fn specializer_direct_generic_functions(&self, spec: &Specializer) -> Vec<GenericId> {
+        let mut generics = Vec::new();
+        let mut seen = crate::fastmap::HashSet::default();
+        for method in self.methods.iter() {
+            if !method.specializers.iter().any(|s| s == spec) {
+                continue;
+            }
+            if let Some(gid) = method.generic {
+                if seen.insert(gid) {
+                    generics.push(gid);
+                }
+            }
+        }
+        generics
     }
 
     pub fn get_wrapper(&self, kind: WrapperKind, id: MethodId) -> Option<MethodId> {
@@ -531,8 +1476,245 @@ impl MetaObjectProtocol {
         false
     }
 
-    /// Find applicable methods for given argument classes
+    pub fn get_eql_specializer_object(&self, idx: u32) -> Option<NodeId> {
+        self.eql_specializers
+            .get(idx as usize)
+            .map(|s| s.object)
+    }
+
+    pub fn intern_eql_specializer(&mut self, arena: &Arena, object: NodeId) -> u32 {
+        for (idx, spec) in self.eql_specializers.iter().enumerate() {
+            if self.eql_nodes(arena, spec.object, object) {
+                return idx as u32;
+            }
+        }
+        let idx = self.eql_specializers.len() as u32;
+        self.eql_specializers.push(EqlSpecializer { object });
+        idx
+    }
+
+    pub fn generic_uses_eql_specializers(&self, generic_id: GenericId) -> bool {
+        if let Some(gf) = self.get_generic(generic_id) {
+            for &mid in &gf.methods {
+                if let Some(method) = self.get_method(mid) {
+                    if method
+                        .specializers
+                        .iter()
+                        .any(|s| matches!(s, Specializer::Eql(_)))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn class_of_node(&self, node: NodeId, arena: &Arena) -> ClassId {
+        match arena.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Instance(id)) => self
+                .get_instance(*id as usize)
+                .map(|i| i.class)
+                .unwrap_or(self.standard_object),
+            Node::Leaf(OpaqueValue::Class(_)) => self.standard_class,
+            Node::Leaf(OpaqueValue::Symbol(_)) => self.symbol_class,
+            Node::Leaf(OpaqueValue::Integer(_)) => self.integer_class,
+            Node::Leaf(OpaqueValue::Generic(_)) => self.standard_generic_function,
+            Node::Leaf(OpaqueValue::Method(_)) => self.standard_method,
+            Node::Leaf(OpaqueValue::SlotDefinition(_, _, direct)) => {
+                if *direct {
+                    self.standard_direct_slot_definition
+                } else {
+                    self.standard_effective_slot_definition
+                }
+            }
+            Node::Leaf(OpaqueValue::EqlSpecializer(_)) => self.eql_specializer_class,
+            _ => self.t_class,
+        }
+    }
+
+    fn eql_nodes(&self, arena: &Arena, a: NodeId, b: NodeId) -> bool {
+        if a == b {
+            return true;
+        }
+
+        match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+            (Node::Leaf(OpaqueValue::Integer(ai)), Node::Leaf(OpaqueValue::Integer(bi))) => {
+                return ai == bi;
+            }
+            (Node::Leaf(OpaqueValue::BigInt(ai)), Node::Leaf(OpaqueValue::BigInt(bi))) => {
+                return ai == bi;
+            }
+            (Node::Leaf(OpaqueValue::Float(af)), Node::Leaf(OpaqueValue::Float(bf))) => {
+                return af == bf;
+            }
+            (Node::Leaf(OpaqueValue::Integer(ai)), Node::Leaf(OpaqueValue::Float(bf))) => {
+                return (*ai as f64) == *bf;
+            }
+            (Node::Leaf(OpaqueValue::Float(af)), Node::Leaf(OpaqueValue::Integer(bi))) => {
+                return *af == (*bi as f64);
+            }
+            (Node::Leaf(OpaqueValue::BigInt(ai)), Node::Leaf(OpaqueValue::Float(bf))) => {
+                return ai.to_f64().unwrap_or(f64::INFINITY) == *bf;
+            }
+            (Node::Leaf(OpaqueValue::Float(af)), Node::Leaf(OpaqueValue::BigInt(bi))) => {
+                return *af == bi.to_f64().unwrap_or(f64::INFINITY);
+            }
+            (Node::Leaf(OpaqueValue::Integer(ai)), Node::Leaf(OpaqueValue::BigInt(bi))) => {
+                return num_bigint::BigInt::from(*ai) == *bi;
+            }
+            (Node::Leaf(OpaqueValue::BigInt(ai)), Node::Leaf(OpaqueValue::Integer(bi))) => {
+                return *ai == num_bigint::BigInt::from(*bi);
+            }
+            _ => {}
+        }
+
+        match (arena.get_unchecked(a), arena.get_unchecked(b)) {
+            (Node::Leaf(OpaqueValue::Symbol(id1)), Node::Leaf(OpaqueValue::Symbol(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Class(id1)), Node::Leaf(OpaqueValue::Class(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Instance(id1)), Node::Leaf(OpaqueValue::Instance(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Generic(id1)), Node::Leaf(OpaqueValue::Generic(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::Method(id1)), Node::Leaf(OpaqueValue::Method(id2))) => {
+                id1 == id2
+            }
+            (Node::Leaf(OpaqueValue::EqlSpecializer(id1)), Node::Leaf(OpaqueValue::EqlSpecializer(id2))) => {
+                id1 == id2
+            }
+            (
+                Node::Leaf(OpaqueValue::SlotDefinition(c1, s1, d1)),
+                Node::Leaf(OpaqueValue::SlotDefinition(c2, s2, d2)),
+            ) => c1 == c2 && s1 == s2 && d1 == d2,
+            (Node::Leaf(OpaqueValue::Nil), Node::Leaf(OpaqueValue::Nil)) => true,
+            _ => false,
+        }
+    }
+
+    fn method_applicable_values(
+        &self,
+        method: &Method,
+        arg_values: &[NodeId],
+        arg_classes: &[ClassId],
+        arena: &Arena,
+    ) -> bool {
+        if method.specializers.len() > arg_values.len() {
+            return false;
+        }
+
+        for (i, spec) in method.specializers.iter().enumerate() {
+            match spec {
+                Specializer::Class(class_id) => {
+                    if let Some(&arg_class) = arg_classes.get(i) {
+                        if let Some(class) = self.classes.get(arg_class.0 as usize) {
+                            if !class.cpl.contains(class_id) {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                Specializer::Eql(idx) => {
+                    let obj = match self.get_eql_specializer_object(*idx) {
+                        Some(obj) => obj,
+                        None => return false,
+                    };
+                    let arg = match arg_values.get(i) {
+                        Some(v) => *v,
+                        None => return false,
+                    };
+                    if !self.eql_nodes(arena, obj, arg) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn method_applicable_classes(&self, method: &Method, arg_classes: &[ClassId]) -> bool {
+        if method
+            .specializers
+            .iter()
+            .any(|s| matches!(s, Specializer::Eql(_)))
+        {
+            return false;
+        }
+
+        if method.specializers.len() > arg_classes.len() {
+            return false;
+        }
+
+        for (i, spec) in method.specializers.iter().enumerate() {
+            let class_id = match spec {
+                Specializer::Class(cid) => cid,
+                Specializer::Eql(_) => return false,
+            };
+            if let Some(&arg_class) = arg_classes.get(i) {
+                if let Some(class) = self.classes.get(arg_class.0 as usize) {
+                    if !class.cpl.contains(class_id) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Find applicable methods for given argument values
     pub fn compute_applicable_methods(
+        &self,
+        generic_id: GenericId,
+        arg_values: &[NodeId],
+        arena: &Arena,
+    ) -> Vec<MethodId> {
+        let gf = match self.get_generic(generic_id) {
+            Some(gf) => gf,
+            None => return Vec::new(),
+        };
+
+        let arg_classes: Vec<ClassId> = arg_values
+            .iter()
+            .map(|&v| self.class_of_node(v, arena))
+            .collect();
+
+        let mut applicable = Vec::new();
+
+        for &method_id in &gf.methods {
+            if let Some(method) = self.get_method(method_id) {
+                if self.method_applicable_values(method, arg_values, &arg_classes, arena) {
+                    applicable.push(method_id);
+                }
+            }
+        }
+
+        let order = self.argument_precedence_order_indices(generic_id);
+
+        // Sort by specificity (most specific first)
+        applicable.sort_by(|&a, &b| {
+            let ma = self.get_method(a).unwrap();
+            let mb = self.get_method(b).unwrap();
+            self.compare_method_specificity(ma, mb, &arg_classes, &order)
+        });
+
+        applicable
+    }
+
+    /// Find applicable methods for given argument classes (EQL specializers ignored)
+    pub fn compute_applicable_methods_using_classes(
         &self,
         generic_id: GenericId,
         arg_classes: &[ClassId],
@@ -546,40 +1728,47 @@ impl MetaObjectProtocol {
 
         for &method_id in &gf.methods {
             if let Some(method) = self.get_method(method_id) {
-                if self.method_applicable(method, arg_classes) {
+                if self.method_applicable_classes(method, arg_classes) {
                     applicable.push(method_id);
                 }
             }
         }
 
-        // Sort by specificity (most specific first)
+        let order = self.argument_precedence_order_indices(generic_id);
+
         applicable.sort_by(|&a, &b| {
             let ma = self.get_method(a).unwrap();
             let mb = self.get_method(b).unwrap();
-            self.compare_method_specificity(ma, mb, arg_classes)
+            self.compare_method_specificity(ma, mb, arg_classes, &order)
         });
 
         applicable
     }
 
-    pub fn method_applicable(&self, method: &Method, arg_classes: &[ClassId]) -> bool {
-        if method.specializers.len() > arg_classes.len() {
-            return false;
-        }
+    fn argument_precedence_order_indices(&self, generic_id: GenericId) -> Vec<usize> {
+        let gf = match self.get_generic(generic_id) {
+            Some(gf) => gf,
+            None => return Vec::new(),
+        };
 
-        for (i, &spec) in method.specializers.iter().enumerate() {
-            if let Some(&arg_class) = arg_classes.get(i) {
-                if let Some(class) = self.classes.get(arg_class.0 as usize) {
-                    if !class.cpl.contains(&spec) {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
+        let required = &gf.required_parameters;
+        let order_syms = gf
+            .argument_precedence_order
+            .as_ref()
+            .unwrap_or(required);
+
+        let mut indices = Vec::new();
+        for sym in order_syms {
+            if let Some(idx) = required.iter().position(|s| s == sym) {
+                indices.push(idx);
             }
         }
 
-        true
+        if indices.is_empty() {
+            indices = (0..required.len()).collect();
+        }
+
+        indices
     }
 
     fn compare_method_specificity(
@@ -587,22 +1776,54 @@ impl MetaObjectProtocol {
         ma: &Method,
         mb: &Method,
         arg_classes: &[ClassId],
+        order: &[usize],
     ) -> std::cmp::Ordering {
         // Compare based on argument class precedence lists (most specific first).
-        for (i, arg_class) in arg_classes.iter().enumerate() {
+        let indices: Vec<usize> = if order.is_empty() {
+            (0..arg_classes.len()).collect()
+        } else {
+            order.to_vec()
+        };
+
+        for &i in &indices {
+            let arg_class = match arg_classes.get(i) {
+                Some(class) => class,
+                None => continue,
+            };
             let cpl = match self.classes.get(arg_class.0 as usize) {
                 Some(c) => &c.cpl,
                 None => continue,
             };
 
-            let sa = ma.specializers.get(i).copied().unwrap_or(self.t_class);
-            let sb = mb.specializers.get(i).copied().unwrap_or(self.t_class);
+            let sa = ma
+                .specializers
+                .get(i)
+                .cloned()
+                .unwrap_or(Specializer::Class(self.t_class));
+            let sb = mb
+                .specializers
+                .get(i)
+                .cloned()
+                .unwrap_or(Specializer::Class(self.t_class));
 
-            let posa = cpl.iter().position(|c| *c == sa).unwrap_or(usize::MAX);
-            let posb = cpl.iter().position(|c| *c == sb).unwrap_or(usize::MAX);
+            match (&sa, &sb) {
+                (Specializer::Eql(_), Specializer::Class(_)) => {
+                    return std::cmp::Ordering::Less;
+                }
+                (Specializer::Class(_), Specializer::Eql(_)) => {
+                    return std::cmp::Ordering::Greater;
+                }
+                (Specializer::Eql(_), Specializer::Eql(_)) => {
+                    continue;
+                }
+                (Specializer::Class(ca), Specializer::Class(cb)) => {
+                    let posa = cpl.iter().position(|c| *c == *ca).unwrap_or(usize::MAX);
+                    let posb = cpl.iter().position(|c| *c == *cb).unwrap_or(usize::MAX);
 
-            if posa != posb {
-                return posa.cmp(&posb);
+                    if posa != posb {
+                        return posa.cmp(&posb);
+                    }
+                }
             }
         }
 
@@ -616,6 +1837,15 @@ impl MetaObjectProtocol {
             for slot in &class.slots {
                 if let Some(initform) = slot.initform {
                     roots.push(initform);
+                }
+                if let Some(initfn) = slot.initfunction {
+                    roots.push(initfn);
+                }
+                if let Some(slot_type) = slot.slot_type {
+                    roots.push(slot_type);
+                }
+                if let Some(class_val) = slot.class_value {
+                    roots.push(class_val);
                 }
             }
         }
@@ -638,6 +1868,25 @@ impl MetaObjectProtocol {
                 roots.push(expander);
                 roots.push(options);
             }
+            if let Some(df) = gf.discriminating_function {
+                roots.push(df);
+            }
+            for func in gf.method_cache.values() {
+                roots.push(*func);
+            }
+        }
+
+        // Trace interned EQL specializers
+        for spec in &self.eql_specializers {
+            roots.push(spec.object);
+        }
+
+        // Trace dependents stored on classes/generics
+        for deps in self.class_dependents.values() {
+            roots.extend(deps.iter().copied());
+        }
+        for deps in self.generic_dependents.values() {
+            roots.extend(deps.iter().copied());
         }
 
         // Trace Instances (slot values) - REMOVED
@@ -683,17 +1932,25 @@ mod tests {
                 SlotDefinition {
                     name: x_name,
                     initform: None,
+                    initfunction: None,
                     initarg: None,
                     readers: Vec::new(),
                     writers: Vec::new(),
+                    allocation: SlotAllocation::Instance,
+                    slot_type: None,
+                    class_value: None,
                     index: 0,
                 },
                 SlotDefinition {
                     name: y_name,
                     initform: None,
+                    initfunction: None,
                     initarg: None,
                     readers: Vec::new(),
                     writers: Vec::new(),
+                    allocation: SlotAllocation::Instance,
+                    slot_type: None,
+                    class_value: None,
                     index: 1,
                 },
             ],
@@ -718,9 +1975,13 @@ mod tests {
             vec![SlotDefinition {
                 name: x_name,
                 initform: None,
+                initfunction: None,
                 initarg: None,
                 readers: Vec::new(),
                 writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
                 index: 0,
             }],
         );
@@ -747,9 +2008,13 @@ mod tests {
             vec![SlotDefinition {
                 name: x_name,
                 initform: None,
+                initfunction: None,
                 initarg: None,
                 readers: Vec::new(),
                 writers: Vec::new(),
+                allocation: SlotAllocation::Instance,
+                slot_type: None,
+                class_value: None,
                 index: 0,
             }],
         );

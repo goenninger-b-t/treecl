@@ -86,6 +86,10 @@ error*.t*xt
 *.out    
 *.err*
 history.t*xt
+perf.data
+*.old
+*.folded
+flamegraph.svg
 
 # ---> C/C++
 

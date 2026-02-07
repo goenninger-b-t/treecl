@@ -2,7 +2,7 @@ use crate::eval::{EvalResult, SpecialForms};
 use crate::process::Process;
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::NodeId;
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 /// Type for primitive functions
 /// Note: Signature changed to take Process context
@@ -18,6 +18,7 @@ pub struct GlobalContext {
     // cached standard symbols
     pub t_sym: SymbolId,
     pub nil_sym: SymbolId,
+    pub package_sym: SymbolId,
 }
 
 impl GlobalContext {
@@ -27,10 +28,12 @@ impl GlobalContext {
 
         let nil_sym = symbols.intern_in("NIL", PackageId(1));
         let t_sym = symbols.intern_in("T", PackageId(1));
+        let package_sym = symbols.intern_in("*PACKAGE*", PackageId(1));
 
         // Export NIL and T
         symbols.export_symbol(nil_sym);
         symbols.export_symbol(t_sym);
+        symbols.export_symbol(package_sym);
 
         // Ensure CALL-NEXT-METHOD/NEXT-METHOD-P are in COMMON-LISP so reader resolves them consistently.
         let cnm_sym = symbols.intern_in("CALL-NEXT-METHOD", PackageId(1));
@@ -55,9 +58,10 @@ impl GlobalContext {
         Self {
             symbols: RwLock::new(symbols),
             special_forms,
-            primitives: HashMap::new(),
+            primitives: HashMap::default(),
             t_sym,
             nil_sym,
+            package_sym,
         }
     }
 

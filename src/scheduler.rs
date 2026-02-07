@@ -3,6 +3,7 @@ use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
 use crossbeam_deque::{Injector, Stealer, Worker};
 use dashmap::DashMap;
+use crate::fastmap::HashMap;
 use std::iter;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -277,6 +278,64 @@ fn os_thread_id() -> u64 {
     digits.parse::<u64>().unwrap_or(0)
 }
 
+fn match_receive_pattern(
+    proc: &Process,
+    pattern: Option<NodeId>,
+    value: NodeId,
+    symbols: &crate::symbol::SymbolTable,
+    globals: &crate::context::GlobalContext,
+) -> Option<HashMap<crate::symbol::SymbolId, NodeId>> {
+    let pat = match pattern {
+        Some(pat) => pat,
+        None => return Some(HashMap::default()),
+    };
+
+    let bindings = crate::pattern::match_pattern(
+        &proc.arena.inner,
+        &proc.arrays,
+        &proc.hashtables,
+        symbols,
+        globals.special_forms.quote,
+        pat,
+        value,
+    )?;
+
+    if let Some(env) = &proc.current_env {
+        for (sym, val) in &bindings {
+            if let Some(existing) = env.lookup(*sym) {
+                if !crate::pattern::literal_equal(
+                    &proc.arena.inner,
+                    &proc.arrays,
+                    &proc.hashtables,
+                    existing,
+                    *val,
+                ) {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(bindings)
+}
+
+fn apply_pattern_bindings(
+    proc: &mut Process,
+    bindings: HashMap<crate::symbol::SymbolId, NodeId>,
+) {
+    if bindings.is_empty() {
+        return;
+    }
+    let env = proc
+        .current_env
+        .get_or_insert_with(crate::eval::Environment::new);
+    for (sym, val) in bindings {
+        if env.lookup(sym).is_none() {
+            env.bind(sym, val);
+        }
+    }
+}
+
 fn handle_syscall(
     sched: &SchedulerHandle,
     pid: Pid,
@@ -300,59 +359,52 @@ fn handle_syscall(
                 // Lock child to set up program
                 let mut child = child_arc.lock().unwrap();
 
-                // We need to copy `func` from Parent to Child.
-                // We need Parent Lock.
-                if let Some(parent_arc) = sched.registry.get(&pid) {
-                    let mut parent = parent_arc.lock().unwrap();
+                // Deep copy function node from parent into child arena
+                let func_copy =
+                    crate::arena::deep_copy(&proc.arena.inner, func, &mut child.arena.inner);
 
-                    // Deep copy function node
-                    let func_copy =
-                        crate::arena::deep_copy(&parent.arena.inner, func, &mut child.arena.inner);
+                // Wrap in (FUNCALL func_copy)
+                // Find FUNCALL symbol
+                let funcall_sym = globals
+                    .symbols
+                    .write()
+                    .unwrap()
+                    .intern_in("FUNCALL", crate::symbol::PackageId(1));
+                let funcall_val = OpaqueValue::Symbol(funcall_sym.0);
+                let funcall_node = child
+                    .arena
+                    .inner
+                    .alloc(crate::arena::Node::Leaf(funcall_val));
 
-                    // Wrap in (FUNCALL func_copy)
-                    // Find FUNCALL symbol
-                    let funcall_sym = globals
-                        .symbols
-                        .write()
-                        .unwrap()
-                        .intern_in("FUNCALL", crate::symbol::PackageId(1));
-                    let funcall_val = OpaqueValue::Symbol(funcall_sym.0);
-                    let funcall_node = child
-                        .arena
-                        .inner
-                        .alloc(crate::arena::Node::Leaf(funcall_val));
+                let nil = child.make_nil();
+                let args_list = child
+                    .arena
+                    .inner
+                    .alloc(crate::arena::Node::Fork(func_copy, nil));
+                let call_form = child
+                    .arena
+                    .inner
+                    .alloc(crate::arena::Node::Fork(funcall_node, args_list));
 
-                    let nil = child.make_nil();
-                    let args_list = child
-                        .arena
-                        .inner
-                        .alloc(crate::arena::Node::Fork(func_copy, nil));
-                    let call_form = child
-                        .arena
-                        .inner
-                        .alloc(crate::arena::Node::Fork(funcall_node, args_list));
+                child.program = call_form;
+                // Status is already Runnable (from spawn_process default? No check Process::new)
+                // Process::new sets Runnable.
 
-                    child.program = call_form;
-                    // Status is already Runnable (from spawn_process default? No check Process::new)
-                    // Process::new sets Runnable.
+                // Resume Parent with Child PID
+                let pid_node = proc.make_pid(child_pid);
 
-                    // Resume Parent with Child PID
-                    let pid_node = parent.make_pid(child_pid);
-
-                    if let Some(redex) = parent.pending_redex.take() {
-                        // Deep copy pid_node? No, pid_node is in parent arena (alloced by parent.make_pid)
-                        // Wait. `parent.make_pid` allocates in `parent.arena`.
-                        // `overwrite` takes NodeId (redex in parent) and Node (value).
-                        // `get_unchecked` returns &Node.
-                        let val = parent.arena.inner.get_unchecked(pid_node).clone();
-                        parent.arena.inner.overwrite(redex, val);
-                    }
-                    parent.status = Status::Runnable;
-
-                    // Schedule parent
-                    sched.global_queue.push(pid);
+                if let Some(redex) = proc.pending_redex.take() {
+                    // Deep copy pid_node? No, pid_node is in parent arena (alloced by parent.make_pid)
+                    // Wait. `parent.make_pid` allocates in `parent.arena`.
+                    // `overwrite` takes NodeId (redex in parent) and Node (value).
+                    // `get_unchecked` returns &Node.
+                    let val = proc.arena.inner.get_unchecked(pid_node).clone();
+                    proc.arena.inner.overwrite(redex, val);
                 }
-                // Unlock parent
+                proc.status = Status::Runnable;
+
+                // Schedule parent
+                sched.global_queue.push(pid);
 
                 // Schedule child
                 sched.global_queue.push(child_pid);
@@ -390,13 +442,20 @@ fn handle_syscall(
                     );
 
                     // Delivery logic
+                    let symbols = globals.symbols.read().unwrap();
                     let mut wake = false;
-                    if let Status::Waiting(_pat) = target_proc.status {
-                        // Check pattern
-                        wake = true; // Simplify
+                    let mut bindings = HashMap::default();
+                    if let Status::Waiting(pat) = &target_proc.status {
+                        if let Some(found) =
+                            match_receive_pattern(&target_proc, *pat, copied, &symbols, globals)
+                        {
+                            wake = true;
+                            bindings = found;
+                        }
                     }
 
                     if wake {
+                        apply_pattern_bindings(&mut target_proc, bindings);
                         if let Some(redex) = target_proc.pending_redex.take() {
                             let result_node = target_proc.arena.inner.get_unchecked(copied).clone();
                             target_proc.arena.inner.overwrite(redex, result_node);
@@ -442,22 +501,20 @@ fn handle_syscall(
             }
         }
         SysCall::Receive { pattern } => {
-            let mut found = None;
+            let symbols = globals.symbols.read().unwrap();
+            let mut found: Option<(usize, HashMap<crate::symbol::SymbolId, NodeId>)> = None;
             for (i, msg) in proc.mailbox.iter().enumerate() {
-                let matches = if let Some(pat) = pattern {
-                    crate::arena::deep_equal(&proc.arena.inner, pat, msg.payload)
-                } else {
-                    true
-                };
-
-                if matches {
-                    found = Some(i);
+                if let Some(bindings) =
+                    match_receive_pattern(&proc, pattern, msg.payload, &symbols, globals)
+                {
+                    found = Some((i, bindings));
                     break;
                 }
             }
 
-            if let Some(i) = found {
+            if let Some((i, bindings)) = found {
                 let msg = proc.mailbox.remove(i).unwrap();
+                apply_pattern_bindings(&mut proc, bindings);
                 // Resume execution with message payload
                 // We need to pass the payload to the waiting redex
                 if let Some(redex) = proc.pending_redex.take() {

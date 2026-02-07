@@ -92,7 +92,7 @@ impl<'a> Lexer<'a> {
     }
 }
 
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 pub struct Parser<'a> {
     undo: Option<Token>,

@@ -1,0 +1,40 @@
+(format t "Starting MOP EQL Specializer Test...~%")
+
+(defgeneric eql-pick (x))
+(defmethod eql-pick ((x (eql 1))) :one)
+(defmethod eql-pick ((x integer)) :int)
+
+(let ((res1 (eql-pick 1))
+      (res2 (eql-pick 2)))
+  (if (eq res1 :one)
+      (format t "EQL specializer dispatch OK~%")
+      (format t "EQL specializer dispatch FAIL: ~A~%" res1))
+  (if (eq res2 :int)
+      (format t "Class fallback dispatch OK~%")
+      (format t "Class fallback dispatch FAIL: ~A~%" res2)))
+
+(let* ((spec1 (intern-eql-specializer 1))
+       (spec2 (intern-eql-specializer 1)))
+  (if (eql spec1 spec2)
+      (format t "INTERN-EQL-SPECIALIZER OK~%")
+      (format t "INTERN-EQL-SPECIALIZER FAIL~%")))
+
+(let* ((obj (list 1 2))
+       (spec (intern-eql-specializer obj))
+       (back (eql-specializer-object spec)))
+  (if (eql obj back)
+      (format t "EQL-SPECIALIZER-OBJECT OK~%")
+      (format t "EQL-SPECIALIZER-OBJECT FAIL: ~A~%" back)))
+
+(let* ((spec (intern-eql-specializer 1))
+       (m (find-method (symbol-function 'eql-pick) nil (list spec))))
+  (if m
+      (format t "FIND-METHOD with EQL specializer OK~%")
+      (format t "FIND-METHOD with EQL specializer FAIL~%")))
+
+(let* ((spec (intern-eql-specializer 1))
+       (m (find-method (symbol-function 'eql-pick) nil (list spec)))
+       (specs (method-specializers m)))
+  (if (and specs (eql (car specs) spec))
+      (format t "METHOD-SPECIALIZERS includes EQL OK~%")
+      (format t "METHOD-SPECIALIZERS includes EQL FAIL: ~A~%" specs)))

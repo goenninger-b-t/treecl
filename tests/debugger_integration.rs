@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+
 use treecl::context::GlobalContext;
 use treecl::eval::{ControlSignal, Environment, Interpreter};
 use treecl::process::{Pid, Process, Status};
@@ -107,7 +107,7 @@ fn test_restart_invocation() {
         treecl::types::OpaqueValue::Symbol(lambda_sym.0),
     ));
 
-    let lambda_expr = proc.make_list(&[lambda_op, params, body_list]);
+    let _lambda_expr = proc.make_list(&[lambda_op, params, body_list]);
 
     // Eval to get closure
     let func_input = "(function (lambda () 42))";
@@ -185,7 +185,7 @@ fn test_restart_invocation() {
             });
 
             assert!(continue_rss.is_some(), "Continue restart not found");
-            let r = continue_rss.unwrap().clone();
+            let r = continue_rss.unwrap();
 
             // Invoke restart
             let func = r.function;

@@ -1,6 +1,6 @@
 use crate::arena::{Arena, Node};
 use crate::types::{NodeId, OpaqueValue};
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 pub struct EvalContext {
     pub steps: usize,
@@ -19,9 +19,9 @@ impl Default for EvalContext {
             max_steps: 10000,
             exhausted: false,
             cache_epoch: 0,
-            purity_cache: HashMap::new(),
-            whnf_cache: HashMap::new(),
-            nf_cache: HashMap::new(),
+            purity_cache: HashMap::default(),
+            whnf_cache: HashMap::default(),
+            nf_cache: HashMap::default(),
         }
     }
 }
@@ -445,8 +445,10 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
     match arena.get_unchecked(id) {
         Node::Leaf(val) => match val {
             OpaqueValue::Nil => "nil".to_string(),
+            OpaqueValue::Unbound => "#<unbound>".to_string(),
             OpaqueValue::Integer(n) => n.to_string(),
             OpaqueValue::Float(f) => format!("{:.6}", f),
+            OpaqueValue::Char(c) => format!("#\\{}", c),
             OpaqueValue::String(s) => format!("{:?}", s),
             OpaqueValue::VectorHandle(h) => format!("#<vector:{}>", h),
             OpaqueValue::ForeignPtr(p) => format!("#<foreign:{:?}>", p),
@@ -456,6 +458,8 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Class(id) => format!("#<class:{}>", id),
             OpaqueValue::Symbol(id) => format!("#<symbol:{}>", id),
             OpaqueValue::BigInt(n) => n.to_string(),
+            OpaqueValue::Ratio(n, d) => format!("{}/{}", n, d),
+            OpaqueValue::Pathname(p) => format!("#P\"{}\"", p.namestring()),
             OpaqueValue::StreamHandle(id) => format!("#<stream:{}>", id),
             OpaqueValue::Pid(pid) => format!("#<{}.{}.{}>", pid.node, pid.id, pid.serial),
             OpaqueValue::HashHandle(h) => format!("#<hash-table:{}>", h),
@@ -465,6 +469,17 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::CallMethod(id) => format!("#<call-method:{}>", id),
             OpaqueValue::MethodWrapper(a, b) => format!("#<method-wrapper:{}:{}>", a, b),
             OpaqueValue::Method(id) => format!("#<method:{}>", id),
+            OpaqueValue::EqlSpecializer(id) => format!("#<eql-specializer:{}>", id),
+            OpaqueValue::SlotDefinition(class_id, slot_idx, direct) => {
+                let tag = if *direct { ":direct" } else { "" };
+                format!("#<slot-definition:{}:{}{}>", class_id, slot_idx, tag)
+            }
+            OpaqueValue::Readtable(id) => format!("#<readtable:{}>", id),
+            OpaqueValue::Complex(real, imag) => format!(
+                "#C({} {})",
+                unparse(arena, *real, depth + 1),
+                unparse(arena, *imag, depth + 1)
+            ),
         },
         Node::Stem(x) => format!("(Stem {})", unparse(arena, *x, depth + 1)),
         Node::Fork(l, r) => format!(
@@ -489,7 +504,7 @@ pub enum ControlSignal {
 
 /// Frame for tagbody control construct
 pub struct TagbodyFrame {
-    pub tags: std::collections::HashMap<String, usize>,
+    pub tags: crate::fastmap::HashMap<String, usize>,
     pub statements: Vec<NodeId>,
     pub pc: usize,
 }

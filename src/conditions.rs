@@ -4,7 +4,7 @@
 
 use crate::symbol::SymbolId;
 use crate::types::NodeId;
-use std::collections::HashMap;
+use crate::fastmap::HashMap;
 
 /// A condition type (class-like, but simpler)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,8 +70,8 @@ impl ConditionSystem {
             simple_condition_type: ConditionType(4),
             simple_error_type: ConditionType(5),
             simple_warning_type: ConditionType(6),
-            type_parents: HashMap::new(),
-            type_names: HashMap::new(),
+            type_parents: HashMap::default(),
+            type_names: HashMap::default(),
         };
 
         // Register names
@@ -201,7 +201,7 @@ impl ConditionSystem {
     pub fn make_condition(&self, typ: ConditionType) -> Condition {
         Condition {
             condition_type: typ,
-            slots: HashMap::new(),
+            slots: HashMap::default(),
             format_control: None,
             format_arguments: Vec::new(),
         }
@@ -211,7 +211,7 @@ impl ConditionSystem {
     pub fn make_simple_error(&self, format: &str, args: Vec<NodeId>) -> Condition {
         Condition {
             condition_type: self.simple_error_type,
-            slots: HashMap::new(),
+            slots: HashMap::default(),
             format_control: Some(format.to_string()),
             format_arguments: args,
         }
@@ -221,7 +221,7 @@ impl ConditionSystem {
     pub fn make_simple_warning(&self, format: &str, args: Vec<NodeId>) -> Condition {
         Condition {
             condition_type: self.simple_warning_type,
-            slots: HashMap::new(),
+            slots: HashMap::default(),
             format_control: Some(format.to_string()),
             format_arguments: args,
         }
