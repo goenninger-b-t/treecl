@@ -212,7 +212,11 @@ fn main() -> io::Result<()> {
             }
 
             if finished {
-                if std::env::var("TREECL_DEBUG_COUNTERS").is_ok() {
+                let debug_counters = std::env::var("TREECL_DEBUG_COUNTERS").is_ok();
+                let debug_load_file_timing =
+                    std::env::var("TREECL_DEBUG_LOAD_FILE_TIMING").is_ok();
+
+                if debug_counters {
                     let sym = treecl::symbol::snapshot_counters();
                     let hash = treecl::hashtables::snapshot_counters();
                     let pkg_ms = sym.find_package_ns as f64 / 1_000_000.0;
@@ -230,7 +234,9 @@ fn main() -> io::Result<()> {
                         hash.clr_calls,
                         hash.maphash_calls
                     );
+                }
 
+                if debug_counters || debug_load_file_timing {
                     let mut loads = treecl::counters::snapshot_loads();
                     if !loads.is_empty() {
                         let mut total = treecl::counters::LoadCounters::default();
@@ -247,15 +253,24 @@ fn main() -> io::Result<()> {
                         );
                         loads.sort_by(|a, b| b.1.elapsed_ns.cmp(&a.1.elapsed_ns));
                         for (path, entry) in loads.iter().take(10) {
-                            eprintln!(
-                                "LOAD TOP: {} loads={} elapsed={:.2}ms find_symbol={} gethash={} sethash={}",
-                                path,
-                                entry.loads,
-                                entry.elapsed_ns as f64 / 1_000_000.0,
-                                entry.find_symbol_calls,
-                                entry.gethash_calls,
-                                entry.sethash_calls
-                            );
+                            if debug_counters {
+                                eprintln!(
+                                    "LOAD TOP: {} loads={} elapsed={:.2}ms find_symbol={} gethash={} sethash={}",
+                                    path,
+                                    entry.loads,
+                                    entry.elapsed_ns as f64 / 1_000_000.0,
+                                    entry.find_symbol_calls,
+                                    entry.gethash_calls,
+                                    entry.sethash_calls
+                                );
+                            } else {
+                                eprintln!(
+                                    "LOAD TOP: {} loads={} elapsed={:.2}ms",
+                                    path,
+                                    entry.loads,
+                                    entry.elapsed_ns as f64 / 1_000_000.0
+                                );
+                            }
                         }
                     }
                 }

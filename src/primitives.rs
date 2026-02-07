@@ -12,6 +12,7 @@ use crate::readtable::{ReadtableCase, ReadtableId};
 use crate::symbol::{PackageId, SymbolId};
 use crate::syscall::SysCall;
 use crate::types::{NodeId, OpaqueValue};
+use crate::pathname::Pathname;
 use crate::tree_calculus;
 use crate::clos::GenericName;
 use libc;
@@ -105,12 +106,46 @@ fn alloc_string(proc: &mut Process, value: String) -> NodeId {
     proc.arena.inner.alloc(Node::Leaf(OpaqueValue::String(value)))
 }
 
+fn alloc_pathname(proc: &mut Process, pathname: Pathname) -> NodeId {
+    proc.arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Pathname(pathname)))
+}
+
+fn node_to_pathname(proc: &Process, node: NodeId) -> Option<Pathname> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Pathname(p)) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+fn pathname_from_designator(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+    label: &str,
+) -> Result<Pathname, ControlSignal> {
+    if let Some(pn) = node_to_pathname(proc, node) {
+        return Ok(pn);
+    }
+    let s = path_from_designator(proc, ctx, node, label)?;
+    Ok(Pathname::from_namestring(&s))
+}
+
 fn path_is_absolute(path: &str) -> bool {
     if std::path::Path::new(path).is_absolute() {
         return true;
     }
     let bytes = path.as_bytes();
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+        || {
+            let colon = path.find(':');
+            let sep = path.find(|c| c == '/' || c == '\\');
+            colon.is_some()
+                && !(colon == Some(1)
+                    && bytes.get(0).map(|b| b.is_ascii_alphabetic()) == Some(true))
+                && (sep.is_none() || colon.unwrap() < sep.unwrap())
+        }
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -145,6 +180,79 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
+fn is_wild_component(text: &str) -> bool {
+    text.eq_ignore_ascii_case("WILD")
+        || text.eq_ignore_ascii_case("WILD-INFERIORS")
+        || text.contains('*')
+        || text.contains('?')
+}
+
+fn component_matches(actual: &str, pattern: &str) -> bool {
+    if pattern.eq_ignore_ascii_case("WILD") {
+        return true;
+    }
+    if pattern.contains('*') || pattern.contains('?') {
+        return glob_match(pattern, actual);
+    }
+    actual == pattern
+}
+
+fn directory_matches(
+    actual: Option<crate::pathname::PathnameDirectory>,
+    pattern: Option<crate::pathname::PathnameDirectory>,
+) -> bool {
+    let Some(pattern) = pattern else {
+        return actual
+            .as_ref()
+            .map(|d| d.components.is_empty())
+            .unwrap_or(true);
+    };
+    let Some(actual) = actual else {
+        return false;
+    };
+    if pattern.absolute != actual.absolute {
+        return false;
+    }
+
+    let pcomps = pattern.components;
+    let acomps = actual.components;
+
+    if let Some(idx) = pcomps
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case("WILD-INFERIORS"))
+    {
+        for (a, p) in acomps.iter().zip(pcomps.iter().take(idx)) {
+            if !component_matches(a, p) {
+                return false;
+            }
+        }
+        let suffix = &pcomps[idx + 1..];
+        if suffix.is_empty() {
+            return true;
+        }
+        if acomps.len() < idx + suffix.len() {
+            return false;
+        }
+        let start = acomps.len() - suffix.len();
+        for (a, p) in acomps[start..].iter().zip(suffix.iter()) {
+            if !component_matches(a, p) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if acomps.len() != pcomps.len() {
+        return false;
+    }
+    for (a, p) in acomps.iter().zip(pcomps.iter()) {
+        if !component_matches(a, p) {
+            return false;
+        }
+    }
+    true
+}
+
 fn string_from_designator(
     proc: &Process,
     ctx: &crate::context::GlobalContext,
@@ -152,6 +260,7 @@ fn string_from_designator(
 ) -> Option<String> {
     match proc.arena.inner.get_unchecked(node) {
         Node::Leaf(OpaqueValue::String(s)) => Some(s.clone()),
+        Node::Leaf(OpaqueValue::Pathname(p)) => Some(p.namestring().to_string()),
         Node::Leaf(OpaqueValue::Char(c)) => Some(c.to_string()),
         Node::Leaf(OpaqueValue::Integer(_)) => node_to_char(proc, ctx, node).map(|c| c.to_string()),
         Node::Leaf(OpaqueValue::Symbol(id)) => ctx
@@ -756,6 +865,10 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("PATHNAME-HOST", cl, prim_pathname_host);
     globals.register_primitive("PATHNAME-DEVICE", cl, prim_pathname_device);
     globals.register_primitive("PATHNAME-VERSION", cl, prim_pathname_version);
+    globals.register_primitive("PARSE-NAMESTRING", cl, prim_parse_namestring);
+    globals.register_primitive("PATHNAME-MATCH-P", cl, prim_pathname_match_p);
+    globals.register_primitive("WILD-PATHNAME-P", cl, prim_wild_pathname_p);
+    globals.register_primitive("PATHNAMEP", cl, prim_pathnamep);
     globals.register_primitive("DIRECTORY", cl, prim_directory);
     globals.register_primitive("DELETE-FILE", cl, prim_delete_file);
     globals.register_primitive("PROBE-FILE", cl, prim_probe_file);
@@ -1500,7 +1613,9 @@ fn prim_load(
         let content = std::fs::read_to_string(path)
             .map_err(|e| ControlSignal::Error(format!("LOAD: io error: {}", e)))?;
 
-        let counters_base = if std::env::var("TREECL_DEBUG_COUNTERS_RESET").is_ok() {
+        let debug_counters = std::env::var("TREECL_DEBUG_COUNTERS").is_ok();
+        let debug_load_file_timing = std::env::var("TREECL_DEBUG_LOAD_FILE_TIMING").is_ok();
+        let counters_base = if debug_counters && std::env::var("TREECL_DEBUG_COUNTERS_RESET").is_ok() {
             Some((
                 crate::symbol::snapshot_counters(),
                 crate::hashtables::snapshot_counters(),
@@ -1508,6 +1623,16 @@ fn prim_load(
         } else {
             None
         };
+
+        let debug_load = std::env::var("TREECL_DEBUG_LOAD").is_ok();
+        let debug_load_match = std::env::var("TREECL_DEBUG_LOAD_MATCH").ok();
+        let debug_load_this_file = if let Some(pattern) = debug_load_match.as_ref() {
+            full_path_str.contains(pattern) || filename.contains(pattern)
+        } else {
+            true
+        };
+        let debug_load_timing = std::env::var("TREECL_DEBUG_LOAD_TIMING").is_ok();
+        let debug_load_timing_this_file = debug_load_timing && debug_load_this_file;
 
         // Parse and Eval loop
         // We need to use Reader and Interpreter
@@ -1530,7 +1655,9 @@ fn prim_load(
                 env_ptr: &env as *const _,
             }));
 
+            let mut form_index: usize = 0;
             loop {
+                let form_total_start = std::time::Instant::now();
                 let options = build_reader_options(proc, ctx, false);
                 let rt_id = current_readtable_id(proc, ctx);
                 let readtable = proc
@@ -1547,9 +1674,11 @@ fn prim_load(
                     options,
                 );
 
+                let read_start = std::time::Instant::now();
                 let read_result = reader.read();
                 let needs_read_eval = reader.read_eval_hit();
                 let pos = reader.position();
+                let read_elapsed = read_start.elapsed();
                 input = reader.into_input();
                 drop(symbols_guard);
 
@@ -1569,14 +1698,36 @@ fn prim_load(
                 } else {
                     expr
                 };
+                form_index = form_index.saturating_add(1);
+                if debug_load_timing_this_file {
+                    eprintln!(
+                        "LOAD DEBUG TIMING [{} #{} READ]: {:.3}ms at-byte={}",
+                        filename,
+                        form_index,
+                        read_elapsed.as_secs_f64() * 1000.0,
+                        pos
+                    );
+                }
                 let mut interpreter = Interpreter::new(proc, ctx);
-                if std::env::var("TREECL_DEBUG_LOAD").is_ok() {
+                if debug_load && debug_load_this_file {
                     let symbols = ctx.symbols.read().unwrap();
                     let printed =
                         crate::printer::print_to_string(&interpreter.process.arena.inner, &symbols, expr);
-                    eprintln!("LOAD DEBUG: {}", printed);
+                    eprintln!("LOAD DEBUG [{} #{}]: {}", filename, form_index, printed);
                 }
+                let eval_start = std::time::Instant::now();
                 interpreter.eval(expr, &env)?;
+                if debug_load_timing_this_file {
+                    let eval_elapsed = eval_start.elapsed();
+                    let total_elapsed = form_total_start.elapsed();
+                    eprintln!(
+                        "LOAD DEBUG TIMING [{} #{} EVAL]: {:.3}ms total={:.3}ms",
+                        filename,
+                        form_index,
+                        eval_elapsed.as_secs_f64() * 1000.0,
+                        total_elapsed.as_secs_f64() * 1000.0
+                    );
+                }
             }
             Ok::<(), ControlSignal>(())
         })();
@@ -1591,7 +1742,14 @@ fn prim_load(
 
         eval_result?;
 
-        if std::env::var("TREECL_DEBUG_COUNTERS").is_ok() {
+        let elapsed_ns = load_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let elapsed_ms = elapsed_ns as f64 / 1_000_000.0;
+
+        let mut delta = LoadCounters::default();
+        delta.loads = 1;
+        delta.elapsed_ns = elapsed_ns;
+
+        if debug_counters {
             let sym_now = crate::symbol::snapshot_counters();
             let hash_now = crate::hashtables::snapshot_counters();
             let (sym, hash) = if let Some((sym_base, hash_base)) = counters_base {
@@ -1626,7 +1784,6 @@ fn prim_load(
             };
             let pkg_ms = sym.find_package_ns as f64 / 1_000_000.0;
             let sym_ms = sym.find_symbol_ns as f64 / 1_000_000.0;
-            let elapsed_ns = load_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             eprintln!(
                 "LOAD COUNTERS [{}]: find_package={} ({:.2}ms) find_symbol={} ({:.2}ms) intern={} gethash={} sethash={} remhash={} clrhash={} maphash={}",
                 filename,
@@ -1641,9 +1798,6 @@ fn prim_load(
                 hash.clr_calls,
                 hash.maphash_calls
             );
-            let mut delta = LoadCounters::default();
-            delta.loads = 1;
-            delta.elapsed_ns = elapsed_ns;
             delta.find_package_calls = sym.find_package_calls;
             delta.find_package_ns = sym.find_package_ns;
             delta.find_symbol_calls = sym.find_symbol_calls;
@@ -1654,6 +1808,13 @@ fn prim_load(
             delta.remhash_calls = hash.rem_calls;
             delta.clrhash_calls = hash.clr_calls;
             delta.maphash_calls = hash.maphash_calls;
+        }
+
+        if debug_load_file_timing {
+            eprintln!("LOAD FILE TIMING [{}]: {:.2}ms", filename, elapsed_ms);
+        }
+
+        if debug_counters || debug_load_file_timing {
             crate::counters::record_load(&full_path_str, &delta);
         }
 
@@ -1997,7 +2158,7 @@ fn prim_make_pathname(
         file
     };
 
-    Ok(alloc_string(proc, res))
+    Ok(alloc_pathname(proc, Pathname::from_namestring(&res)))
 }
 
 fn prim_pathname_directory(
@@ -2008,12 +2169,9 @@ fn prim_pathname_directory(
     if args.len() != 1 {
         return err_helper("PATHNAME-DIRECTORY requires exactly 1 argument");
     }
-    let path = path_from_designator(proc, ctx, args[0], "PATHNAME-DIRECTORY")?;
-    let path = translate_logical_path_minimal(&path);
-    let path = std::path::Path::new(&path);
-    let dir = match path.parent() {
-        Some(dir) => dir,
-        None => return Ok(proc.make_nil()),
+    let pn = pathname_from_designator(proc, ctx, args[0], "PATHNAME-DIRECTORY")?;
+    let Some(dir) = pn.directory else {
+        return Ok(proc.make_nil());
     };
 
     let mut kw = |name: &str| -> NodeId {
@@ -2024,18 +2182,9 @@ fn prim_pathname_directory(
     };
 
     let mut parts: Vec<NodeId> = Vec::new();
-    let absolute = dir.is_absolute();
-    parts.push(kw(if absolute { "ABSOLUTE" } else { "RELATIVE" }));
-
-    for comp in dir.components() {
-        let component = match comp {
-            std::path::Component::RootDir => continue,
-            std::path::Component::CurDir => ".".to_string(),
-            std::path::Component::ParentDir => "..".to_string(),
-            std::path::Component::Normal(s) => s.to_string_lossy().to_string(),
-            std::path::Component::Prefix(prefix) => prefix.as_os_str().to_string_lossy().to_string(),
-        };
-        parts.push(alloc_string(proc, component));
+    parts.push(kw(if dir.absolute { "ABSOLUTE" } else { "RELATIVE" }));
+    for comp in dir.components {
+        parts.push(alloc_string(proc, comp));
     }
 
     let mut list = proc.make_nil();
@@ -2080,7 +2229,7 @@ fn prim_merge_pathnames(
         };
         dir.join(&specified).to_string_lossy().to_string()
     };
-    Ok(alloc_string(proc, merged))
+    Ok(alloc_pathname(proc, Pathname::from_namestring(&merged)))
 }
 
 fn prim_pathname(
@@ -2089,8 +2238,8 @@ fn prim_pathname(
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
-        let path = path_from_designator(proc, ctx, arg, "PATHNAME")?;
-        Ok(alloc_string(proc, path))
+        let pn = pathname_from_designator(proc, ctx, arg, "PATHNAME")?;
+        Ok(alloc_pathname(proc, pn))
     } else {
         Ok(proc.make_nil())
     }
@@ -2117,10 +2266,9 @@ fn prim_pathname_name(
     if args.len() != 1 {
         return err_helper("PATHNAME-NAME requires exactly 1 argument");
     }
-    let path = path_from_designator(proc, ctx, args[0], "PATHNAME-NAME")?;
-    let path = std::path::Path::new(&path);
-    if let Some(stem) = path.file_stem() {
-        Ok(alloc_string(proc, stem.to_string_lossy().to_string()))
+    let pn = pathname_from_designator(proc, ctx, args[0], "PATHNAME-NAME")?;
+    if let Some(name) = pn.name {
+        Ok(alloc_string(proc, name))
     } else {
         Ok(proc.make_nil())
     }
@@ -2134,10 +2282,9 @@ fn prim_pathname_type(
     if args.len() != 1 {
         return err_helper("PATHNAME-TYPE requires exactly 1 argument");
     }
-    let path = path_from_designator(proc, ctx, args[0], "PATHNAME-TYPE")?;
-    let path = std::path::Path::new(&path);
-    if let Some(ext) = path.extension() {
-        Ok(alloc_string(proc, ext.to_string_lossy().to_string()))
+    let pn = pathname_from_designator(proc, ctx, args[0], "PATHNAME-TYPE")?;
+    if let Some(ty) = pn.type_ {
+        Ok(alloc_string(proc, ty))
     } else {
         Ok(proc.make_nil())
     }
@@ -2145,26 +2292,372 @@ fn prim_pathname_type(
 
 fn prim_pathname_host(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
 ) -> EvalResult {
-    Ok(proc.make_nil())
+    if args.len() != 1 {
+        return err_helper("PATHNAME-HOST requires exactly 1 argument");
+    }
+    let pn = pathname_from_designator(proc, ctx, args[0], "PATHNAME-HOST")?;
+    if let Some(host) = pn.host {
+        Ok(alloc_string(proc, host))
+    } else {
+        Ok(proc.make_nil())
+    }
 }
 
 fn prim_pathname_device(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
 ) -> EvalResult {
-    Ok(proc.make_nil())
+    if args.len() != 1 {
+        return err_helper("PATHNAME-DEVICE requires exactly 1 argument");
+    }
+    let pn = pathname_from_designator(proc, ctx, args[0], "PATHNAME-DEVICE")?;
+    if let Some(device) = pn.device {
+        Ok(alloc_string(proc, device))
+    } else {
+        Ok(proc.make_nil())
+    }
 }
 
 fn prim_pathname_version(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
-    _args: &[NodeId],
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
 ) -> EvalResult {
-    Ok(proc.make_nil())
+    if args.len() != 1 {
+        return err_helper("PATHNAME-VERSION requires exactly 1 argument");
+    }
+    let pn = pathname_from_designator(proc, ctx, args[0], "PATHNAME-VERSION")?;
+    if let Some(version) = pn.version {
+        Ok(alloc_string(proc, version))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn slice_by_char_indices(s: &str, start: usize, end: usize) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if start > chars.len() || end > chars.len() || start > end {
+        return None;
+    }
+    Some(chars[start..end].iter().collect())
+}
+
+#[derive(Debug, Default)]
+struct ParseNamestringOptions {
+    start: Option<usize>,
+    end: Option<usize>,
+    junk_allowed: bool,
+    junk_allowed_set: bool,
+}
+
+fn parse_namestring_kwargs(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> Result<ParseNamestringOptions, ControlSignal> {
+    let mut opts = ParseNamestringOptions::default();
+
+    if args.is_empty() {
+        return Ok(opts);
+    }
+    if args.len() % 2 != 0 {
+        return Err(ControlSignal::Error(
+            "PARSE-NAMESTRING: odd number of keyword arguments".to_string(),
+        ));
+    }
+
+    let syms = ctx.symbols.read().unwrap();
+    let keyword_pkg = syms.get_package(PackageId(0));
+    let kw_start = keyword_pkg.and_then(|p| p.find_external("START"));
+    let kw_end = keyword_pkg.and_then(|p| p.find_external("END"));
+    let kw_junk = keyword_pkg.and_then(|p| p.find_external("JUNK-ALLOWED"));
+
+    for pair in args.chunks(2) {
+        let key_node = pair[0];
+        let val_node = pair[1];
+        let key_sym = node_to_symbol(proc, key_node).ok_or_else(|| {
+            ControlSignal::Error("PARSE-NAMESTRING: keyword must be a symbol".to_string())
+        })?;
+
+        if Some(key_sym) == kw_start {
+            if opts.start.is_none() {
+                if let Node::Leaf(OpaqueValue::Integer(n)) =
+                    proc.arena.inner.get_unchecked(val_node)
+                {
+                    if *n >= 0 {
+                        opts.start = Some(*n as usize);
+                    }
+                } else {
+                    return Err(ControlSignal::Error(
+                        "PARSE-NAMESTRING: :start must be an integer".to_string(),
+                    ));
+                }
+            }
+            continue;
+        }
+        if Some(key_sym) == kw_end {
+            if opts.end.is_none() {
+                if let Node::Leaf(OpaqueValue::Integer(n)) =
+                    proc.arena.inner.get_unchecked(val_node)
+                {
+                    if *n >= 0 {
+                        opts.end = Some(*n as usize);
+                    }
+                } else {
+                    return Err(ControlSignal::Error(
+                        "PARSE-NAMESTRING: :end must be an integer".to_string(),
+                    ));
+                }
+            }
+            continue;
+        }
+        if Some(key_sym) == kw_junk {
+            if !opts.junk_allowed_set {
+                opts.junk_allowed = !node_is_nil(proc, val_node);
+                opts.junk_allowed_set = true;
+            }
+            continue;
+        }
+
+        return Err(ControlSignal::Error(
+            "PARSE-NAMESTRING: invalid keyword argument".to_string(),
+        ));
+    }
+
+    Ok(opts)
+}
+
+fn prim_parse_namestring(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("PARSE-NAMESTRING requires at least 1 argument");
+    }
+
+    if let Some(pn) = node_to_pathname(proc, args[0]) {
+        let idx = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Integer(pn.namestring.chars().count() as i64)));
+        let pn_node = alloc_pathname(proc, pn);
+        return Ok(set_multiple_values(proc, vec![pn_node, idx]));
+    }
+
+    let raw = path_from_designator(proc, ctx, args[0], "PARSE-NAMESTRING")?;
+    let host_node = args.get(1).copied();
+    let defaults_node = args.get(2).copied();
+    let kw_start = if args.len() > 3 { 3 } else { args.len() };
+    let opts = parse_namestring_kwargs(proc, ctx, &args[kw_start..])?;
+
+    let mut start = opts.start.unwrap_or(0);
+    let mut end = opts.end.unwrap_or_else(|| raw.chars().count());
+    let mut slice = slice_by_char_indices(&raw, start, end)
+        .ok_or_else(|| ControlSignal::Error("PARSE-NAMESTRING: invalid bounds".to_string()))?;
+
+    if let Some(idx) = slice
+        .chars()
+        .position(|c| c.is_whitespace())
+    {
+        if opts.junk_allowed {
+            slice = slice_by_char_indices(&slice, 0, idx)
+                .unwrap_or_else(|| "".to_string());
+            end = start + idx;
+        } else {
+            return Err(ControlSignal::Error(
+                "PARSE-NAMESTRING: junk at end of namestring".to_string(),
+            ));
+        }
+    }
+
+    let mut merged = slice.clone();
+    let defaults = if let Some(node) = defaults_node {
+        if node_is_nil(proc, node) {
+            None
+        } else {
+            Some(pathname_from_designator(proc, ctx, node, "PARSE-NAMESTRING")?)
+        }
+    } else {
+        None
+    };
+
+    if let Some(defaults_pn) = &defaults {
+        if merged.is_empty() {
+            merged = defaults_pn.namestring().to_string();
+        } else if !path_is_absolute(&merged) {
+            let base = std::path::Path::new(defaults_pn.namestring());
+            let dir = if base.is_dir() {
+                base.to_path_buf()
+            } else {
+                base.parent().unwrap_or(base).to_path_buf()
+            };
+            merged = dir.join(&merged).to_string_lossy().to_string();
+        }
+    }
+
+    let mut pn = Pathname::from_namestring(&merged);
+    if pn.host.is_none() {
+        if let Some(node) = host_node {
+            if !node_is_nil(proc, node) {
+                if let Some(host) = string_from_designator(proc, ctx, node) {
+                    pn.host = Some(host);
+                }
+            }
+        }
+    }
+    if pn.host.is_none() {
+        if let Some(defaults_pn) = &defaults {
+            if let Some(host) = defaults_pn.host.clone() {
+                pn.host = Some(host);
+            }
+        }
+    }
+
+    let idx = proc
+        .arena
+        .inner
+        .alloc(Node::Leaf(OpaqueValue::Integer(end as i64)));
+    let pn_node = alloc_pathname(proc, pn);
+    Ok(set_multiple_values(proc, vec![pn_node, idx]))
+}
+
+fn prim_pathnamep(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("PATHNAMEP requires exactly 1 argument");
+    }
+    let is_pathname = matches!(
+        proc.arena.inner.get_unchecked(args[0]),
+        Node::Leaf(OpaqueValue::Pathname(_))
+    );
+    if is_pathname {
+        Ok(proc.make_t(_ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_wild_pathname_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("WILD-PATHNAME-P requires 1 or 2 arguments");
+    }
+    let pn = pathname_from_designator(proc, ctx, args[0], "WILD-PATHNAME-P")?;
+
+    let key = if args.len() == 2 { args[1] } else { proc.make_nil() };
+    let key_name = if node_is_nil(proc, key) {
+        None
+    } else {
+        node_to_symbol(proc, key)
+            .and_then(|sym| ctx.symbols.read().unwrap().symbol_name(sym).map(|s| s.to_string()))
+    };
+
+    let is_wild = |text: &Option<String>| text.as_ref().map(|s| is_wild_component(s)).unwrap_or(false);
+    let dir_wild = pn.directory.as_ref().map(|d| {
+        d.components
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("WILD") || c.eq_ignore_ascii_case("WILD-INFERIORS"))
+    }).unwrap_or(false);
+
+    let result = match key_name.as_deref() {
+        None => {
+            dir_wild
+                || is_wild(&pn.name)
+                || is_wild(&pn.type_)
+                || is_wild(&pn.version)
+                || is_wild(&pn.host)
+                || is_wild(&pn.device)
+        }
+        Some("HOST") => is_wild(&pn.host),
+        Some("DEVICE") => is_wild(&pn.device),
+        Some("DIRECTORY") => dir_wild,
+        Some("NAME") => is_wild(&pn.name),
+        Some("TYPE") => is_wild(&pn.type_),
+        Some("VERSION") => is_wild(&pn.version),
+        _ => {
+            return Err(ControlSignal::Error(
+                "WILD-PATHNAME-P: invalid key".to_string(),
+            ))
+        }
+    };
+
+    if result {
+        Ok(proc.make_t(ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_pathname_match_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("PATHNAME-MATCH-P requires exactly 2 arguments");
+    }
+    let path = pathname_from_designator(proc, ctx, args[0], "PATHNAME-MATCH-P")?;
+    let pattern = pathname_from_designator(proc, ctx, args[1], "PATHNAME-MATCH-P")?;
+
+    let host_ok = match &pattern.host {
+        None => true,
+        Some(host) if is_wild_component(host) => true,
+        Some(host) => path.host.as_deref() == Some(host.as_str()),
+    };
+    let device_ok = match &pattern.device {
+        None => true,
+        Some(dev) if is_wild_component(dev) => true,
+        Some(dev) => path.device.as_deref() == Some(dev.as_str()),
+    };
+    let dir_ok = directory_matches(path.directory.clone(), pattern.directory.clone());
+
+    let name_ok = match &pattern.name {
+        None => path.name.is_none(),
+        Some(pat) if is_wild_component(pat) => {
+            if let Some(actual) = &path.name {
+                component_matches(actual, pat)
+            } else {
+                false
+            }
+        }
+        Some(pat) => path.name.as_deref() == Some(pat.as_str()),
+    };
+
+    let type_ok = match &pattern.type_ {
+        None => path.type_.is_none(),
+        Some(pat) if is_wild_component(pat) => {
+            if let Some(actual) = &path.type_ {
+                component_matches(actual, pat)
+            } else {
+                false
+            }
+        }
+        Some(pat) => path.type_.as_deref() == Some(pat.as_str()),
+    };
+
+    let version_ok = match &pattern.version {
+        None => path.version.is_none(),
+        Some(pat) if is_wild_component(pat) => true,
+        Some(pat) => path.version.as_deref() == Some(pat.as_str()),
+    };
+
+    let result = host_ok && device_ok && dir_ok && name_ok && type_ok && version_ok;
+    if result {
+        Ok(proc.make_t(ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
 }
 
 fn prim_directory(
@@ -2215,7 +2708,7 @@ fn prim_directory(
     entries.sort();
     let mut list = proc.make_nil();
     for entry in entries.into_iter().rev() {
-        let node = alloc_string(proc, entry);
+        let node = alloc_pathname(proc, Pathname::from_namestring(&entry));
         list = proc.arena.inner.alloc(Node::Fork(node, list));
     }
     Ok(list)
@@ -2248,9 +2741,10 @@ fn prim_probe_file(
     path = translate_logical_path_minimal(&path);
     if std::fs::metadata(&path).is_ok() {
         if let Ok(full) = std::fs::canonicalize(&path) {
-            return Ok(alloc_string(proc, full.to_string_lossy().to_string()));
+            let full_str = full.to_string_lossy().to_string();
+            return Ok(alloc_pathname(proc, Pathname::from_namestring(&full_str)));
         }
-        return Ok(alloc_string(proc, path));
+        return Ok(alloc_pathname(proc, Pathname::from_namestring(&path)));
     }
     Ok(proc.make_nil())
 }
@@ -2267,7 +2761,8 @@ fn prim_truename(
     path = translate_logical_path_minimal(&path);
     let full = std::fs::canonicalize(&path)
         .map_err(|e| ControlSignal::Error(format!("TRUENAME: {}", e)))?;
-    Ok(alloc_string(proc, full.to_string_lossy().to_string()))
+    let full_str = full.to_string_lossy().to_string();
+    Ok(alloc_pathname(proc, Pathname::from_namestring(&full_str)))
 }
 
 fn prim_rename_file(
@@ -2289,9 +2784,9 @@ fn prim_rename_file(
         .unwrap_or_else(|_| std::path::PathBuf::from(&to))
         .to_string_lossy()
         .to_string();
-    let new_node = alloc_string(proc, to);
-    let old_node = alloc_string(proc, old_true.clone());
-    let new_true_node = alloc_string(proc, old_true);
+    let new_node = alloc_pathname(proc, Pathname::from_namestring(&to));
+    let old_node = alloc_pathname(proc, Pathname::from_namestring(&old_true));
+    let new_true_node = alloc_pathname(proc, Pathname::from_namestring(&old_true));
     Ok(set_multiple_values(proc, vec![new_node, old_node, new_true_node]))
 }
 
@@ -2317,7 +2812,7 @@ fn prim_ensure_directories_exist(
     let existed = dir.exists();
     std::fs::create_dir_all(dir)
         .map_err(|e| ControlSignal::Error(format!("ENSURE-DIRECTORIES-EXIST: {}", e)))?;
-    let path_node = alloc_string(proc, path);
+    let path_node = alloc_pathname(proc, Pathname::from_namestring(&path));
     let created_node = if existed { proc.make_nil() } else { proc.make_t(ctx) };
     Ok(set_multiple_values(proc, vec![path_node, created_node]))
 }
@@ -2330,7 +2825,9 @@ fn prim_compile_file_pathname(
     Ok(proc
         .arena
         .inner
-        .alloc(Node::Leaf(OpaqueValue::String("out.fasl".to_string()))))
+        .alloc(Node::Leaf(OpaqueValue::Pathname(Pathname::from_namestring(
+            "out.fasl",
+        )))))
 }
 
 fn prim_file_namestring(
@@ -14679,6 +15176,210 @@ mod tests {
         let merged = prim_merge_pathnames(&mut proc, &globals, &[specified]).unwrap();
         let out = string_from_designator(&proc, &globals, merged).unwrap();
         assert!(out.ends_with("/tmp/treecl-defaults/child.lisp"));
+    }
+
+    #[test]
+    fn test_parse_namestring_basic_and_bounds() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let raw = "dir/file.lisp";
+        let path = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(raw.to_string())));
+        let pn = prim_parse_namestring(&mut proc, &globals, &[path]).unwrap();
+        let out = string_from_designator(&proc, &globals, pn).unwrap();
+        assert_eq!(out, raw);
+        assert!(proc.values.len() >= 2);
+        match proc.arena.inner.get_unchecked(proc.values[1]) {
+            Node::Leaf(OpaqueValue::Integer(n)) => {
+                assert_eq!(*n as usize, raw.chars().count());
+            }
+            other => panic!("Expected integer index, got {:?}", other),
+        }
+
+        let nil = proc.make_nil();
+        let kw_start = globals.symbols.write().unwrap().intern_keyword("START");
+        let kw_end = globals.symbols.write().unwrap().intern_keyword("END");
+        let start_kw = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_start.0)));
+        let end_kw = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_end.0)));
+        let start = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Integer(4)));
+        let end = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Integer(raw.chars().count() as i64)));
+        let pn2 = prim_parse_namestring(
+            &mut proc,
+            &globals,
+            &[path, nil, nil, start_kw, start, end_kw, end],
+        )
+        .unwrap();
+        let out2 = string_from_designator(&proc, &globals, pn2).unwrap();
+        assert_eq!(out2, "file.lisp");
+    }
+
+    #[test]
+    fn test_parse_namestring_junk_allowed() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let raw = "foo.lisp junk";
+        let path = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(raw.to_string())));
+        let nil = proc.make_nil();
+        let kw_junk = globals.symbols.write().unwrap().intern_keyword("JUNK-ALLOWED");
+        let junk_kw = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_junk.0)));
+        let t_node = proc.make_t(&globals);
+
+        let pn = prim_parse_namestring(&mut proc, &globals, &[path, nil, nil, junk_kw, t_node])
+            .unwrap();
+        let out = string_from_designator(&proc, &globals, pn).unwrap();
+        assert_eq!(out, "foo.lisp");
+        assert!(proc.values.len() >= 2);
+        match proc.arena.inner.get_unchecked(proc.values[1]) {
+            Node::Leaf(OpaqueValue::Integer(n)) => {
+                assert_eq!(*n as usize, "foo.lisp".chars().count());
+            }
+            other => panic!("Expected integer index, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_namestring_logical() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let raw = "SYS:FOO;BAR.LISP";
+        let path = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(raw.to_string())));
+        let pn = prim_parse_namestring(&mut proc, &globals, &[path]).unwrap();
+
+        let host = prim_pathname_host(&mut proc, &globals, &[pn]).unwrap();
+        assert_eq!(
+            string_from_designator(&proc, &globals, host).unwrap(),
+            "SYS"
+        );
+
+        let dir = prim_pathname_directory(&mut proc, &globals, &[pn]).unwrap();
+        let items = list_to_vec_opt(&proc, dir).unwrap();
+        assert!(items.len() >= 2);
+        let first = items[0];
+        let first_sym = node_to_symbol(&proc, first).unwrap();
+        let sym_table = globals.symbols.read().unwrap();
+        let first_name = sym_table.symbol_name(first_sym).unwrap();
+        assert_eq!(first_name, "ABSOLUTE");
+        let second = string_from_designator(&proc, &globals, items[1]).unwrap();
+        assert_eq!(second, "FOO");
+
+        let name = prim_pathname_name(&mut proc, &globals, &[pn]).unwrap();
+        assert_eq!(
+            string_from_designator(&proc, &globals, name).unwrap(),
+            "BAR"
+        );
+        let ty = prim_pathname_type(&mut proc, &globals, &[pn]).unwrap();
+        assert_eq!(
+            string_from_designator(&proc, &globals, ty).unwrap(),
+            "LISP"
+        );
+    }
+
+    #[test]
+    fn test_wild_pathname_p_and_match() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let kw_name = globals.symbols.write().unwrap().intern_keyword("NAME");
+        let kw_type = globals.symbols.write().unwrap().intern_keyword("TYPE");
+        let kw_wild = globals.symbols.write().unwrap().intern_keyword("WILD");
+        let name_kw_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_name.0)));
+        let type_kw_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_type.0)));
+        let wild_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_wild.0)));
+
+        let pn = prim_make_pathname(&mut proc, &globals, &[name_kw_node, wild_node]).unwrap();
+        let res = prim_wild_pathname_p(&mut proc, &globals, &[pn]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(res), Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0));
+
+        let res_name = prim_wild_pathname_p(&mut proc, &globals, &[pn, name_kw_node]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(res_name), Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0));
+
+        let res_type = prim_wild_pathname_p(&mut proc, &globals, &[pn, type_kw_node]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(res_type), Node::Leaf(OpaqueValue::Nil)));
+
+        let pattern_str = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("CLTEST:*.LSP".to_string())));
+        let actual_str = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("CLTEST:FOO.LSP".to_string())));
+        let pattern = prim_parse_namestring(&mut proc, &globals, &[pattern_str]).unwrap();
+        let actual = prim_parse_namestring(&mut proc, &globals, &[actual_str]).unwrap();
+        let matched = prim_pathname_match_p(&mut proc, &globals, &[actual, pattern]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(matched), Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0));
+
+        let foo_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String("foo".to_string())));
+        let pn2 = prim_make_pathname(&mut proc, &globals, &[name_kw_node, foo_node]).unwrap();
+        let mismatch = prim_pathname_match_p(&mut proc, &globals, &[pn, pn2]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(mismatch), Node::Leaf(OpaqueValue::Nil)));
     }
 
     #[test]

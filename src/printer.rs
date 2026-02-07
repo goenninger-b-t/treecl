@@ -206,6 +206,21 @@ impl<'a> Printer<'a> {
                     self.output.push_str(&s);
                 }
             }
+            OpaqueValue::Pathname(p) => {
+                if self.options.escape {
+                    self.output.push_str("#P");
+                    self.output.push('"');
+                    for c in p.namestring().chars() {
+                        if c == '"' || c == '\\' {
+                            self.output.push('\\');
+                        }
+                        self.output.push(c);
+                    }
+                    self.output.push('"');
+                } else {
+                    self.output.push_str(p.namestring());
+                }
+            }
             OpaqueValue::VectorHandle(h) => {
                 self.output.push_str(&format!("#<vector:{}>", h));
             }
@@ -538,6 +553,7 @@ impl<'a> DotPrinter<'a> {
                     OpaqueValue::Integer(i) => i.to_string(),
                     OpaqueValue::Float(f) => f.to_string(),
                     OpaqueValue::String(s) => format!("{:?}", s),
+                    OpaqueValue::Pathname(p) => format!("#P{:?}", p.namestring()),
                     OpaqueValue::Ratio(n, d) => format!("{}/{}", n, d),
                     _ => "?".to_string(),
                 };
@@ -662,6 +678,7 @@ impl<'a> BookTreeBuilder<'a> {
             OpaqueValue::Ratio(n, d) => Some(format!("{}/{}", n, d)),
             OpaqueValue::Float(f) => Some(f.to_string()),
             OpaqueValue::String(s) => Some(format!("\"{}\"", s)),
+            OpaqueValue::Pathname(p) => Some(format!("#P\"{}\"", p.namestring())),
             _ => Some("atom".to_string()),
         }
     }

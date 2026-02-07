@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use crate::pathname::Pathname;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] // Added Copy/Clone/Eq/Hash
 pub struct ForeignHandle(pub *mut c_void);
@@ -22,6 +23,7 @@ pub enum OpaqueValue {
     Float(f64),
     Char(char),
     String(String),             // String content
+    Pathname(Pathname),         // Pathname object
     Closure(u32),               // Handle to Closure
     VectorHandle(u32),          // Index into Vector Storage
     ForeignPtr(ForeignHandle),  // FFI Handle

@@ -459,6 +459,7 @@ pub fn unparse(arena: &Arena, id: NodeId, depth: usize) -> String {
             OpaqueValue::Symbol(id) => format!("#<symbol:{}>", id),
             OpaqueValue::BigInt(n) => n.to_string(),
             OpaqueValue::Ratio(n, d) => format!("{}/{}", n, d),
+            OpaqueValue::Pathname(p) => format!("#P\"{}\"", p.namestring()),
             OpaqueValue::StreamHandle(id) => format!("#<stream:{}>", id),
             OpaqueValue::Pid(pid) => format!("#<{}.{}.{}>", pid.node, pid.id, pid.serial),
             OpaqueValue::HashHandle(h) => format!("#<hash-table:{}>", h),

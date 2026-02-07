@@ -304,3 +304,63 @@ Progress update (Feb 6 2026, minimal pathnames + filesystem primitives)
 - Implemented minimal string-backed pathname and filesystem primitives: `pathname`, `namestring`, `make-pathname` (supports :defaults), `merge-pathnames`, `pathname-directory/name/type` (directory returns a keyword list), `pathname-host/device/version` (nil), `probe-file`, `truename`, `directory` (basic glob `*`/`?`), `delete-file`, `rename-file`, `ensure-directories-exist`, `file-namestring`, and `directory-namestring`.
 - Added unit tests in `src/primitives.rs` for make-pathname, pathname accessors/namestrings, merge-pathnames defaults, probe-file + directory glob, and ensure-directories-exist.
 - Tests: `cargo test -q` passes; regression harness still times out at 120s.
+
+Progress update (Feb 6 2026, pathname objects + parse-namestring)
+--------------------------------------------------------------------------------
+
+- Added a lightweight pathname object (`OpaqueValue::Pathname`) backed by `src/pathname.rs` with parsed directory/name/type components; `#P` reader now yields pathname objects.
+- Pathname primitives now return pathname objects (`pathname`, `make-pathname`, `merge-pathnames`, `probe-file`, `truename`, `directory`, `rename-file`, `ensure-directories-exist`, `compile-file-pathname`).
+- Implemented `parse-namestring` (returns pathname + end index) and added tests for parse-namestring bounds.
+- Tests: `cargo test -q` passes; regression harness still times out at 120s.
+
+Progress update (Feb 6 2026, parse-namestring keywords + host/defaults merge)
+--------------------------------------------------------------------------------
+
+- `parse-namestring` now parses `:start`, `:end`, and `:junk-allowed` keywords; when junk is allowed, parsing stops at first whitespace and returns the index.
+- Added best-effort host/defaults handling: relative namestrings merge against defaults, and host is inherited if provided or in defaults.
+- `pathname-host/device/version` now return values from pathname objects (still mostly nil because parsing is minimal).
+- Added a `parse-namestring` junk-allowed unit test; `cargo test -q` passes; regression harness still times out at 120s.
+
+Progress update (Feb 6 2026, logical pathname parsing + subset harness)
+--------------------------------------------------------------------------------
+
+- `Pathname::from_namestring` now detects logical namestrings (host before `:` with `;` directory separators) and basic Windows drive devices; logical namestrings parse host + directory components + name/type.
+- Added a unit test for logical namestring parsing in `parse-namestring`.
+- Created a focused pathnames harness (`/tmp/ansi_pathnames_subset.lsp`), but it still times out at 120s (`timeout 120s target/debug/treecl /tmp/ansi_pathnames_subset.lsp`).
+
+Progress update (Feb 6 2026, wild-pathname-p + pathname-match-p + instrumentation)
+--------------------------------------------------------------------------------
+
+- Added primitives `pathnamep`, `wild-pathname-p`, and `pathname-match-p` with minimal wildcard matching (name/type globbing and basic directory wild-inferiors handling), plus unit tests.
+- Created a step-by-step harness `/tmp/ansi_pathnames_step.lsp` to print before each pathnames file load. The run reaches `wild-pathname-p.lsp` before timing out at 120s, so the stall is within or after that file.
+
+Progress update (Feb 7 2026, filtered LOAD debug for wild-pathname-p)
+--------------------------------------------------------------------------------
+
+- Added a `TREECL_DEBUG_LOAD_MATCH` filter to form-level LOAD logging so a single file can be traced without global log spam.
+- Ran a focused harness (`/tmp/ansi_pathnames_wild_only.lsp`) with `TREECL_DEBUG_LOAD=1 TREECL_DEBUG_LOAD_MATCH=wild-pathname-p.lsp`; all 36 forms in `wild-pathname-p.lsp` logged and completed, so the stall does not reproduce within that file in isolation.
+- The full step harness still times out at 120s before reaching `wild-pathname-p.lsp` (last printed `enough-namestring.lsp`), so the slowdown likely occurs earlier in the pathnames sequence.
+
+Progress update (Feb 7 2026, per-form LOAD timing + pathnames baseline runtime)
+--------------------------------------------------------------------------------
+
+- Added `TREECL_DEBUG_LOAD_TIMING=1` support in `prim_load` to emit per-form read/eval durations for files selected by `TREECL_DEBUG_LOAD_MATCH`.
+- Re-ran the step harness with `TREECL_DEBUG_LOAD_MATCH=enough-namestring.lsp`; the run still timed out at 120s and only showed file markers through `file-namestring.lsp`.
+- Timed `file-namestring.lsp` in the full step harness: all 5 forms completed, with `EVAL` times roughly `0.74s` to `1.07s` and read times below `1ms` per form.
+- Timed `wild-pathname-p.lsp` in the full step harness: run reached form `#14` before the 120s timeout; prior forms showed `EVAL` around `0.56s` to `0.92s` each, with negligible read time.
+- Control run with larger timeout completed successfully: `timeout 300s target/debug/treecl /tmp/ansi_pathnames_step.lsp` exited 0 and loaded through `parse-namestring.lsp` in `2:39.25`.
+- Conclusion: current pathnames timeout behavior is cumulative load/runtime overhead beyond 120s, not a single deterministic hang before `enough-namestring.lsp`.
+
+Progress update (Feb 7 2026, coarse file-level LOAD timing + ranking)
+--------------------------------------------------------------------------------
+
+- Added `TREECL_DEBUG_LOAD_FILE_TIMING=1` mode in `prim_load` for coarse per-file elapsed logging (`LOAD FILE TIMING [...]`) and enabled final ranked load summaries in script mode even when symbol/hash counters are disabled.
+- Ran the full pathnames step harness with coarse timing: `timeout 240s env TREECL_DEBUG_LOAD_FILE_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` (exit 0).
+- Summary output reported `files=28`, `loads=28`, cumulative elapsed `~144.57s`.
+- Top elapsed files:
+  - `wild-pathname-p.lsp` ~`25.52s`
+  - `make-pathname.lsp` ~`15.94s`
+  - `pathname-match-p.lsp` ~`9.76s`
+  - `pathname.lsp` ~`8.56s`
+  - `logical-pathname.lsp` ~`8.36s`
+- This confirms a clear optimization priority list for pathnames performance work without requiring noisy per-form logging.

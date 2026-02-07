@@ -5,6 +5,7 @@
 use crate::arena::{Arena, Node};
 use crate::arrays::ArrayStore;
 use crate::readtable::{Readtable, ReadtableCase, SyntaxType};
+use crate::pathname::Pathname;
 use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
 use num_traits::{Signed, ToPrimitive};
@@ -625,10 +626,13 @@ impl<'a> Reader<'a> {
                 self.input.next();
                 // Expect string
                 let form = self.read()?;
-                // For now, just return valid node. Pathname support might be missing.
-                // We could wrap it or just return the string/form.
-                // If we return the string, (truename "foo") usually works.
-                Ok(form)
+                if let Node::Leaf(OpaqueValue::String(s)) = self.arena.get_unchecked(form).clone()
+                {
+                    let pn = Pathname::from_namestring(&s);
+                    Ok(self.arena.alloc(Node::Leaf(OpaqueValue::Pathname(pn))))
+                } else {
+                    Ok(form)
+                }
             }
             Some('*') => {
                 // #* bit-vector

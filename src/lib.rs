@@ -12,6 +12,7 @@ pub mod conditions;
 pub mod eval;
 pub mod fastmap;
 pub mod hashtables;
+pub mod pathname;
 pub mod pattern;
 pub mod primitives;
 pub mod printer;
