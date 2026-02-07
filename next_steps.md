@@ -1,2 +1,3 @@
-1. Re-run the step harness with `TREECL_DEBUG_LOAD_MATCH=enough-namestring.lsp` to pinpoint the last form before the timeout.
-2. If it still times out without form logs, add per-form timing to `prim_load` so we can quantify where time is spent.
+1. Add hit/miss counters for the simple `SETF` fast path to quantify complex-place fallback rate in `/tmp/ansi_pathnames_step.lsp`.
+2. Extend `SETF` fast handling beyond symbol places (where safe), then re-run `TREECL_DEBUG_RT_MACRO_TIMING=1` to validate aggregate reduction.
+3. Re-run `TREECL_DEBUG_LOAD_FILE_TIMING=1` after `SETF` work to check movement in top files (`wild-pathname-p.lsp`, `make-pathname.lsp`, `pathname-match-p.lsp`).

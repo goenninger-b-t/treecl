@@ -364,3 +364,80 @@ Progress update (Feb 7 2026, coarse file-level LOAD timing + ranking)
   - `pathname.lsp` ~`8.56s`
   - `logical-pathname.lsp` ~`8.36s`
 - This confirms a clear optimization priority list for pathnames performance work without requiring noisy per-form logging.
+
+Progress update (Feb 7 2026, split timing for REGRESSION-TEST:DEFTEST)
+--------------------------------------------------------------------------------
+
+- Added evaluator-level split timing for `REGRESSION-TEST:DEFTEST`:
+  - `TREECL_DEBUG_DEFTEST_TIMING=1` enables timing logs.
+  - `TREECL_DEBUG_DEFTEST_MATCH=<substring>` filters by test name.
+- Instrumentation reports per-test `expand` (macro expansion) and `eval` (expanded-form execution) times as:
+  - `DEFTEST TIMING [<test-name>]: expand=<ms> eval=<ms> total=<ms>`.
+- Focused run on wild-pathname tests:
+  - Command: `timeout 240s env TREECL_DEBUG_DEFTEST_TIMING=1 TREECL_DEBUG_DEFTEST_MATCH=WILD-PATHNAME-P. target/debug/treecl /tmp/ansi_pathnames_step.lsp`
+  - Result: exit 0, 36 split timing entries logged.
+- Aggregate timing from that run:
+  - expand sum ~`16804ms`, eval sum ~`5804ms`, total ~`22609ms`
+  - averages: expand ~`466.8ms`, eval ~`161.2ms` per test.
+- Interpretation: in this hotspot, macro expansion dominates over runtime evaluation, so optimization should prioritize macroexpansion path cost (RT `deftest`/helpers and general macro expansion overhead) before primitive-level runtime tuning.
+
+Progress update (Feb 7 2026, fast-path expansion for RT DEFTEST)
+--------------------------------------------------------------------------------
+
+- Implemented a fast macro expansion path in `src/eval.rs` for `REGRESSION-TEST:DEFTEST`: when this macro is invoked, TreeCL now constructs the equivalent expansion in Rust (`(add-entry (make-entry ...))`) instead of evaluating the Lisp macro body.
+- Kept split timing instrumentation enabled for validation.
+- Re-ran focused timing:
+  - Command: `timeout 240s env TREECL_DEBUG_DEFTEST_TIMING=1 TREECL_DEBUG_DEFTEST_MATCH=WILD-PATHNAME-P. target/debug/treecl /tmp/ansi_pathnames_step.lsp`
+  - Result: exit 0, 36 timing entries.
+  - New aggregate: expand ~`1.03ms`, eval ~`5822ms`, total ~`5823ms`.
+  - Expansion average dropped from ~`466.8ms` per test to ~`0.03ms` per test.
+- Re-ran coarse file timing:
+  - Command: `timeout 240s env TREECL_DEBUG_LOAD_FILE_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp`
+  - Result: `wild-pathname-p.lsp` elapsed dropped from ~`25.52s` to ~`4.48s`.
+  - Full step-harness total dropped from ~`144.57s` to ~`26.93s` (`~5.37x` speedup, `~81.4%` reduction).
+- Control check:
+  - `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` now exits 0 and reaches `"DEBUG: done"`.
+
+Progress update (Feb 7 2026, generic macro timing + follow-up fast paths)
+--------------------------------------------------------------------------------
+
+- Added generic macro split timing in the evaluator:
+  - `TREECL_DEBUG_RT_MACRO_TIMING=1` enables per-macro split timing logs.
+  - `TREECL_DEBUG_RT_MACRO_MATCH=<substring>` filters by fully-qualified macro name.
+  - Log format: `MACRO TIMING [<pkg:name>]: expand=<ms> eval=<ms> total=<ms>`.
+- Added fast expansion for `CL-TEST:SIGNALS-ERROR` and a conservative fast path for `COMMON-LISP:SETF` when all places are symbols (complex-place `SETF` still falls back to the Lisp macro body).
+- Added regression tests in `src/eval.rs`:
+  - `test_expand_signals_error_eval_branch`
+  - `test_expand_signals_error_compile_branch`
+  - `test_setf_fast_path_symbol_places`
+  - `test_setf_fast_path_falls_back_for_places`
+  - `cargo test -q` passes.
+- Targeted `signals-error` load-path check:
+  - `timeout 240s env TREECL_DEBUG_RT_MACRO_TIMING=1 TREECL_DEBUG_RT_MACRO_MATCH=CL-TEST:SIGNALS-ERROR target/debug/treecl /tmp/ansi_pathnames_step.lsp`
+  - Result: exit 0, no `MACRO TIMING` hits for `CL-TEST:SIGNALS-ERROR`.
+  - Interpretation: `signals-error` forms are inside quoted `DEFTEST` bodies in this harness and are not macroexpanded during step-load.
+- Full macro timing on the step harness still shows dominant load-time macro cost in `COMMON-LISP:LET*`, `COMMON-LISP:COND`, and `COMMON-LISP:SETF` (plus `REGRESSION-TEST:DEFTEST` eval-side cost).
+- The simple `SETF` fast path did not reduce aggregate `SETF` totals in this harness, suggesting expensive `SETF` cases are mostly non-symbol places and still taking fallback expansion.
+
+Progress update (Feb 7 2026, evaluator-level LET*/COND handling)
+--------------------------------------------------------------------------------
+
+- Added direct evaluator dispatch for `COMMON-LISP:LET*` and `COMMON-LISP:COND` in both:
+  - TCO step path (`step_application`),
+  - non-TCO path (`eval_application`),
+  so these forms are handled before macro expansion.
+- Implemented evaluators:
+  - `eval_let_star` with sequential binding semantics and special-variable save/restore,
+  - `eval_cond` with clause evaluation semantics matching existing macro behavior.
+- Added tests in `src/eval.rs`:
+  - `test_eval_let_star_sequential_bindings`
+  - `test_eval_let_star_special_binding_restore`
+  - `test_eval_cond_direct_handling`
+  - `cargo test -q` passes (99 core tests).
+- Re-ran full macro timing:
+  - Command: `timeout 240s env TREECL_DEBUG_RT_MACRO_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp`
+  - Result: `COMMON-LISP:LET*` and `COMMON-LISP:COND` no longer appear in `MACRO TIMING` aggregates, confirming macro expansion bypass for these forms.
+- Re-ran pathnames timing:
+  - Coarse file timing summary: total improved from ~`34.52s` to ~`28.73s`.
+  - Control wall time: `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` now around `27.67s`.
+  - Remaining largest macro timing contributors are now `COMMON-LISP:SETF` and `REGRESSION-TEST:DEFTEST` eval-side work.

@@ -9,7 +9,7 @@ use crate::symbol::{PackageId, SymbolId, SymbolTable};
 use crate::types::{NodeId, OpaqueValue};
 
 use crate::fastmap::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Environment for lexical bindings
 #[derive(Debug, Clone)]
@@ -212,6 +212,12 @@ pub enum Continuation {
     Apply {
         // Restore caller environment after a function application.
         saved_env: Environment,
+    },
+    /// Timing frame for macro expansion and expanded-form evaluation.
+    MacroTiming {
+        label: String,
+        expand_ns: u64,
+        eval_started_at: std::time::Instant,
     },
     /// Evaluate sequences (PROGN)
     /// (remaining_forms)
@@ -1088,6 +1094,9 @@ impl<'a> Interpreter<'a> {
             if sym_id == sf.r#let {
                 return self.step_let(args, env);
             }
+            if self.is_common_lisp_let_star_symbol(sym_id) {
+                return self.step_let_star(args, env);
+            }
             if sym_id == sf.multiple_value_bind {
                 return self.step_multiple_value_bind(args, env);
             }
@@ -1117,6 +1126,9 @@ impl<'a> Interpreter<'a> {
                     "UNQUOTE-SPLICING outside of QUASIQUOTE".into(),
                 ));
             }
+            if self.is_common_lisp_cond_symbol(sym_id) {
+                return self.step_cond(args, env);
+            }
         }
 
         // Handle CALL-METHOD when it is lexically bound.
@@ -1134,7 +1146,28 @@ impl<'a> Interpreter<'a> {
         if let Some(sym_id) = self.node_to_symbol(op) {
             if let Some(&macro_idx) = self.process.macros.get(&sym_id) {
                 if let Some(closure) = self.process.closures.get(macro_idx).cloned() {
-                    let expanded = self._apply_macro(&closure, args)?;
+                    let macro_timing_label = self.macro_timing_label(sym_id, args);
+                    let macro_started_at = std::time::Instant::now();
+                    let expanded =
+                        if let Some(fast) = self.try_fast_macro_expand(sym_id, args, &env)?
+                    {
+                        fast
+                    } else {
+                        self._apply_macro(&closure, args)?
+                    };
+                    if let Some(label) = macro_timing_label {
+                        let expand_ns = macro_started_at
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64;
+                        self.process
+                            .continuation_stack
+                            .push(Continuation::MacroTiming {
+                                label,
+                                expand_ns,
+                                eval_started_at: std::time::Instant::now(),
+                            });
+                    }
                     self.process.program = expanded;
                     self.process.execution_mode = crate::process::ExecutionMode::Eval;
                     return Ok(true);
@@ -1683,6 +1716,14 @@ impl<'a> Interpreter<'a> {
         Ok(true)
     }
 
+    fn step_let_star(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env.clone());
+        let result = self.eval_let_star(args, &env)?;
+        self.process.program = result;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
     fn step_setq(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
         self.process.current_env = Some(env.clone());
         if let Node::Fork(var_node, rest) = self.process.arena.get_unchecked(args).clone() {
@@ -1735,6 +1776,14 @@ impl<'a> Interpreter<'a> {
             self.process.execution_mode = crate::process::ExecutionMode::Return;
             Ok(true)
         }
+    }
+
+    fn step_cond(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env.clone());
+        let result = self.eval_cond(args, &env)?;
+        self.process.program = result;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
     }
 
     fn step_multiple_value_bind(
@@ -2175,6 +2224,19 @@ impl<'a> Interpreter<'a> {
             Continuation::Apply { saved_env } => {
                 // Restore caller environment after function application.
                 self.process.current_env = Some(saved_env);
+                self.process.execution_mode = crate::process::ExecutionMode::Return;
+                Ok(true)
+            }
+            Continuation::MacroTiming {
+                label,
+                expand_ns,
+                eval_started_at,
+            } => {
+                let eval_ns = eval_started_at
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.log_macro_split_timing(&label, expand_ns, eval_ns);
                 self.process.execution_mode = crate::process::ExecutionMode::Return;
                 Ok(true)
             }
@@ -2965,12 +3027,39 @@ impl<'a> Interpreter<'a> {
     pub fn eval_application(&mut self, op: NodeId, args: NodeId, env: &Environment) -> EvalResult {
         // First, check if operator is a symbol that's a special form
         if let Some(sym_id) = self.node_to_symbol(op) {
+            if self.is_common_lisp_let_star_symbol(sym_id) {
+                return self.eval_let_star(args, env);
+            }
+            if self.is_common_lisp_cond_symbol(sym_id) {
+                return self.eval_cond(args, env);
+            }
             // Check special forms
             let sf = &self.globals.special_forms;
             // 0. Check for macro expansion
             if let Some(&macro_idx) = self.process.macros.get(&sym_id) {
                 if let Some(closure) = self.process.closures.get(macro_idx).cloned() {
-                    let expanded = self._apply_macro(&closure, args)?;
+                    let macro_timing_label = self.macro_timing_label(sym_id, args);
+                    let expand_started_at = std::time::Instant::now();
+                    let expanded = if let Some(fast) = self.try_fast_macro_expand(sym_id, args, env)?
+                    {
+                        fast
+                    } else {
+                        self._apply_macro(&closure, args)?
+                    };
+                    if let Some(label) = macro_timing_label {
+                        let expand_ns = expand_started_at
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64;
+                        let eval_started_at = std::time::Instant::now();
+                        let result = self.eval(expanded, env)?;
+                        let eval_ns = eval_started_at
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64;
+                        self.log_macro_split_timing(&label, expand_ns, eval_ns);
+                        return Ok(result);
+                    }
                     return self.eval(expanded, env);
                 }
             }
@@ -4013,6 +4102,655 @@ impl<'a> Interpreter<'a> {
         matches!(node, Node::Leaf(OpaqueValue::Nil))
     }
 
+    fn debug_deftest_timing_enabled(&self) -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("TREECL_DEBUG_DEFTEST_TIMING").is_ok())
+    }
+
+    fn debug_rt_macro_timing_enabled(&self) -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("TREECL_DEBUG_RT_MACRO_TIMING").is_ok())
+    }
+
+    fn deftest_timing_match_pattern(&self) -> Option<&str> {
+        static PATTERN: OnceLock<Option<String>> = OnceLock::new();
+        PATTERN
+            .get_or_init(|| std::env::var("TREECL_DEBUG_DEFTEST_MATCH").ok())
+            .as_deref()
+    }
+
+    fn rt_macro_timing_match_pattern(&self) -> Option<&str> {
+        static PATTERN: OnceLock<Option<String>> = OnceLock::new();
+        PATTERN
+            .get_or_init(|| std::env::var("TREECL_DEBUG_RT_MACRO_MATCH").ok())
+            .as_deref()
+    }
+
+    fn is_regression_deftest_symbol(&self, sym: SymbolId) -> bool {
+        let symbols = self.globals.symbols.read().unwrap();
+        if symbols.symbol_name(sym) != Some("DEFTEST") {
+            return false;
+        }
+        let Some(pkg_id) = symbols.symbol_package(sym) else {
+            return false;
+        };
+        let Some(pkg) = symbols.get_package(pkg_id) else {
+            return false;
+        };
+        pkg.name == "REGRESSION-TEST"
+    }
+
+    fn format_deftest_name_from_args(&self, args: NodeId) -> String {
+        let first_arg = match self.process.arena.inner.get_unchecked(args) {
+            Node::Fork(head, _) => *head,
+            _ => return "<missing-name>".to_string(),
+        };
+        let symbols = self.globals.symbols.read().unwrap();
+        if let Some(sym) = self.node_to_symbol(first_arg) {
+            let name = symbols.symbol_name(sym).unwrap_or("<unnamed>");
+            if let Some(pkg_id) = symbols.symbol_package(sym) {
+                if let Some(pkg) = symbols.get_package(pkg_id) {
+                    return format!("{}:{}", pkg.name, name);
+                }
+            }
+            return name.to_string();
+        }
+        crate::printer::print_to_string(&self.process.arena.inner, &symbols, first_arg)
+    }
+
+    fn should_time_deftest(&self, sym: SymbolId, args: NodeId) -> Option<String> {
+        if !self.debug_deftest_timing_enabled() {
+            return None;
+        }
+        if !self.is_regression_deftest_symbol(sym) {
+            return None;
+        }
+        let test_name = self.format_deftest_name_from_args(args);
+        if let Some(pattern) = self.deftest_timing_match_pattern() {
+            if !pattern.is_empty() && !test_name.contains(pattern) {
+                return None;
+            }
+        }
+        Some(test_name)
+    }
+
+    fn format_macro_name(&self, sym: SymbolId) -> String {
+        let symbols = self.globals.symbols.read().unwrap();
+        let sym_name = symbols.symbol_name(sym).unwrap_or("<unnamed>");
+        if let Some(pkg_id) = symbols.symbol_package(sym) {
+            if let Some(pkg) = symbols.get_package(pkg_id) {
+                return format!("{}:{}", pkg.name, sym_name);
+            }
+        }
+        sym_name.to_string()
+    }
+
+    fn should_time_rt_macro(&self, sym: SymbolId) -> Option<String> {
+        if !self.debug_rt_macro_timing_enabled() {
+            return None;
+        }
+        let macro_name = self.format_macro_name(sym);
+        if let Some(pattern) = self.rt_macro_timing_match_pattern() {
+            if !pattern.is_empty() && !macro_name.contains(pattern) {
+                return None;
+            }
+        }
+        Some(macro_name)
+    }
+
+    fn macro_timing_label(&self, sym: SymbolId, args: NodeId) -> Option<String> {
+        if let Some(test_name) = self.should_time_deftest(sym, args) {
+            return Some(format!("DEFTEST TIMING [{}]", test_name));
+        }
+        self.should_time_rt_macro(sym)
+            .map(|name| format!("MACRO TIMING [{}]", name))
+    }
+
+    fn log_macro_split_timing(&self, label: &str, expand_ns: u64, eval_ns: u64) {
+        let expand_ms = expand_ns as f64 / 1_000_000.0;
+        let eval_ms = eval_ns as f64 / 1_000_000.0;
+        let total_ms = (expand_ns.saturating_add(eval_ns)) as f64 / 1_000_000.0;
+        eprintln!(
+            "{}: expand={:.3}ms eval={:.3}ms total={:.3}ms",
+            label, expand_ms, eval_ms, total_ms
+        );
+    }
+
+    fn make_quote_form(&mut self, value: NodeId) -> NodeId {
+        let quote_sym = self.globals.special_forms.quote;
+        let quote_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(quote_sym.0)));
+        let arg_list = self.process.make_list(&[value]);
+        self.process.arena.inner.alloc(Node::Fork(quote_node, arg_list))
+    }
+
+    fn make_call_form(&mut self, operator: NodeId, args: &[NodeId]) -> NodeId {
+        let arg_list = self.process.make_list(args);
+        self.process.arena.inner.alloc(Node::Fork(operator, arg_list))
+    }
+
+    fn make_string_form(&mut self, value: &str) -> NodeId {
+        self.process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::String(value.to_string())))
+    }
+
+    fn try_fast_macro_expand(
+        &mut self,
+        sym: SymbolId,
+        args: NodeId,
+        env: &Environment,
+    ) -> Result<Option<NodeId>, ControlSignal> {
+        if self.is_regression_deftest_symbol(sym) {
+            return Ok(Some(self.expand_regression_deftest(args)?));
+        }
+        if self.is_common_lisp_setf_symbol(sym) {
+            if let Some(expanded) = self.expand_common_lisp_setf(args)? {
+                return Ok(Some(expanded));
+            }
+        }
+        if self.is_cl_test_signals_error_symbol(sym) {
+            return Ok(Some(self.expand_cl_test_signals_error(args, env)?));
+        }
+        Ok(None)
+    }
+
+    fn expand_common_lisp_setf(&mut self, args: NodeId) -> Result<Option<NodeId>, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Ok(Some(self.process.make_nil()));
+        }
+        if args_vec.len() % 2 != 0 {
+            let error_sym = self.ensure_cl_symbol("ERROR");
+            let error_node = self.sym_node(error_sym);
+            let msg = self.make_string_form("SETF: Odd number of arguments");
+            return Ok(Some(self.make_call_form(error_node, &[msg])));
+        }
+
+        let mut setq_forms = Vec::new();
+        let setq_sym = self.globals.special_forms.setq;
+        let setq_node = self.sym_node(setq_sym);
+        for pair in args_vec.chunks_exact(2) {
+            if self.node_to_symbol(pair[0]).is_none() {
+                return Ok(None);
+            }
+            let pair_list = self.process.make_list(pair);
+            setq_forms.push(self.process.arena.inner.alloc(Node::Fork(setq_node, pair_list)));
+        }
+
+        if setq_forms.len() == 1 {
+            return Ok(Some(setq_forms[0]));
+        }
+
+        let progn_sym = self.globals.special_forms.progn;
+        let progn_node = self.sym_node(progn_sym);
+        let body_list = self.process.make_list(&setq_forms);
+        Ok(Some(self.process.arena.inner.alloc(Node::Fork(progn_node, body_list))))
+    }
+
+    fn is_cl_test_signals_error_symbol(&self, sym: SymbolId) -> bool {
+        self.is_symbol_named_in_package(sym, "CL-TEST", "SIGNALS-ERROR")
+    }
+
+    fn is_common_lisp_setf_symbol(&self, sym: SymbolId) -> bool {
+        self.is_symbol_named_in_package(sym, "COMMON-LISP", "SETF")
+    }
+
+    fn is_common_lisp_let_star_symbol(&self, sym: SymbolId) -> bool {
+        self.is_symbol_named_in_package(sym, "COMMON-LISP", "LET*")
+    }
+
+    fn is_common_lisp_cond_symbol(&self, sym: SymbolId) -> bool {
+        self.is_symbol_named_in_package(sym, "COMMON-LISP", "COND")
+    }
+
+    fn is_symbol_named_in_package(&self, sym: SymbolId, pkg_name: &str, symbol_name: &str) -> bool {
+        let symbols = self.globals.symbols.read().unwrap();
+        if symbols.symbol_name(sym) != Some(symbol_name) {
+            return false;
+        }
+        let Some(pkg_id) = symbols.symbol_package(sym) else {
+            return false;
+        };
+        let Some(pkg) = symbols.get_package(pkg_id) else {
+            return false;
+        };
+        pkg.name == pkg_name
+    }
+
+    fn regression_compile_tests_enabled(&self) -> bool {
+        let compile_sym = {
+            let symbols = self.globals.symbols.read().unwrap();
+            let Some(rt_pkg) = symbols.find_package("REGRESSION-TEST") else {
+                return false;
+            };
+            symbols
+                .get_package(rt_pkg)
+                .and_then(|pkg| pkg.find_symbol("*COMPILE-TESTS*"))
+        };
+        compile_sym
+            .and_then(|sym| self.process.get_value(sym))
+            .map(|node| !self.is_nil(node))
+            .unwrap_or(false)
+    }
+
+    fn expand_cl_test_signals_error(
+        &mut self,
+        args: NodeId,
+        _env: &Environment,
+    ) -> Result<NodeId, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Err(ControlSignal::Error(
+                "SIGNALS-ERROR: missing FORM and ERROR-NAME".into(),
+            ));
+        }
+
+        let form = args_vec[0];
+        let error_name = args_vec[1];
+        let mut safety = self.process.make_integer(3);
+        let mut name_arg = self.process.make_nil();
+        let mut name_supplied = false;
+        let mut inline = self.process.make_nil();
+
+        let mut idx = 2usize;
+        while idx < args_vec.len() {
+            if idx + 1 >= args_vec.len() {
+                return Err(ControlSignal::Error(
+                    "SIGNALS-ERROR: missing value for keyword argument".into(),
+                ));
+            }
+
+            let key_node = args_vec[idx];
+            let value_node = args_vec[idx + 1];
+            let key_sym = self.node_to_symbol(key_node).ok_or_else(|| {
+                ControlSignal::Error("SIGNALS-ERROR: expected keyword argument".into())
+            })?;
+            if !self.is_keyword_symbol(key_sym) {
+                return Err(ControlSignal::Error(
+                    "SIGNALS-ERROR: expected keyword argument".into(),
+                ));
+            }
+
+            let key_name = {
+                let symbols = self.globals.symbols.read().unwrap();
+                symbols.symbol_name(key_sym).unwrap_or("").to_string()
+            };
+            match key_name.as_str() {
+                "SAFETY" => safety = value_node,
+                "NAME" => {
+                    name_arg = value_node;
+                    name_supplied = true;
+                }
+                "INLINE" => inline = value_node,
+                _ => {
+                    return Err(ControlSignal::Error(format!(
+                        "SIGNALS-ERROR: unknown keyword :{}",
+                        key_name
+                    )));
+                }
+            }
+            idx += 2;
+        }
+
+        let (
+            handler_bind_sym,
+            warning_sym,
+            function_sym,
+            lambda_sym,
+            declare_sym,
+            ignore_sym,
+            muffle_warning_sym,
+            proclaim_sym,
+            optimize_sym,
+            safety_sym,
+            handler_case_sym,
+            apply_sym,
+            values_sym,
+            multiple_value_list_sym,
+            funcall_sym,
+            compile_sym,
+            eval_sym,
+            cond_sym,
+            typep_sym,
+            type_error_datum_sym,
+            type_error_expected_type_sym,
+            list_sym,
+            eq_sym,
+            cell_error_name_sym,
+            not_sym,
+            streamp_sym,
+            stream_error_stream_sym,
+            pathnamep_sym,
+            pathname_sym,
+            file_error_pathname_sym,
+            printable_p_sym,
+            c_sym,
+        ) = {
+            let mut symbols = self.globals.symbols.write().unwrap();
+            let cl_pkg = PackageId(1);
+            let cl_test_pkg = symbols.find_package("CL-TEST").unwrap_or(PackageId(2));
+            (
+                symbols.intern_in("HANDLER-BIND", cl_pkg),
+                symbols.intern_in("WARNING", cl_pkg),
+                symbols.intern_in("FUNCTION", cl_pkg),
+                symbols.intern_in("LAMBDA", cl_pkg),
+                symbols.intern_in("DECLARE", cl_pkg),
+                symbols.intern_in("IGNORE", cl_pkg),
+                symbols.intern_in("MUFFLE-WARNING", cl_pkg),
+                symbols.intern_in("PROCLAIM", cl_pkg),
+                symbols.intern_in("OPTIMIZE", cl_pkg),
+                symbols.intern_in("SAFETY", cl_pkg),
+                symbols.intern_in("HANDLER-CASE", cl_pkg),
+                symbols.intern_in("APPLY", cl_pkg),
+                symbols.intern_in("VALUES", cl_pkg),
+                symbols.intern_in("MULTIPLE-VALUE-LIST", cl_pkg),
+                symbols.intern_in("FUNCALL", cl_pkg),
+                symbols.intern_in("COMPILE", cl_pkg),
+                symbols.intern_in("EVAL", cl_pkg),
+                symbols.intern_in("COND", cl_pkg),
+                symbols.intern_in("TYPEP", cl_pkg),
+                symbols.intern_in("TYPE-ERROR-DATUM", cl_pkg),
+                symbols.intern_in("TYPE-ERROR-EXPECTED-TYPE", cl_pkg),
+                symbols.intern_in("LIST", cl_pkg),
+                symbols.intern_in("EQ", cl_pkg),
+                symbols.intern_in("CELL-ERROR-NAME", cl_pkg),
+                symbols.intern_in("NOT", cl_pkg),
+                symbols.intern_in("STREAMP", cl_pkg),
+                symbols.intern_in("STREAM-ERROR-STREAM", cl_pkg),
+                symbols.intern_in("PATHNAMEP", cl_pkg),
+                symbols.intern_in("PATHNAME", cl_pkg),
+                symbols.intern_in("FILE-ERROR-PATHNAME", cl_pkg),
+                symbols.intern_in("PRINTABLE-P", cl_test_pkg),
+                symbols.intern_in("C", cl_test_pkg),
+            )
+        };
+
+        let handler_bind_node = self.sym_node(handler_bind_sym);
+        let warning_node = self.sym_node(warning_sym);
+        let function_node = self.sym_node(function_sym);
+        let lambda_node = self.sym_node(lambda_sym);
+        let declare_node = self.sym_node(declare_sym);
+        let ignore_node = self.sym_node(ignore_sym);
+        let muffle_warning_node = self.sym_node(muffle_warning_sym);
+        let proclaim_node = self.sym_node(proclaim_sym);
+        let optimize_node = self.sym_node(optimize_sym);
+        let safety_node = self.sym_node(safety_sym);
+        let handler_case_node = self.sym_node(handler_case_sym);
+        let apply_node = self.sym_node(apply_sym);
+        let values_node = self.sym_node(values_sym);
+        let multiple_value_list_node = self.sym_node(multiple_value_list_sym);
+        let funcall_node = self.sym_node(funcall_sym);
+        let compile_node = self.sym_node(compile_sym);
+        let eval_node = self.sym_node(eval_sym);
+        let cond_node = self.sym_node(cond_sym);
+        let typep_node = self.sym_node(typep_sym);
+        let type_error_datum_node = self.sym_node(type_error_datum_sym);
+        let type_error_expected_type_node = self.sym_node(type_error_expected_type_sym);
+        let list_node = self.sym_node(list_sym);
+        let eq_node = self.sym_node(eq_sym);
+        let cell_error_name_node = self.sym_node(cell_error_name_sym);
+        let not_node = self.sym_node(not_sym);
+        let streamp_node = self.sym_node(streamp_sym);
+        let stream_error_stream_node = self.sym_node(stream_error_stream_sym);
+        let pathnamep_node = self.sym_node(pathnamep_sym);
+        let pathname_node = self.sym_node(pathname_sym);
+        let file_error_pathname_node = self.sym_node(file_error_pathname_sym);
+        let printable_p_node = self.sym_node(printable_p_sym);
+        let c_node = self.sym_node(c_sym);
+        let quote_node = self.sym_node(self.globals.special_forms.quote);
+        let nil_node = self.process.make_nil();
+        let t_node = self.process.make_t(self.globals);
+
+        let ignore_form = self.make_call_form(ignore_node, &[c_node]);
+        let declare_ignore_form = self.make_call_form(declare_node, &[ignore_form]);
+        let muffle_warning_form = self.make_call_form(muffle_warning_node, &[]);
+        let lambda_params = self.process.make_list(&[c_node]);
+        let warning_lambda = self.make_call_form(
+            lambda_node,
+            &[lambda_params, declare_ignore_form, muffle_warning_form],
+        );
+        let warning_handler = self.make_call_form(function_node, &[warning_lambda]);
+        let warning_binding = self.process.make_list(&[warning_node, warning_handler]);
+        let handler_bindings = self.process.make_list(&[warning_binding]);
+
+        let safety_three_node = self.process.make_integer(3);
+        let safety_three_form = self.process.make_list(&[safety_node, safety_three_node]);
+        let optimize_3_form = self.process.make_list(&[optimize_node, safety_three_form]);
+        let quoted_optimize_3 = self.make_quote_form(optimize_3_form);
+        let proclaim_form = self.make_call_form(proclaim_node, &[quoted_optimize_3]);
+
+        let protected_eval_target = if !self.is_nil(inline) {
+            form
+        } else if self.regression_compile_tests_enabled() {
+            let optimize_compile_tail = self.process.make_list(&[safety_node, safety]);
+            let optimize_compile_form = self.process.make_list(&[optimize_node, optimize_compile_tail]);
+            let declare_compile_form = self.make_call_form(declare_node, &[optimize_compile_form]);
+            let lambda_form =
+                self.make_call_form(lambda_node, &[self.process.make_nil(), declare_compile_form, form]);
+            let quoted_lambda = self.make_quote_form(lambda_form);
+            let compile_call = self.make_call_form(compile_node, &[self.process.make_nil(), quoted_lambda]);
+            self.make_call_form(funcall_node, &[compile_call])
+        } else {
+            let quoted_form = self.make_quote_form(form);
+            self.make_call_form(eval_node, &[quoted_form])
+        };
+
+        let function_values = self.make_call_form(function_node, &[values_node]);
+        let mv_list_form = self.make_call_form(multiple_value_list_node, &[protected_eval_target]);
+        let apply_values_form = self.make_call_form(apply_node, &[function_values, nil_node, mv_list_form]);
+
+        let error_name_key = self.node_to_symbol(error_name).and_then(|sym| {
+            self.globals
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(sym)
+                .map(str::to_string)
+        });
+
+        let mut cond_clauses = Vec::new();
+        match error_name_key.as_deref() {
+            Some("TYPE-ERROR") => {
+                let datum_form = self.make_call_form(type_error_datum_node, &[c_node]);
+                let expected_form = self.make_call_form(type_error_expected_type_node, &[c_node]);
+                let typep_test = self.make_call_form(typep_node, &[datum_form, expected_form]);
+
+                let quoted_typep = self.make_quote_form(typep_node);
+                let quoted_quote = self.make_quote_form(quote_node);
+                let quoted_datum = self.make_call_form(list_node, &[quoted_quote, datum_form]);
+                let quoted_expected = self.make_call_form(list_node, &[quoted_quote, expected_form]);
+                let typep_form =
+                    self.make_call_form(list_node, &[quoted_typep, quoted_datum, quoted_expected]);
+                let arrow_true = self.make_string_form("==> true");
+                let details = self.make_call_form(list_node, &[typep_form, arrow_true]);
+                let values_form = self.make_call_form(values_node, &[nil_node, details]);
+                cond_clauses.push(self.process.make_list(&[typep_test, values_form]));
+            }
+            Some("UNDEFINED-FUNCTION") | Some("UNBOUND-VARIABLE") if name_supplied => {
+                let cell_name_form = self.make_call_form(cell_error_name_node, &[c_node]);
+                let expected_name = self.make_quote_form(name_arg);
+                let eq_form = self.make_call_form(eq_node, &[cell_name_form, expected_name]);
+                let mismatch_test = self.make_call_form(not_node, &[eq_form]);
+                let quoted_cell_name = self.make_quote_form(cell_error_name_node);
+                let arrow = self.make_string_form("==>");
+                let details = self.make_call_form(list_node, &[quoted_cell_name, arrow, cell_name_form]);
+                let values_form = self.make_call_form(values_node, &[nil_node, details]);
+                cond_clauses.push(self.process.make_list(&[mismatch_test, values_form]));
+            }
+            Some("STREAM-ERROR") | Some("END-OF-FILE") | Some("READER-ERROR") => {
+                let stream_form = self.make_call_form(stream_error_stream_node, &[c_node]);
+                let stream_ok = self.make_call_form(streamp_node, &[stream_form]);
+                let mismatch_test = self.make_call_form(not_node, &[stream_ok]);
+                let quoted_stream = self.make_quote_form(stream_error_stream_node);
+                let arrow = self.make_string_form("==>");
+                let details = self.make_call_form(list_node, &[quoted_stream, arrow, stream_form]);
+                let values_form = self.make_call_form(values_node, &[nil_node, details]);
+                cond_clauses.push(self.process.make_list(&[mismatch_test, values_form]));
+            }
+            Some("FILE-ERROR") => {
+                let file_path_form = self.make_call_form(file_error_pathname_node, &[c_node]);
+                let pathname_form = self.make_call_form(pathname_node, &[file_path_form]);
+                let pathname_ok = self.make_call_form(pathnamep_node, &[pathname_form]);
+                let mismatch_test = self.make_call_form(not_node, &[pathname_ok]);
+                let quoted_file_path = self.make_quote_form(file_error_pathname_node);
+                let arrow = self.make_string_form("==>");
+                let details = self.make_call_form(list_node, &[quoted_file_path, arrow, file_path_form]);
+                let values_form = self.make_call_form(values_node, &[nil_node, details]);
+                cond_clauses.push(self.process.make_list(&[mismatch_test, values_form]));
+            }
+            _ => {}
+        }
+
+        let printable_form = self.make_call_form(printable_p_node, &[c_node]);
+        cond_clauses.push(self.process.make_list(&[t_node, printable_form]));
+        let cond_form = self.make_call_form(cond_node, &cond_clauses);
+
+        let handler_bind_vars = self.process.make_list(&[c_node]);
+        let handler_clause = self.process.make_list(&[error_name, handler_bind_vars, cond_form]);
+        let handler_case_form = self.make_call_form(handler_case_node, &[apply_values_form, handler_clause]);
+
+        Ok(self.make_call_form(handler_bind_node, &[handler_bindings, proclaim_form, handler_case_form]))
+    }
+
+    fn expand_regression_deftest(&mut self, args: NodeId) -> Result<NodeId, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.is_empty() {
+            return Err(ControlSignal::Error("DEFTEST: missing name".into()));
+        }
+
+        let name_form = args_vec[0];
+        let body = &args_vec[1..];
+        let mut idx = 0usize;
+        let mut properties_flat = Vec::new();
+
+        while idx < body.len() {
+            let is_kw = self
+                .node_to_symbol(body[idx])
+                .map(|sym| self.is_keyword_symbol(sym))
+                .unwrap_or(false);
+            if !is_kw {
+                break;
+            }
+            if idx + 1 >= body.len() {
+                return Err(ControlSignal::Error(
+                    "Poorly formed deftest: missing value for keyword property".into(),
+                ));
+            }
+            properties_flat.push(body[idx]);
+            properties_flat.push(body[idx + 1]);
+            idx += 2;
+        }
+
+        if idx >= body.len() {
+            return Err(ControlSignal::Error(
+                "Poorly formed deftest: missing test form".into(),
+            ));
+        }
+
+        let form = body[idx];
+        idx += 1;
+        let vals = &body[idx..];
+
+        let properties_list = self.process.make_list(&properties_flat);
+        let vals_list = self.process.make_list(vals);
+
+        let (
+            add_entry_sym,
+            make_entry_sym,
+            kw_pend_sym,
+            kw_name_sym,
+            kw_props_sym,
+            kw_form_sym,
+            kw_vals_sym,
+        ) = {
+            let mut symbols = self.globals.symbols.write().unwrap();
+            let rt_pkg = symbols
+                .find_package("REGRESSION-TEST")
+                .ok_or_else(|| ControlSignal::Error("DEFTEST: REGRESSION-TEST package missing".into()))?;
+            (
+                symbols.intern_in("ADD-ENTRY", rt_pkg),
+                symbols.intern_in("MAKE-ENTRY", rt_pkg),
+                symbols.intern_keyword("PEND"),
+                symbols.intern_keyword("NAME"),
+                symbols.intern_keyword("PROPS"),
+                symbols.intern_keyword("FORM"),
+                symbols.intern_keyword("VALS"),
+            )
+        };
+
+        let add_entry_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(add_entry_sym.0)));
+        let make_entry_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(make_entry_sym.0)));
+        let kw_pend_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_pend_sym.0)));
+        let kw_name_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_name_sym.0)));
+        let kw_props_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_props_sym.0)));
+        let kw_form_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_form_sym.0)));
+        let kw_vals_node = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_vals_sym.0)));
+
+        let quoted_name = self.make_quote_form(name_form);
+        let quoted_props = self.make_quote_form(properties_list);
+        let quoted_form = self.make_quote_form(form);
+        let quoted_vals = self.make_quote_form(vals_list);
+
+        let make_entry_args = [
+            kw_pend_node,
+            self.process.make_t(self.globals),
+            kw_name_node,
+            quoted_name,
+            kw_props_node,
+            quoted_props,
+            kw_form_node,
+            quoted_form,
+            kw_vals_node,
+            quoted_vals,
+        ];
+        let make_entry_args_list = self.process.make_list(&make_entry_args);
+        let make_entry_call = self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Fork(make_entry_node, make_entry_args_list));
+        let add_entry_args = [make_entry_call];
+        let add_entry_args_list = self.process.make_list(&add_entry_args);
+        Ok(self
+            .process
+            .arena
+            .inner
+            .alloc(Node::Fork(add_entry_node, add_entry_args_list)))
+    }
+
     /// (quote expr) -> expr (unevaluated)
     fn eval_quote(&mut self, args: NodeId) -> EvalResult {
         // args is (expr . nil)
@@ -4073,6 +4811,111 @@ impl<'a> Interpreter<'a> {
         }
 
         Ok(result)
+    }
+
+    /// (let* ((var val) ...) body*) -> sequential local bindings
+    fn eval_let_star(&mut self, args: NodeId, env: &Environment) -> EvalResult {
+        if let Node::Fork(bindings, body) = self.process.arena.get_unchecked(args).clone() {
+            let new_env = Environment::with_parent(env.clone());
+            let mut special_bindings: Vec<(SymbolId, Option<NodeId>)> = Vec::new();
+
+            let mut current = bindings;
+            loop {
+                match self.process.arena.get_unchecked(current).clone() {
+                    Node::Fork(binding, rest) => {
+                        let (var_node, val_expr) =
+                            match self.process.arena.get_unchecked(binding).clone() {
+                                Node::Fork(var_node, val_rest) => {
+                                    let val_expr =
+                                        if let Node::Fork(val_node, _) =
+                                            self.process.arena.get_unchecked(val_rest).clone()
+                                        {
+                                            val_node
+                                        } else {
+                                            self.process.make_nil()
+                                        };
+                                    (var_node, val_expr)
+                                }
+                                Node::Leaf(OpaqueValue::Symbol(_)) => {
+                                    (binding, self.process.make_nil())
+                                }
+                                _ => {
+                                    current = rest;
+                                    continue;
+                                }
+                            };
+
+                        if let Some(sym) = self.node_to_symbol(var_node) {
+                            // LET* evaluates each init in the environment that already has prior bindings.
+                            let val = self.eval(val_expr, &new_env)?;
+                            if self.is_special_symbol(sym) {
+                                let old = self.process.get_value(sym);
+                                special_bindings.push((sym, old));
+                                self.process.set_value(sym, val);
+                                self.maybe_update_current_package(sym, val);
+                            } else {
+                                new_env.bind(sym, val);
+                            }
+                        }
+                        current = rest;
+                    }
+                    _ => break,
+                }
+            }
+
+            let (_decls, body_start) = self.parse_body(body);
+            let result = self.eval_progn(body_start, &new_env);
+
+            for (sym, old) in special_bindings.into_iter().rev() {
+                match old {
+                    Some(val) => {
+                        self.process.set_value(sym, val);
+                        self.maybe_update_current_package(sym, val);
+                    }
+                    None => {
+                        self.process.unbind_value(sym);
+                    }
+                }
+            }
+
+            result
+        } else {
+            Ok(self.process.make_nil())
+        }
+    }
+
+    /// (cond (test form*)*) -> conditional clauses
+    fn eval_cond(&mut self, args: NodeId, env: &Environment) -> EvalResult {
+        let mut current = args;
+        loop {
+            match self.process.arena.get_unchecked(current).clone() {
+                Node::Leaf(OpaqueValue::Nil) => return Ok(self.process.make_nil()),
+                Node::Fork(clause, rest_clauses) => {
+                    current = rest_clauses;
+
+                    let Node::Fork(test, body) = self.process.arena.get_unchecked(clause).clone() else {
+                        continue;
+                    };
+
+                    let test_val = self.eval(test, env)?;
+                    if self.is_nil(test_val) {
+                        continue;
+                    }
+
+                    match self.process.arena.get_unchecked(body).clone() {
+                        Node::Leaf(OpaqueValue::Nil) => {
+                            // Match macro semantics `(let ((temp test)) (if temp temp ...))`,
+                            // which returns only the primary value.
+                            self.process.values_are_set = false;
+                            self.process.values.clear();
+                            return Ok(test_val);
+                        }
+                        _ => return self.eval_progn(body, env),
+                    }
+                }
+                _ => return Err(ControlSignal::Error("COND: malformed clause list".into())),
+            }
+        }
     }
 
     fn eval_multiple_value_bind(&mut self, args: NodeId, env: &Environment) -> EvalResult {
@@ -6264,6 +7107,222 @@ mod tests {
         .unwrap();
         let result = interpreter.eval(expr, &env).unwrap();
         assert_eq!(list_to_ints(&interpreter.process, result), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_expand_signals_error_eval_branch() {
+        let (mut proc, globals) = setup_env();
+
+        let rt_pkg = globals
+            .symbols
+            .write()
+            .unwrap()
+            .make_package("REGRESSION-TEST", Vec::new(), vec![PackageId(1)], None)
+            .expect("failed to create REGRESSION-TEST package");
+        let _cl_test_pkg = globals
+            .symbols
+            .write()
+            .unwrap()
+            .make_package("CL-TEST", Vec::new(), vec![PackageId(1)], None)
+            .expect("failed to create CL-TEST package");
+        let compile_tests_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("*COMPILE-TESTS*", rt_pkg);
+        proc.set_value(compile_tests_sym, proc.make_nil());
+
+        let call = read_from_string(
+            "(signals-error (+ 1 2) type-error)",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let args = match proc.arena.inner.get_unchecked(call) {
+            Node::Fork(_, tail) => *tail,
+            other => panic!("Expected call form, got {:?}", other),
+        };
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let expanded = interpreter
+            .expand_cl_test_signals_error(args, &Environment::new())
+            .expect("signals-error expansion failed");
+        let printed = {
+            let syms = globals.symbols.read().unwrap();
+            crate::printer::print_to_string(&interpreter.process.arena.inner, &syms, expanded)
+        };
+        assert!(printed.contains("HANDLER-BIND"));
+        assert!(printed.contains("EVAL"));
+        assert!(!printed.contains("COMPILE"));
+    }
+
+    #[test]
+    fn test_expand_signals_error_compile_branch() {
+        let (mut proc, globals) = setup_env();
+
+        let rt_pkg = globals
+            .symbols
+            .write()
+            .unwrap()
+            .make_package("REGRESSION-TEST", Vec::new(), vec![PackageId(1)], None)
+            .expect("failed to create REGRESSION-TEST package");
+        let _cl_test_pkg = globals
+            .symbols
+            .write()
+            .unwrap()
+            .make_package("CL-TEST", Vec::new(), vec![PackageId(1)], None)
+            .expect("failed to create CL-TEST package");
+        let compile_tests_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("*COMPILE-TESTS*", rt_pkg);
+        proc.set_value(compile_tests_sym, proc.make_t(&globals));
+
+        let call = read_from_string(
+            "(signals-error (+ 1 2) type-error :safety 0)",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let args = match proc.arena.inner.get_unchecked(call) {
+            Node::Fork(_, tail) => *tail,
+            other => panic!("Expected call form, got {:?}", other),
+        };
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let expanded = interpreter
+            .expand_cl_test_signals_error(args, &Environment::new())
+            .expect("signals-error expansion failed");
+        let printed = {
+            let syms = globals.symbols.read().unwrap();
+            crate::printer::print_to_string(&interpreter.process.arena.inner, &syms, expanded)
+        };
+        assert!(printed.contains("HANDLER-BIND"));
+        assert!(printed.contains("COMPILE"));
+    }
+
+    #[test]
+    fn test_setf_fast_path_symbol_places() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(progn (setq a 1 b 2) (setf a 7 b 8) (list a b))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result), vec![7, 8]);
+    }
+
+    #[test]
+    fn test_setf_fast_path_falls_back_for_places() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(let ((x (cons 1 2))) (setf (car x) 9) (car x))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 9),
+            other => panic!("Expected 9, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_let_star_sequential_bindings() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(let* ((x 1) (y (+ x 2))) y)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 3),
+            other => panic!("Expected 3, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_let_star_special_binding_restore() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(progn (setq *foo* 10) (let* ((*foo* 20) (x *foo*)) (list x *foo*)))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result), vec![20, 20]);
+
+        let expr2 = read_from_string(
+            "(symbol-value '*foo*)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result2 = interpreter.eval(expr2, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result2) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 10),
+            other => panic!("Expected restored *foo* value 10, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_eval_cond_direct_handling() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(cond ((eql 1 2) 9) ((eql 2 2) 11 12) (t 99))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 12),
+            other => panic!("Expected 12, got {:?}", other),
+        }
+
+        let expr2 = read_from_string(
+            "(cond (() 1) ((+ 2 3)) (t 0))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result2 = interpreter.eval(expr2, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result2) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 5),
+            other => panic!("Expected 5, got {:?}", other),
+        }
     }
 
     #[test]
