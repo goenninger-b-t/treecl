@@ -2,8 +2,9 @@
 //
 // Implements stream types for input/output operations.
 
-use std::io::{self, Read, Write, BufRead, BufReader};
 use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 /// Stream identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +23,33 @@ pub enum StreamDirection {
 pub enum StreamElementType {
     Character,
     Byte,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenDirection {
+    Input,
+    Output,
+    Io,
+    Probe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfExists {
+    Error,
+    Supersede,
+    NewVersion,
+    Rename,
+    RenameAndDelete,
+    Append,
+    Overwrite,
+    Nil,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IfDoesNotExist {
+    Error,
+    Create,
+    Nil,
 }
 
 /// Stream types
@@ -46,10 +74,17 @@ pub enum Stream {
     FileOutputStream {
         path: String,
         file: File,
+        element_type: StreamElementType,
     },
     FileInputStream {
         path: String,
         reader: BufReader<File>,
+        element_type: StreamElementType,
+    },
+    FileIoStream {
+        path: String,
+        file: File,
+        element_type: StreamElementType,
     },
     /// Broadcast stream - writes to multiple streams
     BroadcastStream {
@@ -85,6 +120,7 @@ impl Stream {
             Stream::TwoWayStream { .. } | Stream::EchoStream { .. } => {
                 StreamDirection::Bidirectional
             }
+            Stream::FileIoStream { .. } => StreamDirection::Bidirectional,
             Stream::SynonymStream { .. } => StreamDirection::Bidirectional,
         }
     }
@@ -155,11 +191,28 @@ impl StreamManager {
     
     /// Close a stream
     pub fn close(&mut self, id: StreamId) -> bool {
+        self.close_with_abort(id, false)
+    }
+
+    pub fn close_with_abort(&mut self, id: StreamId, abort: bool) -> bool {
         if id.0 <= 2 {
             return false; // Can't close standard streams
         }
         if let Some(slot) = self.streams.get_mut(id.0 as usize) {
             if slot.is_some() {
+                if !abort {
+                    if let Some(stream) = slot.as_mut() {
+                        match stream {
+                            Stream::FileOutputStream { file, .. } => {
+                                let _ = file.flush();
+                            }
+                            Stream::FileIoStream { file, .. } => {
+                                let _ = file.flush();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 *slot = None;
                 self.free_list.push(id.0);
                 self.column_positions.remove(&id.0);
@@ -167,6 +220,231 @@ impl StreamManager {
             }
         }
         false
+    }
+
+    fn path_plus_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut out = path.as_os_str().to_os_string();
+        out.push(suffix);
+        PathBuf::from(out)
+    }
+
+    fn first_available_suffix_path(path: &Path, base_suffix: &str) -> io::Result<PathBuf> {
+        let first = Self::path_plus_suffix(path, base_suffix);
+        if !first.exists() {
+            return Ok(first);
+        }
+        for idx in 1..=1_000_000usize {
+            let candidate = Self::path_plus_suffix(path, &format!("{}.{}", base_suffix, idx));
+            if !candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "Could not find available backup filename for {}",
+                path.display()
+            ),
+        ))
+    }
+
+    fn first_available_version_path(path: &Path) -> io::Result<PathBuf> {
+        for version in 1..=1_000_000usize {
+            let candidate = Self::path_plus_suffix(path, &format!(".~{}~", version));
+            if !candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "Could not create :NEW-VERSION path for {}",
+                path.display()
+            ),
+        ))
+    }
+
+    fn prepare_existing_file(path: &Path, if_exists: IfExists) -> io::Result<Option<PathBuf>> {
+        match if_exists {
+            IfExists::Rename => {
+                let backup = Self::first_available_suffix_path(path, ".bak")?;
+                std::fs::rename(path, &backup)?;
+                Ok(None)
+            }
+            IfExists::RenameAndDelete => {
+                let backup = Self::first_available_suffix_path(path, ".tmp-old")?;
+                std::fs::rename(path, &backup)?;
+                Ok(Some(backup))
+            }
+            IfExists::NewVersion => {
+                let versioned = Self::first_available_version_path(path)?;
+                std::fs::rename(path, &versioned)?;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn open_file(
+        &mut self,
+        path: &str,
+        direction: OpenDirection,
+        if_exists: IfExists,
+        if_does_not_exist: IfDoesNotExist,
+        element_type: StreamElementType,
+    ) -> io::Result<Option<StreamId>> {
+        use std::io::ErrorKind;
+        let path_ref = Path::new(path);
+        let exists = path_ref.exists();
+
+        match direction {
+            OpenDirection::Input | OpenDirection::Probe => {
+                if !exists {
+                    match if_does_not_exist {
+                        IfDoesNotExist::Nil => return Ok(None),
+                        IfDoesNotExist::Error => {
+                            return Err(io::Error::new(
+                                ErrorKind::NotFound,
+                                format!("No such file: {}", path),
+                            ))
+                        }
+                        IfDoesNotExist::Create => {
+                            let _ = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(false)
+                                .open(path)?;
+                        }
+                    }
+                }
+                let file = std::fs::OpenOptions::new().read(true).open(path)?;
+                let id = self.alloc(Stream::FileInputStream {
+                    path: path.to_string(),
+                    reader: BufReader::new(file),
+                    element_type,
+                });
+                Ok(Some(id))
+            }
+            OpenDirection::Output => {
+                if exists {
+                    match if_exists {
+                        IfExists::Nil => return Ok(None),
+                        IfExists::Error => {
+                            return Err(io::Error::new(
+                                ErrorKind::AlreadyExists,
+                                format!("File exists: {}", path),
+                            ))
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match if_does_not_exist {
+                        IfDoesNotExist::Nil => return Ok(None),
+                        IfDoesNotExist::Error => {
+                            return Err(io::Error::new(
+                                ErrorKind::NotFound,
+                                format!("No such file: {}", path),
+                            ))
+                        }
+                        IfDoesNotExist::Create => {}
+                    }
+                }
+
+                let cleanup_backup = if exists {
+                    Self::prepare_existing_file(path_ref, if_exists)?
+                } else {
+                    None
+                };
+
+                let mut opts = std::fs::OpenOptions::new();
+                match if_exists {
+                    IfExists::Append => {
+                        opts.append(true).create(true);
+                    }
+                    IfExists::Overwrite => {
+                        opts.write(true).create(matches!(if_does_not_exist, IfDoesNotExist::Create));
+                    }
+                    IfExists::Error | IfExists::Nil => {
+                        opts.write(true).create(matches!(if_does_not_exist, IfDoesNotExist::Create));
+                    }
+                    _ => {
+                        opts.write(true).create(true).truncate(true);
+                    }
+                }
+                if !exists && matches!(if_does_not_exist, IfDoesNotExist::Create) {
+                    opts.create(true);
+                }
+                let file = opts.open(path)?;
+                if let Some(old_path) = cleanup_backup {
+                    let _ = std::fs::remove_file(old_path);
+                }
+                let id = self.alloc(Stream::FileOutputStream {
+                    path: path.to_string(),
+                    file,
+                    element_type,
+                });
+                Ok(Some(id))
+            }
+            OpenDirection::Io => {
+                if exists {
+                    match if_exists {
+                        IfExists::Nil => return Ok(None),
+                        IfExists::Error => {
+                            return Err(io::Error::new(
+                                ErrorKind::AlreadyExists,
+                                format!("File exists: {}", path),
+                            ))
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match if_does_not_exist {
+                        IfDoesNotExist::Nil => return Ok(None),
+                        IfDoesNotExist::Error => {
+                            return Err(io::Error::new(
+                                ErrorKind::NotFound,
+                                format!("No such file: {}", path),
+                            ))
+                        }
+                        IfDoesNotExist::Create => {}
+                    }
+                }
+
+                let cleanup_backup = if exists {
+                    Self::prepare_existing_file(path_ref, if_exists)?
+                } else {
+                    None
+                };
+
+                let mut opts = std::fs::OpenOptions::new();
+                opts.read(true).write(true);
+                if !exists && matches!(if_does_not_exist, IfDoesNotExist::Create) {
+                    opts.create(true);
+                }
+                match if_exists {
+                    IfExists::Append => {
+                        opts.append(true);
+                    }
+                    IfExists::Supersede
+                    | IfExists::NewVersion
+                    | IfExists::Rename
+                    | IfExists::RenameAndDelete => {
+                        opts.truncate(true).create(true);
+                    }
+                    _ => {}
+                }
+                let file = opts.open(path)?;
+                if let Some(old_path) = cleanup_backup {
+                    let _ = std::fs::remove_file(old_path);
+                }
+                let id = self.alloc(Stream::FileIoStream {
+                    path: path.to_string(),
+                    file,
+                    element_type,
+                });
+                Ok(Some(id))
+            }
+        }
     }
     
     /// Write a string to a stream
@@ -196,7 +474,23 @@ impl StreamManager {
                 buffer.push_str(s);
                 Ok(())
             }
-            Some(Stream::FileOutputStream { file, .. }) => {
+            Some(Stream::FileOutputStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character output stream",
+                    ));
+                }
+                file.write_all(s.as_bytes())?;
+                Ok(())
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character output stream",
+                    ));
+                }
                 file.write_all(s.as_bytes())?;
                 Ok(())
             }
@@ -266,9 +560,29 @@ impl StreamManager {
                     Ok(None)
                 }
             }
-            Some(Stream::FileInputStream { reader, .. }) => {
+            Some(Stream::FileInputStream { reader, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
                 let mut buf = [0u8; 1];
                 match reader.read(&mut buf) {
+                    Ok(0) => Ok(None),
+                    Ok(_) => Ok(Some(buf[0] as char)),
+                    Err(e) => Err(e),
+                }
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let mut buf = [0u8; 1];
+                match file.read(&mut buf) {
                     Ok(0) => Ok(None),
                     Ok(_) => Ok(Some(buf[0] as char)),
                     Err(e) => Err(e),
@@ -318,12 +632,45 @@ impl StreamManager {
                     Ok(Some(line))
                 }
             }
-            Some(Stream::FileInputStream { reader, .. }) => {
+            Some(Stream::FileInputStream { reader, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => Ok(None),
                     Ok(_) => Ok(Some(line)),
                     Err(e) => Err(e),
+                }
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let mut out = String::new();
+                let mut b = [0u8; 1];
+                loop {
+                    match file.read(&mut b) {
+                        Ok(0) => {
+                            if out.is_empty() {
+                                return Ok(None);
+                            }
+                            return Ok(Some(out));
+                        }
+                        Ok(_) => {
+                            out.push(b[0] as char);
+                            if b[0] == b'\n' {
+                                return Ok(Some(out));
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Not an input stream")),
@@ -341,13 +688,36 @@ impl StreamManager {
                     Ok(None)
                 }
             }
-            Some(Stream::FileInputStream { reader, .. }) => {
+            Some(Stream::FileInputStream { reader, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
                 let buf = reader.fill_buf()?;
                 if buf.is_empty() {
                     Ok(None)
                 } else {
                     Ok(Some(buf[0] as char))
                 }
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let pos = file.stream_position()?;
+                let mut b = [0u8; 1];
+                let result = match file.read(&mut b) {
+                    Ok(0) => None,
+                    Ok(_) => Some(b[0] as char),
+                    Err(e) => return Err(e),
+                };
+                file.seek(SeekFrom::Start(pos))?;
+                Ok(result)
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Cannot peek on this stream")),
         }
@@ -359,6 +729,19 @@ impl StreamManager {
             Some(Stream::StringInputStream { position, .. }) => {
                 if *position > 0 {
                     *position -= 1;
+                }
+                Ok(())
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let pos = file.stream_position()?;
+                if pos > 0 {
+                    file.seek(SeekFrom::Start(pos - 1))?;
                 }
                 Ok(())
             }
@@ -388,7 +771,114 @@ impl StreamManager {
                 let buf = reader.fill_buf()?;
                 Ok(buf.is_empty())
             }
+            Some(Stream::FileIoStream { file, .. }) => {
+                let pos = file.stream_position()?;
+                let len = file.metadata()?.len();
+                Ok(pos >= len)
+            }
             _ => Ok(false),
+        }
+    }
+
+    /// Snapshot remaining textual input without changing stream position.
+    /// Used by the Lisp reader pipeline for stream-backed READ forms.
+    pub fn read_remaining_text(&mut self, id: StreamId) -> io::Result<String> {
+        if let Some(input) = match self.get(id) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            Some(Stream::EchoStream { input, .. }) => Some(*input),
+            _ => None,
+        } {
+            return self.read_remaining_text(input);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::StringInputStream { buffer, position }) => {
+                Ok(buffer.chars().skip(*position).collect())
+            }
+            Some(Stream::FileInputStream { reader, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let pos = reader.stream_position()?;
+                let mut out = String::new();
+                reader.read_to_string(&mut out)?;
+                reader.seek(SeekFrom::Start(pos))?;
+                Ok(out)
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let pos = file.stream_position()?;
+                let mut out = String::new();
+                file.read_to_string(&mut out)?;
+                file.seek(SeekFrom::Start(pos))?;
+                Ok(out)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Stream does not support textual reading",
+            )),
+        }
+    }
+
+    /// Advance textual input cursor by a number of characters.
+    /// For file streams this currently assumes single-byte text encoding.
+    pub fn advance_text_chars(&mut self, id: StreamId, count: usize) -> io::Result<()> {
+        if let Some(input) = match self.get(id) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            Some(Stream::EchoStream { input, .. }) => Some(*input),
+            _ => None,
+        } {
+            return self.advance_text_chars(input, count);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::StringInputStream { buffer, position }) => {
+                let len = buffer.chars().count();
+                *position = position.saturating_add(count).min(len);
+                Ok(())
+            }
+            Some(Stream::FileInputStream { reader, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let mut buf = [0u8; 1];
+                for _ in 0..count {
+                    if reader.read(&mut buf)? == 0 {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Character {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a character input stream",
+                    ));
+                }
+                let mut buf = [0u8; 1];
+                for _ in 0..count {
+                    if file.read(&mut buf)? == 0 {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Stream does not support textual reading",
+            )),
         }
     }
     
@@ -398,7 +888,220 @@ impl StreamManager {
             Some(Stream::Stdout) => io::stdout().flush(),
             Some(Stream::Stderr) => io::stderr().flush(),
             Some(Stream::FileOutputStream { file, .. }) => file.flush(),
+            Some(Stream::FileIoStream { file, .. }) => file.flush(),
             _ => Ok(()),
+        }
+    }
+
+    pub fn force_output(&mut self, id: StreamId) -> io::Result<()> {
+        self.finish_output(id)
+    }
+
+    pub fn clear_output(&mut self, id: StreamId) -> io::Result<()> {
+        match self.get_mut(id) {
+            Some(Stream::StringOutputStream { buffer }) => {
+                buffer.clear();
+                Ok(())
+            }
+            Some(Stream::Stdout)
+            | Some(Stream::Stderr)
+            | Some(Stream::FileOutputStream { .. })
+            | Some(Stream::FileIoStream { .. })
+            | Some(Stream::BroadcastStream { .. })
+            | Some(Stream::TwoWayStream { .. })
+            | Some(Stream::EchoStream { .. }) => Ok(()),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Not an output stream")),
+        }
+    }
+
+    pub fn read_byte(&mut self, id: StreamId) -> io::Result<Option<u8>> {
+        if let Some((input, output)) = match self.get(id) {
+            Some(Stream::EchoStream { input, output }) => Some((*input, *output)),
+            _ => None,
+        } {
+            let b = self.read_byte(input)?;
+            if let Some(v) = b {
+                self.write_byte(output, v)?;
+            }
+            return Ok(b);
+        }
+        if let Some(input) = match self.get(id) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            _ => None,
+        } {
+            return self.read_byte(input);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::Stdin) => {
+                let mut b = [0u8; 1];
+                match io::stdin().lock().read(&mut b) {
+                    Ok(0) => Ok(None),
+                    Ok(_) => Ok(Some(b[0])),
+                    Err(e) => Err(e),
+                }
+            }
+            Some(Stream::FileInputStream { reader, element_type, .. }) => {
+                if *element_type != StreamElementType::Byte {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a byte input stream",
+                    ));
+                }
+                let mut b = [0u8; 1];
+                match reader.read(&mut b) {
+                    Ok(0) => Ok(None),
+                    Ok(_) => Ok(Some(b[0])),
+                    Err(e) => Err(e),
+                }
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Byte {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a byte input stream",
+                    ));
+                }
+                let mut b = [0u8; 1];
+                match file.read(&mut b) {
+                    Ok(0) => Ok(None),
+                    Ok(_) => Ok(Some(b[0])),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Not a byte input stream")),
+        }
+    }
+
+    pub fn write_byte(&mut self, id: StreamId, byte: u8) -> io::Result<()> {
+        if let Some(targets) = match self.get(id) {
+            Some(Stream::BroadcastStream { targets }) => Some(targets.clone()),
+            _ => None,
+        } {
+            for target in targets {
+                self.write_byte(target, byte)?;
+            }
+            return Ok(());
+        }
+        if let Some(output) = match self.get(id) {
+            Some(Stream::TwoWayStream { output, .. }) => Some(*output),
+            Some(Stream::EchoStream { output, .. }) => Some(*output),
+            _ => None,
+        } {
+            return self.write_byte(output, byte);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::Stdout) => {
+                io::stdout().write_all(&[byte])?;
+                io::stdout().flush()
+            }
+            Some(Stream::Stderr) => {
+                io::stderr().write_all(&[byte])?;
+                io::stderr().flush()
+            }
+            Some(Stream::StringOutputStream { buffer }) => {
+                buffer.push(byte as char);
+                Ok(())
+            }
+            Some(Stream::FileOutputStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Byte {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a byte output stream",
+                    ));
+                }
+                file.write_all(&[byte])
+            }
+            Some(Stream::FileIoStream { file, element_type, .. }) => {
+                if *element_type != StreamElementType::Byte {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Not a byte output stream",
+                    ));
+                }
+                file.write_all(&[byte])
+            }
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Not a byte output stream")),
+        }
+    }
+
+    pub fn file_position(&mut self, id: StreamId) -> io::Result<Option<u64>> {
+        if let Some(input) = match self.get(id) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            Some(Stream::EchoStream { input, .. }) => Some(*input),
+            _ => None,
+        } {
+            return self.file_position(input);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::StringInputStream { position, .. }) => Ok(Some(*position as u64)),
+            Some(Stream::StringOutputStream { buffer }) => Ok(Some(buffer.chars().count() as u64)),
+            Some(Stream::FileInputStream { reader, .. }) => Ok(Some(reader.stream_position()?)),
+            Some(Stream::FileOutputStream { file, .. }) => Ok(Some(file.stream_position()?)),
+            Some(Stream::FileIoStream { file, .. }) => Ok(Some(file.stream_position()?)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn set_file_position(&mut self, id: StreamId, pos: u64) -> io::Result<bool> {
+        if let Some(input) = match self.get(id) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            Some(Stream::EchoStream { input, .. }) => Some(*input),
+            _ => None,
+        } {
+            return self.set_file_position(input, pos);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::StringInputStream { buffer, position }) => {
+                let len = buffer.chars().count() as u64;
+                if pos > len {
+                    return Ok(false);
+                }
+                *position = pos as usize;
+                Ok(true)
+            }
+            Some(Stream::StringOutputStream { buffer }) => {
+                let len = buffer.chars().count() as u64;
+                if pos > len {
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            Some(Stream::FileInputStream { reader, .. }) => {
+                reader.seek(SeekFrom::Start(pos))?;
+                Ok(true)
+            }
+            Some(Stream::FileOutputStream { file, .. }) => {
+                file.seek(SeekFrom::Start(pos))?;
+                Ok(true)
+            }
+            Some(Stream::FileIoStream { file, .. }) => {
+                file.seek(SeekFrom::Start(pos))?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub fn file_length(&mut self, id: StreamId) -> io::Result<Option<u64>> {
+        if let Some(input) = match self.get(id) {
+            Some(Stream::TwoWayStream { input, .. }) => Some(*input),
+            Some(Stream::EchoStream { input, .. }) => Some(*input),
+            _ => None,
+        } {
+            return self.file_length(input);
+        }
+
+        match self.get_mut(id) {
+            Some(Stream::StringInputStream { buffer, .. }) => Ok(Some(buffer.chars().count() as u64)),
+            Some(Stream::StringOutputStream { buffer }) => Ok(Some(buffer.chars().count() as u64)),
+            Some(Stream::FileInputStream { reader, .. }) => Ok(Some(reader.get_ref().metadata()?.len())),
+            Some(Stream::FileOutputStream { file, .. }) => Ok(Some(file.metadata()?.len())),
+            Some(Stream::FileIoStream { file, .. }) => Ok(Some(file.metadata()?.len())),
+            _ => Ok(None),
         }
     }
 }

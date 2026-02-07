@@ -503,8 +503,10 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("READ-FROM-STRING", cl, prim_read_from_string);
     globals.register_primitive("READ-DELIMITED-LIST", cl, prim_read_delimited_list);
     globals.register_primitive("READ-CHAR", cl, prim_read_char);
+    globals.register_primitive("PEEK-CHAR", cl, prim_peek_char);
     globals.register_primitive("UNREAD-CHAR", cl, prim_unread_char);
     globals.register_primitive("READ-LINE", cl, prim_read_line);
+    globals.register_primitive("READ-BYTE", cl, prim_read_byte);
 
     // Strings & Characters
     globals.register_primitive("STRING", cl, prim_string);
@@ -841,10 +843,26 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     );
     globals.register_primitive("MAKE-TWO-WAY-STREAM", cl, prim_make_two_way_stream);
     globals.register_primitive("MAKE-BROADCAST-STREAM", cl, prim_make_broadcast_stream);
+    globals.register_primitive("OPEN", cl, prim_open);
     globals.register_primitive("CLOSE", cl, prim_close);
+    globals.register_primitive("STREAMP", cl, prim_streamp);
+    globals.register_primitive("OPEN-STREAM-P", cl, prim_open_stream_p);
+    globals.register_primitive("INPUT-STREAM-P", cl, prim_input_stream_p);
+    globals.register_primitive("OUTPUT-STREAM-P", cl, prim_output_stream_p);
+    globals.register_primitive("FILE-STREAM-P", cl, prim_file_stream_p);
+    globals.register_primitive("TWO-WAY-STREAM-P", cl, prim_two_way_stream_p);
+    globals.register_primitive("BROADCAST-STREAM-P", cl, prim_broadcast_stream_p);
+    globals.register_primitive("SYNONYM-STREAM-P", cl, prim_synonym_stream_p);
+    globals.register_primitive("ECHO-STREAM-P", cl, prim_echo_stream_p);
     globals.register_primitive("WRITE-STRING", cl, prim_write_string);
     globals.register_primitive("WRITE-CHAR", cl, prim_write_char);
+    globals.register_primitive("WRITE-BYTE", cl, prim_write_byte);
     globals.register_primitive("FRESH-LINE", cl, prim_fresh_line);
+    globals.register_primitive("FINISH-OUTPUT", cl, prim_finish_output);
+    globals.register_primitive("FORCE-OUTPUT", cl, prim_force_output);
+    globals.register_primitive("CLEAR-OUTPUT", cl, prim_clear_output);
+    globals.register_primitive("FILE-POSITION", cl, prim_file_position);
+    globals.register_primitive("FILE-LENGTH", cl, prim_file_length);
     globals.register_primitive("SYS-TIME-EVAL", cl, prim_sys_time_eval);
 
     // Concurrency
@@ -7589,6 +7607,81 @@ fn resolve_input_stream_id(
     ))
 }
 
+fn node_to_stream_id(proc: &crate::process::Process, node: NodeId) -> Option<crate::streams::StreamId> {
+    if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(node) {
+        Some(crate::streams::StreamId(*id))
+    } else {
+        None
+    }
+}
+
+fn resolve_output_stream(
+    proc: &crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    arg: Option<NodeId>,
+) -> Result<crate::streams::StreamId, ControlSignal> {
+    let stream_id = match arg {
+        None => get_current_output_stream(proc, ctx),
+        Some(node) => match proc.arena.inner.get_unchecked(node) {
+            Node::Leaf(OpaqueValue::Nil) => get_current_output_stream(proc, ctx),
+            Node::Leaf(OpaqueValue::Symbol(id))
+                if crate::symbol::SymbolId(*id) == ctx.t_sym =>
+            {
+                get_terminal_io_stream(proc, ctx)
+                    .ok_or_else(|| ControlSignal::Error("TERMINAL-IO not bound".into()))?
+            }
+            Node::Leaf(OpaqueValue::StreamHandle(id)) => crate::streams::StreamId(*id),
+            _ => {
+                return Err(ControlSignal::Error(
+                    "Invalid output stream designator".into(),
+                ))
+            }
+        },
+    };
+    Ok(stream_id)
+}
+
+fn resolve_output_stream_id(
+    proc: &crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    stream_id: crate::streams::StreamId,
+) -> Result<crate::streams::StreamId, ControlSignal> {
+    use crate::streams::Stream;
+
+    let mut current = stream_id;
+    for _ in 0..8 {
+        let next = match proc.streams.get(current) {
+            Some(Stream::TwoWayStream { output, .. }) => Some(*output),
+            Some(Stream::EchoStream { output, .. }) => Some(*output),
+            Some(Stream::SynonymStream { symbol_id }) => {
+                let sym = crate::symbol::SymbolId(*symbol_id);
+                if let Some(val) = proc.get_value(sym) {
+                    if let Node::Leaf(OpaqueValue::StreamHandle(id)) =
+                        proc.arena.inner.get_unchecked(val)
+                    {
+                        Some(crate::streams::StreamId(*id))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(next_id) = next {
+            current = next_id;
+        } else {
+            return Ok(current);
+        }
+    }
+
+    Err(ControlSignal::Error(
+        "Too many nested synonym/two-way streams".into(),
+    ))
+}
+
 fn prim_print(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
@@ -8211,25 +8304,14 @@ fn prim_read(
     let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
 
     let preserve_whitespace = false;
-    let (buffer, start_pos) = match proc.streams.get(stream_id) {
-        Some(crate::streams::Stream::StringInputStream { buffer, position }) => {
-            (buffer.clone(), *position)
-        }
-        _ => {
-            return Err(ControlSignal::Error(
-                "READ currently supports only string input streams".into(),
-            ))
-        }
-    };
-    let remaining: String = buffer.chars().skip(start_pos).collect();
-    let result = read_one_from_str(proc, ctx, &remaining, preserve_whitespace)?;
-    let (value_opt, consumed) = (result.0, (start_pos, result.1));
-
-    if let Some(crate::streams::Stream::StringInputStream { position, .. }) =
-        proc.streams.get_mut(stream_id)
-    {
-        *position = consumed.0 + consumed.1;
-    }
+    let remaining = proc
+        .streams
+        .read_remaining_text(stream_id)
+        .map_err(|e| ControlSignal::Error(format!("READ: {}", e)))?;
+    let (value_opt, consumed) = read_one_from_str(proc, ctx, &remaining, preserve_whitespace)?;
+    proc.streams
+        .advance_text_chars(stream_id, consumed)
+        .map_err(|e| ControlSignal::Error(format!("READ: {}", e)))?;
 
     match value_opt {
         Some(val) => Ok(val),
@@ -8262,25 +8344,14 @@ fn prim_read_preserving_whitespace(
     let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
 
     let preserve_whitespace = true;
-    let (buffer, start_pos) = match proc.streams.get(stream_id) {
-        Some(crate::streams::Stream::StringInputStream { buffer, position }) => {
-            (buffer.clone(), *position)
-        }
-        _ => {
-            return Err(ControlSignal::Error(
-                "READ-PRESERVING-WHITESPACE currently supports only string input streams".into(),
-            ))
-        }
-    };
-    let remaining: String = buffer.chars().skip(start_pos).collect();
-    let result = read_one_from_str(proc, ctx, &remaining, preserve_whitespace)?;
-    let (value_opt, consumed) = (result.0, (start_pos, result.1));
-
-    if let Some(crate::streams::Stream::StringInputStream { position, .. }) =
-        proc.streams.get_mut(stream_id)
-    {
-        *position = consumed.0 + consumed.1;
-    }
+    let remaining = proc
+        .streams
+        .read_remaining_text(stream_id)
+        .map_err(|e| ControlSignal::Error(format!("READ-PRESERVING-WHITESPACE: {}", e)))?;
+    let (value_opt, consumed) = read_one_from_str(proc, ctx, &remaining, preserve_whitespace)?;
+    proc.streams
+        .advance_text_chars(stream_id, consumed)
+        .map_err(|e| ControlSignal::Error(format!("READ-PRESERVING-WHITESPACE: {}", e)))?;
 
     match value_opt {
         Some(val) => Ok(val),
@@ -8470,17 +8541,10 @@ fn prim_read_delimited_list(
     let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
 
     let preserve_whitespace = false;
-    let (buffer, start_pos) = match proc.streams.get(stream_id) {
-        Some(crate::streams::Stream::StringInputStream { buffer, position }) => {
-            (buffer.clone(), *position)
-        }
-        _ => {
-            return Err(ControlSignal::Error(
-                "READ-DELIMITED-LIST currently supports only string input streams".into(),
-            ))
-        }
-    };
-    let remaining: String = buffer.chars().skip(start_pos).collect();
+    let remaining = proc
+        .streams
+        .read_remaining_text(stream_id)
+        .map_err(|e| ControlSignal::Error(format!("READ-DELIMITED-LIST: {}", e)))?;
     let options = build_reader_options(proc, ctx, preserve_whitespace);
     let rt_id = current_readtable_id(proc, ctx);
     let readtable = proc
@@ -8509,13 +8573,10 @@ fn prim_read_delimited_list(
     let result = result.map_err(|e| {
         ControlSignal::Error(format!("READ-DELIMITED-LIST: read error: {}", e))
     })?;
-    let (value_opt, consumed) = (result.0, (start_pos, result.1));
-
-    if let Some(crate::streams::Stream::StringInputStream { position, .. }) =
-        proc.streams.get_mut(stream_id)
-    {
-        *position = consumed.0 + consumed.1;
-    }
+    let (value_opt, consumed) = result;
+    proc.streams
+        .advance_text_chars(stream_id, consumed)
+        .map_err(|e| ControlSignal::Error(format!("READ-DELIMITED-LIST: {}", e)))?;
 
     Ok(value_opt.unwrap_or_else(|| proc.make_nil()))
 }
@@ -8548,6 +8609,81 @@ fn prim_read_char(
             }
         }
         Err(e) => Err(ControlSignal::Error(format!("READ-CHAR: {}", e))),
+    }
+}
+
+fn prim_peek_char(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 5 {
+        return err_helper("PEEK-CHAR accepts at most 5 arguments");
+    }
+
+    // Only NIL/T peek-type is currently supported.
+    if let Some(&peek_type) = args.get(0) {
+        if !matches!(proc.arena.inner.get_unchecked(peek_type), Node::Leaf(OpaqueValue::Nil)) {
+            if let Some(sym) = node_to_symbol(proc, peek_type) {
+                if sym != ctx.t_sym {
+                    return err_helper("PEEK-CHAR: non-NIL/T peek-type is not supported yet");
+                }
+            } else {
+                return err_helper("PEEK-CHAR: invalid peek-type");
+            }
+        }
+    }
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(1).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let eof_error_p = args
+        .get(2)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(3).copied().unwrap_or_else(|| proc.make_nil());
+
+    match proc.streams.peek_char(stream_id) {
+        Ok(Some(c)) => Ok(proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(c)))),
+        Ok(None) => {
+            if eof_error_p {
+                Err(ControlSignal::Error("PEEK-CHAR: end of file".into()))
+            } else {
+                Ok(eof_value)
+            }
+        }
+        Err(e) => Err(ControlSignal::Error(format!("PEEK-CHAR: {}", e))),
+    }
+}
+
+fn prim_read_byte(
+    proc: &mut Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() > 4 {
+        return err_helper("READ-BYTE accepts at most 4 arguments");
+    }
+
+    let stream_id = resolve_input_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_input_stream_id(proc, ctx, stream_id)?;
+
+    let eof_error_p = args
+        .get(1)
+        .map(|v| !matches!(proc.arena.inner.get_unchecked(*v), Node::Leaf(OpaqueValue::Nil)))
+        .unwrap_or(true);
+    let eof_value = args.get(2).copied().unwrap_or_else(|| proc.make_nil());
+
+    match proc.streams.read_byte(stream_id) {
+        Ok(Some(b)) => Ok(proc.make_integer(b as i64)),
+        Ok(None) => {
+            if eof_error_p {
+                Err(ControlSignal::Error("READ-BYTE: end of file".into()))
+            } else {
+                Ok(eof_value)
+            }
+        }
+        Err(e) => Err(ControlSignal::Error(format!("READ-BYTE: {}", e))),
     }
 }
 
@@ -8625,6 +8761,418 @@ fn prim_read_line(
 // Stream Primitives
 // ============================================================================
 
+fn open_value_to_keyword_name(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+    label: &str,
+) -> Result<Option<String>, ControlSignal> {
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Nil) => Ok(None),
+        Node::Leaf(OpaqueValue::Symbol(id)) => Ok(Some(
+            ctx.symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase(),
+        )),
+        _ => Err(ControlSignal::Error(format!(
+            "OPEN: {} must be a symbol or NIL",
+            label
+        ))),
+    }
+}
+
+fn parse_open_element_type(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+) -> Result<crate::streams::StreamElementType, ControlSignal> {
+    let symbol_name = |id: u32| {
+        ctx.symbols
+            .read()
+            .unwrap()
+            .symbol_name(SymbolId(id))
+            .unwrap_or("")
+            .to_uppercase()
+    };
+
+    match proc.arena.inner.get_unchecked(node) {
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            let name = symbol_name(*id);
+            match name.as_str() {
+                "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "T" => {
+                    Ok(crate::streams::StreamElementType::Character)
+                }
+                "BYTE" | "OCTET" => Ok(crate::streams::StreamElementType::Byte),
+                _ => Err(ControlSignal::Error(
+                    "OPEN: unsupported :ELEMENT-TYPE".to_string(),
+                )),
+            }
+        }
+        Node::Fork(car, cdr) => {
+            let head = match proc.arena.inner.get_unchecked(*car) {
+                Node::Leaf(OpaqueValue::Symbol(id)) => symbol_name(*id),
+                _ => {
+                    return Err(ControlSignal::Error(
+                        "OPEN: invalid :ELEMENT-TYPE".to_string(),
+                    ))
+                }
+            };
+            let args = list_to_vec_opt(proc, *cdr).ok_or_else(|| {
+                ControlSignal::Error("OPEN: invalid :ELEMENT-TYPE".to_string())
+            })?;
+            match head.as_str() {
+                "UNSIGNED-BYTE" | "SIGNED-BYTE" => {
+                    if let Some(first) = args.first() {
+                        if let Node::Leaf(OpaqueValue::Integer(bits)) =
+                            proc.arena.inner.get_unchecked(*first)
+                        {
+                            if *bits == 8 {
+                                return Ok(crate::streams::StreamElementType::Byte);
+                            }
+                        }
+                    }
+                    Err(ControlSignal::Error(
+                        "OPEN: only (UNSIGNED-BYTE 8) and (SIGNED-BYTE 8) are supported for :ELEMENT-TYPE".to_string(),
+                    ))
+                }
+                _ => Err(ControlSignal::Error(
+                    "OPEN: unsupported :ELEMENT-TYPE".to_string(),
+                )),
+            }
+        }
+        _ => Err(ControlSignal::Error(
+            "OPEN: invalid :ELEMENT-TYPE".to_string(),
+        )),
+    }
+}
+
+/// (open filespec &key direction if-exists if-does-not-exist element-type external-format) -> stream-or-nil
+fn prim_open(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("OPEN requires at least 1 argument");
+    }
+    if args.len() > 1 && args.len() % 2 == 0 {
+        return err_helper("OPEN: odd number of keyword arguments");
+    }
+
+    let mut path = path_from_designator(proc, ctx, args[0], "OPEN")?;
+    path = translate_logical_path_minimal(proc, &path)?;
+
+    let mut direction_name: Option<String> = None;
+    let mut if_exists_name: Option<Option<String>> = None;
+    let mut if_dne_name: Option<Option<String>> = None;
+    let mut element_type = crate::streams::StreamElementType::Character;
+    let mut allow_other_keys = false;
+
+    for pair in args[1..].chunks(2) {
+        let key = node_to_symbol(proc, pair[0])
+            .ok_or_else(|| ControlSignal::Error("OPEN: keyword must be a symbol".to_string()))?;
+        let key_name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(key)
+            .unwrap_or("")
+            .to_uppercase();
+        if key_name == "ALLOW-OTHER-KEYS" && !node_is_nil(proc, pair[1]) {
+            allow_other_keys = true;
+        }
+    }
+
+    for pair in args[1..].chunks(2) {
+        let key = node_to_symbol(proc, pair[0])
+            .ok_or_else(|| ControlSignal::Error("OPEN: keyword must be a symbol".to_string()))?;
+        let key_name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(key)
+            .unwrap_or("")
+            .to_uppercase();
+        match key_name.as_str() {
+            "DIRECTION" => {
+                direction_name = open_value_to_keyword_name(proc, ctx, pair[1], ":DIRECTION")?;
+            }
+            "IF-EXISTS" => {
+                if_exists_name = Some(open_value_to_keyword_name(proc, ctx, pair[1], ":IF-EXISTS")?);
+            }
+            "IF-DOES-NOT-EXIST" => {
+                if_dne_name =
+                    Some(open_value_to_keyword_name(proc, ctx, pair[1], ":IF-DOES-NOT-EXIST")?);
+            }
+            "ELEMENT-TYPE" => {
+                element_type = parse_open_element_type(proc, ctx, pair[1])?;
+            }
+            "EXTERNAL-FORMAT" => {
+                // Accepted for compatibility; stream backend currently treats
+                // textual streams as UTF-8/byte-oriented and ignores this value.
+            }
+            "ALLOW-OTHER-KEYS" => {}
+            _ if allow_other_keys => {}
+            _ => return err_helper("OPEN: unsupported keyword argument"),
+        }
+    }
+
+    // Character streams are the default for text directions when no explicit
+    // byte element type is requested.
+    if matches!(direction_name.as_deref(), Some("INPUT" | "OUTPUT" | "IO" | "PROBE"))
+        && element_type == crate::streams::StreamElementType::Character
+    {
+        // no-op; explicit branch keeps intent clear.
+    } else if matches!(direction_name.as_deref(), Some("INPUT" | "OUTPUT" | "IO" | "PROBE"))
+        && element_type == crate::streams::StreamElementType::Byte
+    {
+        // byte streams are supported.
+    } else if direction_name.is_none() {
+        // defaults handled below.
+    } else {
+        return err_helper("OPEN: invalid :DIRECTION");
+    }
+
+    let direction = match direction_name.as_deref().unwrap_or("INPUT") {
+        "INPUT" => crate::streams::OpenDirection::Input,
+        "OUTPUT" => crate::streams::OpenDirection::Output,
+        "IO" => crate::streams::OpenDirection::Io,
+        "PROBE" => crate::streams::OpenDirection::Probe,
+        _ => return err_helper("OPEN: invalid :DIRECTION"),
+    };
+
+    let if_exists = match if_exists_name {
+        Some(Some(name)) => match name.as_str() {
+            "ERROR" => crate::streams::IfExists::Error,
+            "SUPERSEDE" => crate::streams::IfExists::Supersede,
+            "NEW-VERSION" => crate::streams::IfExists::NewVersion,
+            "RENAME" => crate::streams::IfExists::Rename,
+            "RENAME-AND-DELETE" => crate::streams::IfExists::RenameAndDelete,
+            "APPEND" => crate::streams::IfExists::Append,
+            "OVERWRITE" => crate::streams::IfExists::Overwrite,
+            "NIL" => crate::streams::IfExists::Nil,
+            _ => return err_helper("OPEN: invalid :IF-EXISTS"),
+        },
+        Some(None) => crate::streams::IfExists::Nil,
+        None => match direction {
+            crate::streams::OpenDirection::Output | crate::streams::OpenDirection::Io => {
+                crate::streams::IfExists::Supersede
+            }
+            _ => crate::streams::IfExists::Error,
+        },
+    };
+
+    let if_does_not_exist = match if_dne_name {
+        Some(Some(name)) => match name.as_str() {
+            "ERROR" => crate::streams::IfDoesNotExist::Error,
+            "CREATE" => crate::streams::IfDoesNotExist::Create,
+            "NIL" => crate::streams::IfDoesNotExist::Nil,
+            _ => return err_helper("OPEN: invalid :IF-DOES-NOT-EXIST"),
+        },
+        Some(None) => crate::streams::IfDoesNotExist::Nil,
+        None => match direction {
+            crate::streams::OpenDirection::Output | crate::streams::OpenDirection::Io => {
+                crate::streams::IfDoesNotExist::Create
+            }
+            crate::streams::OpenDirection::Probe => crate::streams::IfDoesNotExist::Nil,
+            crate::streams::OpenDirection::Input => crate::streams::IfDoesNotExist::Error,
+        },
+    };
+
+    let opened = proc
+        .streams
+        .open_file(
+            &path,
+            direction,
+            if_exists,
+            if_does_not_exist,
+            element_type,
+        )
+        .map_err(|e| ControlSignal::Error(format!("OPEN: {}", e)))?;
+    if let Some(id) = opened {
+        Ok(proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::StreamHandle(id.0))))
+    } else {
+        Ok(proc.make_nil())
+    }
+}
+
+fn prim_streamp(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("STREAMP requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if proc.streams.get(id).is_some() {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_open_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("OPEN-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if proc.streams.get(id).is_some() {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_input_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("INPUT-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if let Some(stream) = proc.streams.get(id) {
+            if matches!(
+                stream.direction(),
+                crate::streams::StreamDirection::Input | crate::streams::StreamDirection::Bidirectional
+            ) {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_output_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("OUTPUT-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if let Some(stream) = proc.streams.get(id) {
+            if matches!(
+                stream.direction(),
+                crate::streams::StreamDirection::Output
+                    | crate::streams::StreamDirection::Bidirectional
+            ) {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_file_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("FILE-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if let Some(stream) = proc.streams.get(id) {
+            if matches!(
+                stream,
+                crate::streams::Stream::FileInputStream { .. }
+                    | crate::streams::Stream::FileOutputStream { .. }
+                    | crate::streams::Stream::FileIoStream { .. }
+            ) {
+                return Ok(proc.make_t(ctx));
+            }
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_two_way_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("TWO-WAY-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if matches!(proc.streams.get(id), Some(crate::streams::Stream::TwoWayStream { .. })) {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_broadcast_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("BROADCAST-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if matches!(
+            proc.streams.get(id),
+            Some(crate::streams::Stream::BroadcastStream { .. })
+        ) {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_synonym_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("SYNONYM-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if matches!(
+            proc.streams.get(id),
+            Some(crate::streams::Stream::SynonymStream { .. })
+        ) {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
+fn prim_echo_stream_p(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("ECHO-STREAM-P requires exactly 1 argument");
+    }
+    if let Some(id) = node_to_stream_id(proc, args[0]) {
+        if matches!(
+            proc.streams.get(id),
+            Some(crate::streams::Stream::EchoStream { .. })
+        ) {
+            return Ok(proc.make_t(ctx));
+        }
+    }
+    Ok(proc.make_nil())
+}
+
 /// (make-string-output-stream) -> stream
 fn prim_make_string_output_stream(
     proc: &mut crate::process::Process,
@@ -8698,14 +9246,14 @@ fn prim_make_two_way_stream(
         return err_helper("MAKE-TWO-WAY-STREAM requires input and output streams");
     }
 
-    let input_id = match proc.arena.inner.get_unchecked(args[0]) {
-        Node::Leaf(OpaqueValue::StreamHandle(id)) => crate::streams::StreamId(*id),
-        _ => return err_helper("MAKE-TWO-WAY-STREAM: input must be a stream"),
-    };
-    let output_id = match proc.arena.inner.get_unchecked(args[1]) {
-        Node::Leaf(OpaqueValue::StreamHandle(id)) => crate::streams::StreamId(*id),
-        _ => return err_helper("MAKE-TWO-WAY-STREAM: output must be a stream"),
-    };
+    let input_id =
+        node_to_stream_id(proc, args[0]).ok_or_else(|| {
+            ControlSignal::Error("MAKE-TWO-WAY-STREAM: input must be a stream".to_string())
+        })?;
+    let output_id =
+        node_to_stream_id(proc, args[1]).ok_or_else(|| {
+            ControlSignal::Error("MAKE-TWO-WAY-STREAM: output must be a stream".to_string())
+        })?;
 
     let stream = Stream::TwoWayStream {
         input: input_id,
@@ -8728,11 +9276,10 @@ fn prim_make_broadcast_stream(
 
     let mut targets = Vec::new();
     for &arg in args {
-        match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::StreamHandle(id)) => {
-                targets.push(crate::streams::StreamId(*id))
-            }
-            _ => return err_helper("MAKE-BROADCAST-STREAM: args must be streams"),
+        if let Some(id) = node_to_stream_id(proc, arg) {
+            targets.push(id);
+        } else {
+            return err_helper("MAKE-BROADCAST-STREAM: args must be streams");
         }
     }
 
@@ -8750,15 +9297,39 @@ fn prim_close(
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    if let Some(&arg) = args.first() {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(arg) {
-            let stream_id = crate::streams::StreamId(*id);
-            if proc.streams.close(stream_id) {
-                return Ok(proc.make_t(ctx));
+    if args.is_empty() {
+        return err_helper("CLOSE requires a stream");
+    }
+    if args.len() > 1 && (args.len() - 1) % 2 != 0 {
+        return err_helper("CLOSE: odd number of keyword arguments");
+    }
+
+    let mut abort = false;
+    for pair in args[1..].chunks(2) {
+        let key = node_to_symbol(proc, pair[0])
+            .ok_or_else(|| ControlSignal::Error("CLOSE: keyword must be a symbol".to_string()))?;
+        let key_name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(key)
+            .unwrap_or("")
+            .to_uppercase();
+        match key_name.as_str() {
+            "ABORT" => {
+                abort = !node_is_nil(proc, pair[1]);
             }
+            _ => return err_helper("CLOSE: unsupported keyword argument"),
         }
     }
-    Ok(proc.make_nil())
+
+    let stream_id =
+        node_to_stream_id(proc, args[0]).ok_or_else(|| ControlSignal::Error("CLOSE: invalid stream".to_string()))?;
+    if proc.streams.close_with_abort(stream_id, abort) {
+        Ok(proc.make_t(ctx))
+    } else {
+        Ok(proc.make_nil())
+    }
 }
 
 /// (write-string string &optional stream) -> string
@@ -8772,15 +9343,8 @@ fn prim_write_string(
     }
 
     let string_arg = args[0];
-    let stream_id = if args.len() > 1 {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(args[1]) {
-            crate::streams::StreamId(*id)
-        } else {
-            proc.streams.stdout_id()
-        }
-    } else {
-        proc.streams.stdout_id()
-    };
+    let stream_id = resolve_output_stream(proc, ctx, args.get(1).copied())?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
 
     if let Node::Leaf(OpaqueValue::String(s)) = proc.arena.inner.get_unchecked(string_arg) {
         let s_clone = s.clone();
@@ -8797,7 +9361,7 @@ fn prim_write_string(
 /// (write-char char &optional stream) -> char
 fn prim_write_char(
     proc: &mut crate::process::Process,
-    _ctx: &crate::context::GlobalContext,
+    ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
     if args.is_empty() {
@@ -8805,15 +9369,8 @@ fn prim_write_char(
     }
 
     let char_arg = args[0];
-    let stream_id = if args.len() > 1 {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(args[1]) {
-            crate::streams::StreamId(*id)
-        } else {
-            proc.streams.stdout_id()
-        }
-    } else {
-        proc.streams.stdout_id()
-    };
+    let stream_id = resolve_output_stream(proc, ctx, args.get(1).copied())?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
 
     let c = match proc.arena.inner.get_unchecked(char_arg) {
         Node::Leaf(OpaqueValue::Char(c)) => *c,
@@ -8826,26 +9383,152 @@ fn prim_write_char(
     Ok(char_arg)
 }
 
+/// (write-byte byte stream) -> byte
+fn prim_write_byte(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("WRITE-BYTE requires exactly 2 arguments");
+    }
+    let b = match proc.arena.inner.get_unchecked(args[0]) {
+        Node::Leaf(OpaqueValue::Integer(n)) if *n >= 0 && *n <= 255 => *n as u8,
+        _ => return err_helper("WRITE-BYTE: first argument must be an integer in [0,255]"),
+    };
+    let stream_id = resolve_output_stream(proc, ctx, Some(args[1]))?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
+    proc.streams
+        .write_byte(stream_id, b)
+        .map_err(|e| ControlSignal::Error(format!("WRITE-BYTE: {}", e)))?;
+    Ok(args[0])
+}
+
 /// (fresh-line &optional stream) -> generalized-boolean
 fn prim_fresh_line(
     proc: &mut crate::process::Process,
     ctx: &crate::context::GlobalContext,
     args: &[NodeId],
 ) -> EvalResult {
-    let stream_id = if !args.is_empty() {
-        if let Node::Leaf(OpaqueValue::StreamHandle(id)) = proc.arena.inner.get_unchecked(args[0]) {
-            crate::streams::StreamId(*id)
-        } else {
-            proc.streams.stdout_id()
-        }
-    } else {
-        proc.streams.stdout_id()
-    };
+    let stream_id = resolve_output_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
 
     match proc.streams.fresh_line(stream_id) {
         Ok(true) => Ok(proc.make_t(ctx)),
         Ok(false) => Ok(proc.make_nil()),
         Err(_) => Ok(proc.make_nil()),
+    }
+}
+
+/// (finish-output &optional stream) -> nil
+fn prim_finish_output(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    let stream_id = resolve_output_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
+    proc.streams
+        .finish_output(stream_id)
+        .map_err(|e| ControlSignal::Error(format!("FINISH-OUTPUT: {}", e)))?;
+    Ok(proc.make_nil())
+}
+
+/// (force-output &optional stream) -> nil
+fn prim_force_output(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    let stream_id = resolve_output_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
+    proc.streams
+        .force_output(stream_id)
+        .map_err(|e| ControlSignal::Error(format!("FORCE-OUTPUT: {}", e)))?;
+    Ok(proc.make_nil())
+}
+
+/// (clear-output &optional stream) -> nil
+fn prim_clear_output(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    let stream_id = resolve_output_stream(proc, ctx, args.get(0).copied())?;
+    let stream_id = resolve_output_stream_id(proc, ctx, stream_id)?;
+    proc.streams
+        .clear_output(stream_id)
+        .map_err(|e| ControlSignal::Error(format!("CLEAR-OUTPUT: {}", e)))?;
+    Ok(proc.make_nil())
+}
+
+/// (file-position stream &optional position-spec) -> pos-or-boolean
+fn prim_file_position(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() || args.len() > 2 {
+        return err_helper("FILE-POSITION requires 1 or 2 arguments");
+    }
+    let stream_id = node_to_stream_id(proc, args[0])
+        .ok_or_else(|| ControlSignal::Error("FILE-POSITION: first argument must be a stream".to_string()))?;
+
+    if args.len() == 1 {
+        return match proc.streams.file_position(stream_id) {
+            Ok(Some(pos)) => Ok(proc.make_integer(pos as i64)),
+            Ok(None) => Ok(proc.make_nil()),
+            Err(e) => Err(ControlSignal::Error(format!("FILE-POSITION: {}", e))),
+        };
+    }
+
+    let pos = match proc.arena.inner.get_unchecked(args[1]) {
+        Node::Leaf(OpaqueValue::Integer(n)) if *n >= 0 => *n as u64,
+        Node::Leaf(OpaqueValue::Symbol(id)) => {
+            let name = ctx
+                .symbols
+                .read()
+                .unwrap()
+                .symbol_name(SymbolId(*id))
+                .unwrap_or("")
+                .to_uppercase();
+            match name.as_str() {
+                "START" => 0,
+                "END" => match proc.streams.file_length(stream_id) {
+                    Ok(Some(len)) => len,
+                    Ok(None) => return Ok(proc.make_nil()),
+                    Err(e) => {
+                        return Err(ControlSignal::Error(format!("FILE-POSITION: {}", e)));
+                    }
+                },
+                _ => return err_helper("FILE-POSITION: position must be integer, :START or :END"),
+            }
+        }
+        _ => return err_helper("FILE-POSITION: position must be integer, :START or :END"),
+    };
+
+    match proc.streams.set_file_position(stream_id, pos) {
+        Ok(true) => Ok(proc.make_t(ctx)),
+        Ok(false) => Ok(proc.make_nil()),
+        Err(e) => Err(ControlSignal::Error(format!("FILE-POSITION: {}", e))),
+    }
+}
+
+/// (file-length stream) -> integer-or-nil
+fn prim_file_length(
+    proc: &mut crate::process::Process,
+    _ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("FILE-LENGTH requires exactly 1 argument");
+    }
+    let stream_id = node_to_stream_id(proc, args[0])
+        .ok_or_else(|| ControlSignal::Error("FILE-LENGTH: argument must be a stream".to_string()))?;
+    match proc.streams.file_length(stream_id) {
+        Ok(Some(len)) => Ok(proc.make_integer(len as i64)),
+        Ok(None) => Ok(proc.make_nil()),
+        Err(e) => Err(ControlSignal::Error(format!("FILE-LENGTH: {}", e))),
     }
 }
 
@@ -15384,6 +16067,79 @@ mod tests {
     use super::*;
     use crate::reader::read_from_string;
 
+    fn open_output_byte_stream_with_if_exists(
+        proc: &mut crate::process::Process,
+        globals: &crate::context::GlobalContext,
+        path: &str,
+        if_exists: &str,
+    ) -> NodeId {
+        let path_node = alloc_string(proc, path.to_string());
+        let kw_direction = globals.symbols.write().unwrap().intern_keyword("DIRECTION");
+        let kw_output = globals.symbols.write().unwrap().intern_keyword("OUTPUT");
+        let kw_if_exists = globals.symbols.write().unwrap().intern_keyword("IF-EXISTS");
+        let kw_if_exists_value = globals.symbols.write().unwrap().intern_keyword(if_exists);
+        let kw_element_type = globals.symbols.write().unwrap().intern_keyword("ELEMENT-TYPE");
+        let unsigned_byte_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("UNSIGNED-BYTE", PackageId(1));
+
+        let direction_key = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_direction.0)));
+        let output_value = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_output.0)));
+        let if_exists_key = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_if_exists.0)));
+        let if_exists_value = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_if_exists_value.0)));
+        let element_type_key = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_element_type.0)));
+        let ub_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(unsigned_byte_sym.0)));
+        let eight_node = proc.make_integer(8);
+        let element_type_value = proc.make_list(&[ub_node, eight_node]);
+
+        prim_open(
+            proc,
+            globals,
+            &[
+                path_node,
+                direction_key,
+                output_value,
+                if_exists_key,
+                if_exists_value,
+                element_type_key,
+                element_type_value,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn write_all_bytes(
+        proc: &mut crate::process::Process,
+        globals: &crate::context::GlobalContext,
+        stream: NodeId,
+        bytes: &[u8],
+    ) {
+        for byte in bytes {
+            let byte_node = proc.make_integer(*byte as i64);
+            prim_write_byte(proc, globals, &[byte_node, stream]).unwrap();
+        }
+    }
+
     #[test]
     fn test_add() {
         let mut globals = crate::context::GlobalContext::new();
@@ -16393,6 +17149,381 @@ mod tests {
         let report = proc.maybe_auto_collect();
         assert!(report.is_some(), "auto GC should trigger");
         assert_eq!(proc.gc_runtime_stats.auto_triggers, 1);
+    }
+
+    #[test]
+    fn test_open_stream_predicates_and_close() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let path = std::env::temp_dir().join(format!("treecl-stream-open-{}.txt", std::process::id()));
+        std::fs::write(&path, "abc").unwrap();
+        let path_node = alloc_string(&mut proc, path.to_string_lossy().to_string());
+
+        let stream = prim_open(&mut proc, &globals, &[path_node]).unwrap();
+        let streamp = prim_streamp(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(streamp),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
+        let inputp = prim_input_stream_p(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(inputp),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
+        let filep = prim_file_stream_p(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(filep),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
+
+        let closed = prim_close(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(closed),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
+        let openp = prim_open_stream_p(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(openp),
+            Node::Leaf(OpaqueValue::Nil)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_open_output_write_byte_and_file_length_position() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let path = std::env::temp_dir().join(format!("treecl-stream-write-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_node = alloc_string(&mut proc, path.to_string_lossy().to_string());
+        let kw_direction = globals.symbols.write().unwrap().intern_keyword("DIRECTION");
+        let kw_output = globals.symbols.write().unwrap().intern_keyword("OUTPUT");
+        let kw_element_type = globals.symbols.write().unwrap().intern_keyword("ELEMENT-TYPE");
+        let unsigned_byte_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("UNSIGNED-BYTE", PackageId(1));
+        let key_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(kw_direction.0)));
+        let val_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(kw_output.0)));
+        let et_key_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(kw_element_type.0)));
+        let ub_node = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(unsigned_byte_sym.0)));
+        let eight_node = proc.make_integer(8);
+        let et_value_node = proc.make_list(&[ub_node, eight_node]);
+
+        let stream = prim_open(
+            &mut proc,
+            &globals,
+            &[path_node, key_node, val_node, et_key_node, et_value_node],
+        )
+        .unwrap();
+        let byte = proc.make_integer(65);
+        prim_write_byte(&mut proc, &globals, &[byte, stream]).unwrap();
+        prim_finish_output(&mut proc, &globals, &[stream]).unwrap();
+
+        let pos = prim_file_position(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(pos),
+            Node::Leaf(OpaqueValue::Integer(1))
+        ));
+        let len = prim_file_length(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(len),
+            Node::Leaf(OpaqueValue::Integer(1))
+        ));
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data, b"A");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_peek_read_char_and_file_position_set_end() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let path = std::env::temp_dir().join(format!("treecl-stream-read-{}.txt", std::process::id()));
+        std::fs::write(&path, "AB").unwrap();
+        let path_node = alloc_string(&mut proc, path.to_string_lossy().to_string());
+        let stream = prim_open(&mut proc, &globals, &[path_node]).unwrap();
+
+        let nil_node = proc.make_nil();
+        let peeked = prim_peek_char(&mut proc, &globals, &[nil_node, stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(peeked),
+            Node::Leaf(OpaqueValue::Char('A'))
+        ));
+        let byte = prim_read_char(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(byte),
+            Node::Leaf(OpaqueValue::Char('A'))
+        ));
+        let pos = prim_file_position(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(pos),
+            Node::Leaf(OpaqueValue::Integer(1))
+        ));
+
+        let kw_end = globals.symbols.write().unwrap().intern_keyword("END");
+        let kw_end_node = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Symbol(kw_end.0)));
+        let set_res = prim_file_position(&mut proc, &globals, &[stream, kw_end_node]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(set_res),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
+        let pos_end = prim_file_position(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(pos_end),
+            Node::Leaf(OpaqueValue::Integer(2))
+        ));
+
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_read_and_read_delimited_list_support_file_streams() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let path = std::env::temp_dir().join(format!("treecl-read-file-{}.lsp", std::process::id()));
+        std::fs::write(&path, "(foo 1) 99 bar baz )").unwrap();
+        let path_node = alloc_string(&mut proc, path.to_string_lossy().to_string());
+        let stream = prim_open(&mut proc, &globals, &[path_node]).unwrap();
+
+        let form = prim_read(&mut proc, &globals, &[stream]).unwrap();
+        let elems = list_to_vec_opt(&proc, form).expect("proper list");
+        assert_eq!(elems.len(), 2);
+        let first_sym = node_to_symbol(&proc, elems[0]).expect("symbol");
+        let first_name = globals
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(first_sym)
+            .unwrap_or("")
+            .to_uppercase();
+        assert_eq!(first_name, "FOO");
+
+        let second = prim_read(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(second),
+            Node::Leaf(OpaqueValue::Integer(99))
+        ));
+
+        let delim = proc.arena.inner.alloc(Node::Leaf(OpaqueValue::Char(')')));
+        let rest = prim_read_delimited_list(&mut proc, &globals, &[delim, stream]).unwrap();
+        let rest_elems = list_to_vec_opt(&proc, rest).expect("proper rest list");
+        assert_eq!(rest_elems.len(), 2);
+        let sym_bar = node_to_symbol(&proc, rest_elems[0]).expect("symbol");
+        let sym_baz = node_to_symbol(&proc, rest_elems[1]).expect("symbol");
+        let symbols = globals.symbols.read().unwrap();
+        assert_eq!(symbols.symbol_name(sym_bar).unwrap_or(""), "BAR");
+        assert_eq!(symbols.symbol_name(sym_baz).unwrap_or(""), "BAZ");
+
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_read_preserving_whitespace_supports_file_streams() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let path = std::env::temp_dir().join(format!("treecl-read-preserve-{}.lsp", std::process::id()));
+        std::fs::write(&path, "  123").unwrap();
+        let path_node = alloc_string(&mut proc, path.to_string_lossy().to_string());
+        let stream = prim_open(&mut proc, &globals, &[path_node]).unwrap();
+
+        let val = prim_read_preserving_whitespace(&mut proc, &globals, &[stream]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(val),
+            Node::Leaf(OpaqueValue::Integer(123))
+        ));
+
+        let nil_node = proc.make_nil();
+        let eof_value = proc.make_integer(-1);
+        let eof = prim_read_preserving_whitespace(&mut proc, &globals, &[stream, nil_node, eof_value]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(eof),
+            Node::Leaf(OpaqueValue::Integer(-1))
+        ));
+
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_open_if_exists_rename_creates_backup() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "treecl-open-rename-{}-{}.bin",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::write(&path, b"OLD").unwrap();
+
+        let stream = open_output_byte_stream_with_if_exists(
+            &mut proc,
+            &globals,
+            &path.to_string_lossy(),
+            "RENAME",
+        );
+        write_all_bytes(&mut proc, &globals, stream, b"NEW");
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+
+        let backup = std::path::PathBuf::from(format!("{}.bak", path.to_string_lossy()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"OLD");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn test_open_if_exists_new_version_keeps_prior_version() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "treecl-open-new-version-{}-{}.bin",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::write(&path, b"OLD").unwrap();
+
+        let stream = open_output_byte_stream_with_if_exists(
+            &mut proc,
+            &globals,
+            &path.to_string_lossy(),
+            "NEW-VERSION",
+        );
+        write_all_bytes(&mut proc, &globals, stream, b"NEW");
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+
+        let prior_version = std::path::PathBuf::from(format!("{}.~1~", path.to_string_lossy()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(&prior_version).unwrap(), b"OLD");
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(prior_version);
+    }
+
+    #[test]
+    fn test_open_if_exists_rename_and_delete_discards_backup() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "treecl-open-rename-delete-{}-{}.bin",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::write(&path, b"OLD").unwrap();
+
+        let stream = open_output_byte_stream_with_if_exists(
+            &mut proc,
+            &globals,
+            &path.to_string_lossy(),
+            "RENAME-AND-DELETE",
+        );
+        write_all_bytes(&mut proc, &globals, stream, b"NEW");
+        prim_close(&mut proc, &globals, &[stream]).unwrap();
+
+        let temp_old = std::path::PathBuf::from(format!("{}.tmp-old", path.to_string_lossy()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEW");
+        assert!(
+            !temp_old.exists(),
+            "rename-and-delete should remove temporary backup"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
