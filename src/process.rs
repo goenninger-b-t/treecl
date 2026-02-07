@@ -155,6 +155,9 @@ pub struct Process {
     pub functions: HashMap<SymbolId, usize>,
     /// SETF Functions (SymbolId -> Function Node)
     pub setf_functions: HashMap<SymbolId, NodeId>,
+    /// LOGICAL-PATHNAME-TRANSLATIONS host table (HOST -> list of (FROM-WILDNAME TO-WILDNAME))
+    pub logical_pathname_translations:
+        HashMap<String, Vec<(crate::pathname::Pathname, crate::pathname::Pathname)>>,
     pub fast_make_instance_ok: Option<bool>,
 
     /// Condition System State
@@ -260,6 +263,7 @@ impl Process {
             macros: HashMap::default(), // Initialize macros
             functions: HashMap::default(),
             setf_functions: HashMap::default(),
+            logical_pathname_translations: HashMap::default(),
             fast_make_instance_ok: None,
             conditions,
             arrays,

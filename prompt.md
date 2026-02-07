@@ -34,8 +34,10 @@
 - Evaluator now has a fast expansion path for `REGRESSION-TEST:DEFTEST` that builds the expansion directly in Rust (bypassing expensive macro-body evaluation).
 - Evaluator now also includes:
   - fast expansion for `CL-TEST:SIGNALS-ERROR`;
-  - fast-path expansion for simple `COMMON-LISP:SETF` symbol-place assignments;
+  - fast expansion for `COMMON-LISP:DEFMETHOD` (semantics-preserving macro-shape expansion with fallback);
+  - fast-path expansion for common `COMMON-LISP:SETF` places (`symbol`, `car`, `cdr`, `gethash`, `get`, `symbol-value`, `slot-value`, `funcallable-standard-instance-access`, `readtable-case`);
   - direct evaluator handling for `COMMON-LISP:LET*` and `COMMON-LISP:COND` (in both step and non-step application paths, before macro expansion);
+  - direct evaluator handling for `COMMON-LISP:OR` (in both step and non-step application paths, before macro expansion);
   - cached env-flag lookups (`OnceLock`) for macro timing toggles to avoid repeated hot-path `std::env::var` calls.
 
 ## Harnesses/Artifacts
@@ -59,6 +61,15 @@
 - `/tmp/ansi_pathnames_rt_macro_timing_after_letstar_cond_eval.log`: full macro timing run after evaluator-level LET*/COND handling.
 - `/tmp/ansi_pathnames_file_timing_after_letstar_cond_eval.log`: coarse file timing run after evaluator-level LET*/COND handling.
 - `/tmp/ansi_pathnames_step_after_letstar_cond_eval.log`: 120s control run after evaluator-level LET*/COND handling.
+- `/tmp/ansi_pathnames_rt_macro_timing_after_setf_place_fast.log`: full macro timing run after broader SETF place fast path.
+- `/tmp/ansi_pathnames_file_timing_after_setf_place_fast.log`: coarse file timing run after broader SETF place fast path.
+- `/tmp/ansi_pathnames_step_after_setf_place_fast.log`: 120s control run after broader SETF place fast path.
+- `/tmp/ansi_pathnames_rt_macro_timing_after_or_direct_final.log`: full macro timing run after evaluator-level OR handling.
+- `/tmp/ansi_pathnames_file_timing_after_or_direct_final.log`: coarse file timing run after evaluator-level OR handling.
+- `/tmp/ansi_pathnames_step_after_or_direct_final.log`: 120s control run after evaluator-level OR handling.
+- `/tmp/ansi_pathnames_rt_macro_timing_after_defmethod_fast.log`: full macro timing run after safe DEFMETHOD fast expansion.
+- `/tmp/ansi_pathnames_file_timing_after_defmethod_fast.log`: coarse file timing run after safe DEFMETHOD fast expansion.
+- `/tmp/ansi_pathnames_step_after_defmethod_fast.log`: 120s control run after safe DEFMETHOD fast expansion.
 
 ## Latest Findings
 - Re-run with `TREECL_DEBUG_LOAD_MATCH=enough-namestring.lsp` still timed out at 120s, but showed only file-level markers up to `file-namestring.lsp`.
@@ -97,6 +108,19 @@
   - Macro timing top entries become `REGRESSION-TEST:DEFTEST` (mostly eval-side) and `COMMON-LISP:SETF` (expansion-heavy).
   - Coarse file timing improves from ~`34.52s` to ~`28.73s` total (~`16.8%` faster).
   - 120s control run completes in ~`27.67s`.
+- After broadening `SETF` fast-path place handling:
+  - `COMMON-LISP:SETF` macro aggregate drops from ~`33055ms` total (`expand ~32573ms`) to ~`222ms` total (`expand ~7.4ms`).
+  - Coarse file timing improves from ~`28.73s` to ~`1.68s` total (~`94.15%` faster).
+  - 120s control run completes in ~`3.90s`.
+  - Remaining top macro timing contributors shift to `COMMON-LISP:DEFMETHOD` and `COMMON-LISP:OR`.
+- After adding evaluator-level `OR` handling:
+  - `COMMON-LISP:OR` disappears from macro timing aggregates (no `OR` hits in aggregate output).
+  - Control runtime improves from ~`3.90s` to ~`3.19s`.
+- After adding safe `DEFMETHOD` fast expansion:
+  - `COMMON-LISP:DEFMETHOD` aggregate drops from ~`1560.3ms` total (`expand ~1500.5ms`) to ~`45.5ms` total (`expand ~2.6ms`).
+  - Coarse load summary improves to ~`1044ms`.
+  - 120s control runtime improves from ~`3.19s` to ~`1.39s`.
+  - Current top macro contributors are now `REGRESSION-TEST:DEFTEST` (mostly eval-side), `SETF`, `WHEN`, and `DEFSTRUCT`.
 - Conclusion: current evidence points to cumulative runtime over the 120s timeout window, not a single hard stall before `enough-namestring.lsp`.
 
 ## Tests Recently Run
@@ -117,16 +141,27 @@
 - `timeout 240s env TREECL_DEBUG_RT_MACRO_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after evaluator-level `LET*`/`COND` (exit 0; `LET*`/`COND` no longer appear in macro aggregates).
 - `timeout 240s env TREECL_DEBUG_LOAD_FILE_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after evaluator-level `LET*`/`COND` (exit 0; total ~28.73s).
 - `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` after evaluator-level `LET*`/`COND` (exit 0; elapsed ~27.67s).
-- `cargo test -q` after evaluator-level `LET*`/`COND` + tests (passes; 99 tests in core suite).
+- `timeout 240s env TREECL_DEBUG_RT_MACRO_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after broader `SETF` place fast path (exit 0; `SETF` aggregate reduced to ~222ms total).
+- `timeout 240s env TREECL_DEBUG_LOAD_FILE_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after broader `SETF` place fast path (exit 0; total ~1.68s).
+- `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` after broader `SETF` place fast path (exit 0; elapsed ~3.90s).
+- `cargo test -q` after broader `SETF` place fast path + tests (passes; 101 tests in core suite).
+- `cargo test -q` after evaluator-level `OR` handling (passes; 102 tests in core suite).
+- `timeout 240s env TREECL_DEBUG_RT_MACRO_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after evaluator-level `OR` handling (exit 0; aggregate no longer includes `COMMON-LISP:OR`).
+- `timeout 240s env TREECL_DEBUG_LOAD_FILE_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after evaluator-level `OR` handling (exit 0; load summary in ~1.3-1.9s across repeated runs).
+- `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` after evaluator-level `OR` handling (exit 0; elapsed ~3.19s).
+- `cargo test -q` after safe `DEFMETHOD` fast expansion + tests (passes; 104 tests in core suite).
+- `timeout 240s env TREECL_DEBUG_RT_MACRO_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after safe `DEFMETHOD` fast expansion (exit 0; `DEFMETHOD` aggregate ~45.5ms total).
+- `timeout 240s env TREECL_DEBUG_LOAD_FILE_TIMING=1 target/debug/treecl /tmp/ansi_pathnames_step.lsp` after safe `DEFMETHOD` fast expansion (exit 0; load summary ~1044ms).
+- `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` after safe `DEFMETHOD` fast expansion (exit 0; elapsed ~1.39s).
 
 ## Outstanding Questions / Next Steps
-1. Prioritize `COMMON-LISP:SETF` expansion cost now that `LET*`/`COND` are handled directly.
-2. Add focused timing or counters for `SETF` fast-path hit/miss to quantify complex-place fallback.
-3. Re-run coarse file timing after broader `SETF` handling (or other top macro targets like `DEFMETHOD`) to confirm ranked-file movement.
+1. Profile `REGRESSION-TEST:DEFTEST` eval-side work (not expansion-side) now that major macro-expansion costs are largely removed.
+2. Evaluate whether remaining macro contributors (`SETF`, `WHEN`, `DEFSTRUCT`, `DEFGENERIC`) need additional fast paths or are acceptable at current ~1.4s runtime.
+3. Keep re-running `TREECL_DEBUG_RT_MACRO_TIMING=1` and `TREECL_DEBUG_LOAD_FILE_TIMING=1` after each optimization to track regressions/movement.
 
 ## Files Modified in Workspace (Uncommitted)
 - `src/primitives.rs` (filtered LOAD debug + per-form timing + coarse file timing)
-- `src/eval.rs` (`DEFTEST` split timing instrumentation in macro execution path)
+- `src/eval.rs` (`DEFTEST`/macro timing instrumentation + fast macro/evaluator paths including `SETF`, `LET*`, `COND`, and `OR`)
 - `src/main.rs` (print ranked load summary when coarse file timing is enabled)
 - `references/tasks.md` (triage update)
 - `references/knowledge_base.md` (triage update)

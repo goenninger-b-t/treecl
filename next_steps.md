@@ -1,3 +1,3 @@
-1. Add hit/miss counters for the simple `SETF` fast path to quantify complex-place fallback rate in `/tmp/ansi_pathnames_step.lsp`.
-2. Extend `SETF` fast handling beyond symbol places (where safe), then re-run `TREECL_DEBUG_RT_MACRO_TIMING=1` to validate aggregate reduction.
-3. Re-run `TREECL_DEBUG_LOAD_FILE_TIMING=1` after `SETF` work to check movement in top files (`wild-pathname-p.lsp`, `make-pathname.lsp`, `pathname-match-p.lsp`).
+1. Profile `REGRESSION-TEST:DEFTEST` eval-side time in the pathnames harness now that `DEFMETHOD` macro-expansion cost is largely removed.
+2. Re-check remaining macro aggregates (`SETF`, `WHEN`, `DEFSTRUCT`, `DEFGENERIC`) and decide whether further fast paths are worth the complexity.
+3. Continue using `TREECL_DEBUG_RT_MACRO_TIMING=1` and `TREECL_DEBUG_LOAD_FILE_TIMING=1` after each change; current control runtime baseline is ~1.39s.

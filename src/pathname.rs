@@ -16,6 +16,24 @@ pub struct Pathname {
 }
 
 impl Pathname {
+    pub fn has_logical_syntax(raw: &str) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.contains(';') {
+            return true;
+        }
+
+        let bytes = trimmed.as_bytes();
+        let colon_idx = trimmed.find(':');
+        let sep_idx = trimmed.find(|c| c == '/' || c == '\\');
+        let is_drive = colon_idx == Some(1)
+            && bytes
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic());
+        colon_idx.is_some()
+            && !is_drive
+            && (sep_idx.is_none() || colon_idx.unwrap() < sep_idx.unwrap())
+    }
+
     pub fn from_namestring(raw: &str) -> Self {
         let namestring = raw.to_string();
         let trimmed = raw.trim();
@@ -25,7 +43,7 @@ impl Pathname {
         let mut directory: Option<PathnameDirectory> = None;
         let mut name: Option<String> = None;
         let mut type_: Option<String> = None;
-        let version: Option<String> = None;
+        let mut version: Option<String> = None;
 
         let bytes = trimmed.as_bytes();
         if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
@@ -33,19 +51,18 @@ impl Pathname {
         }
 
         let colon_idx = trimmed.find(':');
-        let sep_idx = trimmed.find(|c| c == '/' || c == '\\');
-        let is_drive = colon_idx == Some(1) && bytes.get(0).map(|b| b.is_ascii_alphabetic()) == Some(true);
-        let logical = colon_idx.is_some()
-            && !is_drive
-            && (sep_idx.is_none() || colon_idx.unwrap() < sep_idx.unwrap());
+        let logical = Self::has_logical_syntax(trimmed);
 
         if logical {
-            let idx = colon_idx.unwrap();
-            let host_part = trimmed[..idx].trim();
-            if !host_part.is_empty() {
-                host = Some(host_part.to_string());
-            }
-            let rest = &trimmed[idx + 1..];
+            let rest = if let Some(idx) = colon_idx {
+                let host_part = trimmed[..idx].trim();
+                if !host_part.is_empty() {
+                    host = Some(host_part.to_string());
+                }
+                &trimmed[idx + 1..]
+            } else {
+                trimmed
+            };
             let mut segments: Vec<&str> = rest.split(';').collect();
             let ends_with_sep = rest.ends_with(';');
             let file_part = if ends_with_sep {
@@ -61,21 +78,40 @@ impl Pathname {
                 }
                 components.push(seg.to_string());
             }
-            let absolute = host.is_some() || rest.starts_with(';');
+            let absolute = rest.starts_with(';');
             if !components.is_empty() || absolute {
                 directory = Some(PathnameDirectory { absolute, components });
             }
 
             if let Some(file) = file_part {
-                if let Some((stem, ext)) = file.rsplit_once('.') {
-                    if !stem.is_empty() {
-                        name = Some(stem.to_string());
+                let fields: Vec<&str> = file.split('.').collect();
+                match fields.len() {
+                    0 => {}
+                    1 => {
+                        if !fields[0].is_empty() {
+                            name = Some(fields[0].to_string());
+                        }
                     }
-                    if !ext.is_empty() {
-                        type_ = Some(ext.to_string());
+                    2 => {
+                        if !fields[0].is_empty() {
+                            name = Some(fields[0].to_string());
+                        }
+                        if !fields[1].is_empty() {
+                            type_ = Some(fields[1].to_string());
+                        }
                     }
-                } else if !file.is_empty() {
-                    name = Some(file.to_string());
+                    _ => {
+                        if !fields[0].is_empty() {
+                            name = Some(fields[0].to_string());
+                        }
+                        if !fields[1].is_empty() {
+                            type_ = Some(fields[1].to_string());
+                        }
+                        let version_text = fields[2..].join(".");
+                        if !version_text.is_empty() {
+                            version = Some(version_text);
+                        }
+                    }
                 }
             }
         } else {

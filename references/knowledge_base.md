@@ -441,3 +441,75 @@ Progress update (Feb 7 2026, evaluator-level LET*/COND handling)
   - Coarse file timing summary: total improved from ~`34.52s` to ~`28.73s`.
   - Control wall time: `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp` now around `27.67s`.
   - Remaining largest macro timing contributors are now `COMMON-LISP:SETF` and `REGRESSION-TEST:DEFTEST` eval-side work.
+
+Progress update (Feb 7 2026, broader SETF fast-path handling)
+--------------------------------------------------------------------------------
+
+- Expanded `COMMON-LISP:SETF` direct expansion in `src/eval.rs` from symbol places to common place forms:
+  - `(car x)` -> `rplaca`
+  - `(cdr x)` -> `rplacd`
+  - `(gethash k h)` -> `set-gethash`
+  - `(get sym ind)` -> `put`
+  - `(symbol-value sym)` -> `set`
+  - `(slot-value obj slot)` -> `set-slot-value`
+  - `(funcallable-standard-instance-access obj i)` -> `set-funcallable-standard-instance-access`
+  - `(readtable-case rt)` -> `set-readtable-case`
+- Unsupported/complex places still return `None` from the fast path and fall back to macro-body expansion.
+- Added tests in `src/eval.rs`:
+  - `test_setf_fast_path_handles_car_place`
+  - `test_setf_fast_path_handles_gethash_get_and_symbol_value`
+  - `test_setf_fast_path_unknown_place_returns_none`
+  - `cargo test -q` passes (101 core tests).
+- Macro timing impact (pathnames step harness):
+  - `COMMON-LISP:SETF` aggregate changed from about `33055ms` total (`expand ~32573ms`) to about `222ms` total (`expand ~7.4ms`).
+- End-to-end timing impact:
+  - Coarse file timing total changed from about `28725.62ms` to about `1679.19ms` (~`94.15%` reduction).
+  - Control wall time changed from about `27.67s` to about `3.90s` for:
+    `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp`.
+- New top macro contributors in this load path are now primarily `COMMON-LISP:DEFMETHOD` and `COMMON-LISP:OR`, with `SETF` no longer dominant.
+
+Progress update (Feb 7 2026, evaluator-level OR handling)
+--------------------------------------------------------------------------------
+
+- Added direct evaluator dispatch for `COMMON-LISP:OR` before macro expansion in both:
+  - TCO step path (`step_application` -> `step_or`),
+  - non-TCO path (`eval_application` -> `eval_or`).
+- Implemented `eval_or` with macro-equivalent value behavior:
+  - returns `nil` for no arguments,
+  - short-circuits on first truthy form,
+  - for non-final winning forms, returns only primary value,
+  - for final form, returns normal form values.
+- Added regression test in `src/eval.rs`:
+  - `test_eval_or_direct_handling`
+  - `cargo test -q` passes (102 core tests).
+- Macro timing impact:
+  - Before (`/tmp/ansi_pathnames_rt_macro_timing_current.log` aggregate): `COMMON-LISP:OR` about `1076.9ms` total across 285 hits.
+  - After (`/tmp/ansi_pathnames_rt_macro_timing_after_or_direct_final.log` aggregate): `COMMON-LISP:OR` no longer appears in macro timing aggregates.
+- Runtime impact:
+  - Control wall time improved from about `3.90s` to about `3.19s` for:
+    `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp`.
+- Safety note:
+  - A follow-up attempt to directly evaluate simple `DEFMETHOD` forms was reverted because it broke CLOS bootstrap (`COMPUTE-DISCRIMINATING-FUNCTION did not return a function`), so `DEFMETHOD` remains the next optimization target and should use a semantics-preserving approach.
+
+Progress update (Feb 7 2026, safe DEFMETHOD fast expansion)
+--------------------------------------------------------------------------------
+
+- Added fast macro expansion for `COMMON-LISP:DEFMETHOD` in `src/eval.rs` via `try_fast_macro_expand`.
+- The fast path mirrors the Lisp macro shape and semantics:
+  - parses qualifiers and defmethod lambda-list/specializers in Rust,
+  - constructs equivalent `LET*` expansion with:
+    - `FBOUNDP`/`SYMBOL-FUNCTION`/`ENSURE-GENERIC-FUNCTION`,
+    - `ENSURE-METHOD` keyword arguments (`:lambda-list`, `:qualifiers`, `:specializers`, `:body`),
+    - `*USE-MAKE-METHOD-LAMBDA*` + `GENERIC-FUNCTION-METHODS` guard for `MAKE-METHOD-LAMBDA`.
+- Unsupported lambda-list shapes cleanly fall back to normal macro expansion.
+- Added tests in `src/eval.rs`:
+  - `test_expand_defmethod_fast_path_shape`
+  - `test_eval_defmethod_fast_path_with_qualifier`
+  - `cargo test -q` passes (104 core tests).
+- Macro timing impact (pathnames step harness):
+  - Before: `COMMON-LISP:DEFMETHOD` about `1560.3ms` total (`expand ~1500.5ms`, 37 hits).
+  - After: `COMMON-LISP:DEFMETHOD` about `45.5ms` total (`expand ~2.6ms`, 37 hits).
+- Runtime impact:
+  - Coarse load summary improved to about `1044ms` (`TREECL_DEBUG_LOAD_FILE_TIMING=1` run).
+  - Control run improved from about `3.19s` to about `1.39s`:
+    `timeout 120s target/debug/treecl /tmp/ansi_pathnames_step.lsp`.

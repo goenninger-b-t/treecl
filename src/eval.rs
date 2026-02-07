@@ -1129,6 +1129,9 @@ impl<'a> Interpreter<'a> {
             if self.is_common_lisp_cond_symbol(sym_id) {
                 return self.step_cond(args, env);
             }
+            if self.is_common_lisp_or_symbol(sym_id) {
+                return self.step_or(args, env);
+            }
         }
 
         // Handle CALL-METHOD when it is lexically bound.
@@ -1781,6 +1784,14 @@ impl<'a> Interpreter<'a> {
     fn step_cond(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
         self.process.current_env = Some(env.clone());
         let result = self.eval_cond(args, &env)?;
+        self.process.program = result;
+        self.process.execution_mode = crate::process::ExecutionMode::Return;
+        Ok(true)
+    }
+
+    fn step_or(&mut self, args: NodeId, env: Environment) -> Result<bool, ControlSignal> {
+        self.process.current_env = Some(env.clone());
+        let result = self.eval_or(args, &env)?;
         self.process.program = result;
         self.process.execution_mode = crate::process::ExecutionMode::Return;
         Ok(true)
@@ -3033,6 +3044,9 @@ impl<'a> Interpreter<'a> {
             if self.is_common_lisp_cond_symbol(sym_id) {
                 return self.eval_cond(args, env);
             }
+            if self.is_common_lisp_or_symbol(sym_id) {
+                return self.eval_or(args, env);
+            }
             // Check special forms
             let sf = &self.globals.special_forms;
             // 0. Check for macro expansion
@@ -4253,10 +4267,203 @@ impl<'a> Interpreter<'a> {
                 return Ok(Some(expanded));
             }
         }
+        if self.is_common_lisp_defmethod_symbol(sym) {
+            if let Some(expanded) = self.expand_common_lisp_defmethod(args)? {
+                return Ok(Some(expanded));
+            }
+        }
         if self.is_cl_test_signals_error_symbol(sym) {
             return Ok(Some(self.expand_cl_test_signals_error(args, env)?));
         }
         Ok(None)
+    }
+
+    fn expand_common_lisp_defmethod(
+        &mut self,
+        args: NodeId,
+    ) -> Result<Option<NodeId>, ControlSignal> {
+        let args_vec = self.cons_to_vec(args);
+        if args_vec.len() < 2 {
+            return Ok(None);
+        }
+
+        let name_node = args_vec[0];
+
+        // Parse qualifiers the same way as parse-defmethod-qualifiers:
+        // consume non-NIL symbols until the lambda-list starts.
+        let mut qualifiers = Vec::new();
+        let mut idx = 1usize;
+        while idx < args_vec.len() {
+            let arg = args_vec[idx];
+            let Some(_sym) = self.node_to_symbol(arg) else {
+                break;
+            };
+            if self.is_nil(arg) {
+                break;
+            }
+            qualifiers.push(arg);
+            idx += 1;
+        }
+
+        if idx >= args_vec.len() {
+            return Ok(None);
+        }
+        let lambda_list_node = args_vec[idx];
+        let body_nodes = &args_vec[idx + 1..];
+
+        let Some((clean_ll_node, specs_node)) =
+            self.parse_defmethod_lambda_list_fast(lambda_list_node)
+        else {
+            return Ok(None);
+        };
+        let qualifiers_node = self.process.make_list(&qualifiers);
+
+        let let_star_sym = self.ensure_cl_symbol("LET*");
+        let if_sym = self.ensure_cl_symbol("IF");
+        let and_sym = self.ensure_cl_symbol("AND");
+        let fboundp_sym = self.ensure_cl_symbol("FBOUNDP");
+        let symbol_function_sym = self.ensure_cl_symbol("SYMBOL-FUNCTION");
+        let ensure_generic_function_sym = self.ensure_cl_symbol("ENSURE-GENERIC-FUNCTION");
+        let function_sym = self.ensure_cl_symbol("FUNCTION");
+        let lambda_sym = self.ensure_cl_symbol("LAMBDA");
+        let ensure_method_sym = self.ensure_cl_symbol("ENSURE-METHOD");
+        let generic_function_methods_sym = self.ensure_cl_symbol("GENERIC-FUNCTION-METHODS");
+        let make_method_lambda_sym = self.ensure_cl_symbol("MAKE-METHOD-LAMBDA");
+        let use_make_method_lambda_sym = self.ensure_cl_symbol("*USE-MAKE-METHOD-LAMBDA*");
+        let gf_sym = self.ensure_cl_symbol("GF");
+        let fn_sym = self.ensure_cl_symbol("FN");
+        let kw_lambda_list_sym = self.ensure_keyword_symbol("LAMBDA-LIST");
+        let kw_qualifiers_sym = self.ensure_keyword_symbol("QUALIFIERS");
+        let kw_specializers_sym = self.ensure_keyword_symbol("SPECIALIZERS");
+        let kw_body_sym = self.ensure_keyword_symbol("BODY");
+
+        let let_star_node = self.sym_node(let_star_sym);
+        let if_node = self.sym_node(if_sym);
+        let and_node = self.sym_node(and_sym);
+        let fboundp_node = self.sym_node(fboundp_sym);
+        let symbol_function_node = self.sym_node(symbol_function_sym);
+        let ensure_generic_function_node = self.sym_node(ensure_generic_function_sym);
+        let function_node = self.sym_node(function_sym);
+        let lambda_node = self.sym_node(lambda_sym);
+        let ensure_method_node = self.sym_node(ensure_method_sym);
+        let generic_function_methods_node = self.sym_node(generic_function_methods_sym);
+        let make_method_lambda_node = self.sym_node(make_method_lambda_sym);
+        let use_make_method_lambda_node = self.sym_node(use_make_method_lambda_sym);
+        let gf_node = self.sym_node(gf_sym);
+        let fn_node = self.sym_node(fn_sym);
+        let kw_lambda_list_node = self.sym_node(kw_lambda_list_sym);
+        let kw_qualifiers_node = self.sym_node(kw_qualifiers_sym);
+        let kw_specializers_node = self.sym_node(kw_specializers_sym);
+        let kw_body_node = self.sym_node(kw_body_sym);
+
+        let quoted_name = self.make_quote_form(name_node);
+        let quoted_clean_ll = self.make_quote_form(clean_ll_node);
+        let quoted_qualifiers = self.make_quote_form(qualifiers_node);
+        let quoted_specs = self.make_quote_form(specs_node);
+
+        let fboundp_call = self.make_call_form(fboundp_node, &[quoted_name]);
+        let symbol_function_name = self.make_call_form(symbol_function_node, &[quoted_name]);
+        let ensure_generic_call = self.make_call_form(
+            ensure_generic_function_node,
+            &[quoted_name, kw_lambda_list_node, quoted_clean_ll],
+        );
+        let gf_init = self.make_call_form(if_node, &[fboundp_call, symbol_function_name, ensure_generic_call]);
+
+        let lambda_args = {
+            let mut v = Vec::with_capacity(1 + body_nodes.len());
+            v.push(clean_ll_node);
+            v.extend_from_slice(body_nodes);
+            v
+        };
+        let lambda_form = self.make_call_form(lambda_node, &lambda_args);
+        let fn_init = self.make_call_form(function_node, &[lambda_form]);
+
+        let gf_binding = self.process.make_list(&[gf_node, gf_init]);
+        let fn_binding = self.process.make_list(&[fn_node, fn_init]);
+        let bindings = self.process.make_list(&[gf_binding, fn_binding]);
+
+        let quoted_make_method_lambda = self.make_quote_form(make_method_lambda_node);
+        let make_method_symbol_fn =
+            self.make_call_form(symbol_function_node, &[quoted_make_method_lambda]);
+        let make_method_methods =
+            self.make_call_form(generic_function_methods_node, &[make_method_symbol_fn]);
+        let make_method_guard =
+            self.make_call_form(and_node, &[use_make_method_lambda_node, make_method_methods]);
+        let make_method_call = self.make_call_form(
+            make_method_lambda_node,
+            &[gf_node, self.process.make_nil(), fn_node, self.process.make_nil()],
+        );
+        let method_body = self.make_call_form(if_node, &[make_method_guard, make_method_call, fn_node]);
+
+        let ensure_method_call = self.make_call_form(
+            ensure_method_node,
+            &[
+                gf_node,
+                kw_lambda_list_node,
+                quoted_clean_ll,
+                kw_qualifiers_node,
+                quoted_qualifiers,
+                kw_specializers_node,
+                quoted_specs,
+                kw_body_node,
+                method_body,
+            ],
+        );
+
+        Ok(Some(
+            self.make_call_form(let_star_node, &[bindings, ensure_method_call]),
+        ))
+    }
+
+    fn parse_defmethod_lambda_list_fast(&mut self, lambda_list: NodeId) -> Option<(NodeId, NodeId)> {
+        let mut clean_ll = Vec::new();
+        let mut specs = Vec::new();
+        let mut current = lambda_list;
+
+        loop {
+            match self.process.arena.get_unchecked(current).clone() {
+                Node::Leaf(OpaqueValue::Nil) => {
+                    return Some((self.process.make_list(&clean_ll), self.process.make_list(&specs)));
+                }
+                Node::Fork(arg, rest) => {
+                    if let Some(sym) = self.node_to_symbol(arg) {
+                        if self.is_defmethod_lambda_keyword(sym) {
+                            let mut clean_with_tail = clean_ll;
+                            clean_with_tail.extend(self.cons_to_vec(current));
+                            return Some((
+                                self.process.make_list(&clean_with_tail),
+                                self.process.make_list(&specs),
+                            ));
+                        }
+                    }
+
+                    match self.process.arena.get_unchecked(arg).clone() {
+                        Node::Fork(param_name, param_tail) => {
+                            clean_ll.push(param_name);
+                            let spec = match self.process.arena.get_unchecked(param_tail).clone() {
+                                Node::Fork(spec, _) => spec,
+                                _ => self.process.make_nil(),
+                            };
+                            specs.push(spec);
+                        }
+                        _ => {
+                            clean_ll.push(arg);
+                            specs.push(self.sym_node(self.globals.t_sym));
+                        }
+                    }
+
+                    current = rest;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    fn is_defmethod_lambda_keyword(&mut self, sym: SymbolId) -> bool {
+        sym == self.ensure_cl_symbol("&OPTIONAL")
+            || sym == self.ensure_cl_symbol("&REST")
+            || sym == self.ensure_cl_symbol("&KEY")
+            || sym == self.ensure_cl_symbol("&AUX")
     }
 
     fn expand_common_lisp_setf(&mut self, args: NodeId) -> Result<Option<NodeId>, ControlSignal> {
@@ -4271,25 +4478,99 @@ impl<'a> Interpreter<'a> {
             return Ok(Some(self.make_call_form(error_node, &[msg])));
         }
 
-        let mut setq_forms = Vec::new();
-        let setq_sym = self.globals.special_forms.setq;
-        let setq_node = self.sym_node(setq_sym);
+        let mut assignment_forms = Vec::new();
         for pair in args_vec.chunks_exact(2) {
-            if self.node_to_symbol(pair[0]).is_none() {
+            let Some(assignment) = self.expand_common_lisp_setf_assignment(pair[0], pair[1])? else {
                 return Ok(None);
-            }
-            let pair_list = self.process.make_list(pair);
-            setq_forms.push(self.process.arena.inner.alloc(Node::Fork(setq_node, pair_list)));
+            };
+            assignment_forms.push(assignment);
         }
 
-        if setq_forms.len() == 1 {
-            return Ok(Some(setq_forms[0]));
+        if assignment_forms.len() == 1 {
+            return Ok(Some(assignment_forms[0]));
         }
 
         let progn_sym = self.globals.special_forms.progn;
         let progn_node = self.sym_node(progn_sym);
-        let body_list = self.process.make_list(&setq_forms);
+        let body_list = self.process.make_list(&assignment_forms);
         Ok(Some(self.process.arena.inner.alloc(Node::Fork(progn_node, body_list))))
+    }
+
+    fn expand_common_lisp_setf_assignment(
+        &mut self,
+        place: NodeId,
+        value: NodeId,
+    ) -> Result<Option<NodeId>, ControlSignal> {
+        if let Some(_) = self.node_to_symbol(place) {
+            let setq_sym = self.globals.special_forms.setq;
+            let setq_node = self.sym_node(setq_sym);
+            let pair_list = self.process.make_list(&[place, value]);
+            return Ok(Some(self.process.arena.inner.alloc(Node::Fork(setq_node, pair_list))));
+        }
+
+        let (op_node, place_args_node) = match self.process.arena.get_unchecked(place).clone() {
+            Node::Fork(op, place_args) => (op, place_args),
+            _ => return Ok(None),
+        };
+        let Some(op_sym) = self.node_to_symbol(op_node) else {
+            return Ok(None);
+        };
+        let op_name = {
+            let symbols = self.globals.symbols.read().unwrap();
+            symbols.symbol_name(op_sym).unwrap_or("").to_string()
+        };
+        let place_args = self.cons_to_vec(place_args_node);
+
+        let writer_call = match op_name.as_str() {
+            "CAR" if place_args.len() == 1 => {
+                let writer_sym = self.ensure_cl_symbol("RPLACA");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], value])
+            }
+            "CDR" if place_args.len() == 1 => {
+                let writer_sym = self.ensure_cl_symbol("RPLACD");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], value])
+            }
+            "GETHASH" if place_args.len() >= 2 => {
+                let writer_sym = self.ensure_cl_symbol("SET-GETHASH");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], place_args[1], value])
+            }
+            "READTABLE-CASE" if place_args.len() == 1 => {
+                let writer_sym = self.ensure_cl_symbol("SET-READTABLE-CASE");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], value])
+            }
+            "SLOT-VALUE" if place_args.len() == 2 => {
+                let writer_sym = self.ensure_cl_symbol("SET-SLOT-VALUE");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], place_args[1], value])
+            }
+            "FUNCALLABLE-STANDARD-INSTANCE-ACCESS" if place_args.len() == 2 => {
+                let writer_sym =
+                    self.ensure_cl_symbol("SET-FUNCALLABLE-STANDARD-INSTANCE-ACCESS");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], place_args[1], value])
+            }
+            "SYMBOL-VALUE" if place_args.len() == 1 => {
+                let writer_sym = self.ensure_cl_symbol("SET");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], value])
+            }
+            "GET" if place_args.len() == 2 => {
+                let writer_sym = self.ensure_cl_symbol("PUT");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], place_args[1], value])
+            }
+            "LOGICAL-PATHNAME-TRANSLATIONS" if place_args.len() == 1 => {
+                let writer_sym = self.ensure_cl_symbol("SET-LOGICAL-PATHNAME-TRANSLATIONS");
+                let writer = self.sym_node(writer_sym);
+                self.make_call_form(writer, &[place_args[0], value])
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(writer_call))
     }
 
     fn is_cl_test_signals_error_symbol(&self, sym: SymbolId) -> bool {
@@ -4300,12 +4581,20 @@ impl<'a> Interpreter<'a> {
         self.is_symbol_named_in_package(sym, "COMMON-LISP", "SETF")
     }
 
+    fn is_common_lisp_defmethod_symbol(&self, sym: SymbolId) -> bool {
+        self.is_symbol_named_in_package(sym, "COMMON-LISP", "DEFMETHOD")
+    }
+
     fn is_common_lisp_let_star_symbol(&self, sym: SymbolId) -> bool {
         self.is_symbol_named_in_package(sym, "COMMON-LISP", "LET*")
     }
 
     fn is_common_lisp_cond_symbol(&self, sym: SymbolId) -> bool {
         self.is_symbol_named_in_package(sym, "COMMON-LISP", "COND")
+    }
+
+    fn is_common_lisp_or_symbol(&self, sym: SymbolId) -> bool {
+        self.is_symbol_named_in_package(sym, "COMMON-LISP", "OR")
     }
 
     fn is_symbol_named_in_package(&self, sym: SymbolId, pkg_name: &str, symbol_name: &str) -> bool {
@@ -4914,6 +5203,32 @@ impl<'a> Interpreter<'a> {
                     }
                 }
                 _ => return Err(ControlSignal::Error("COND: malformed clause list".into())),
+            }
+        }
+    }
+
+    /// (or form*) -> left-to-right short-circuit
+    fn eval_or(&mut self, args: NodeId, env: &Environment) -> EvalResult {
+        let mut current = args;
+        loop {
+            match self.process.arena.get_unchecked(current).clone() {
+                Node::Leaf(OpaqueValue::Nil) => return Ok(self.process.make_nil()),
+                Node::Fork(form, rest) => {
+                    let value = self.eval(form, env)?;
+                    if self.is_nil(value) {
+                        current = rest;
+                        continue;
+                    }
+                    if let Node::Leaf(OpaqueValue::Nil) = self.process.arena.get_unchecked(rest) {
+                        return Ok(value);
+                    }
+                    // Match macro semantics `(let ((g first)) (if g g ...))`:
+                    // only the primary value is propagated for non-final winning forms.
+                    self.process.values_are_set = false;
+                    self.process.values.clear();
+                    return Ok(value);
+                }
+                _ => return Err(ControlSignal::Error("OR: malformed argument list".into())),
             }
         }
     }
@@ -7203,6 +7518,61 @@ mod tests {
     }
 
     #[test]
+    fn test_expand_defmethod_fast_path_shape() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let form = read_from_string(
+            "(defmethod dm-fast-shape ((x t)) x)",
+            &mut proc.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let args = match proc.arena.inner.get_unchecked(form) {
+            Node::Fork(_, tail) => *tail,
+            other => panic!("Expected defmethod form, got {:?}", other),
+        };
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let expanded = interpreter
+            .expand_common_lisp_defmethod(args)
+            .expect("defmethod fast expansion should not error")
+            .expect("defmethod fast expansion should produce a form");
+        let printed = {
+            let syms = globals.symbols.read().unwrap();
+            crate::printer::print_to_string(&interpreter.process.arena.inner, &syms, expanded)
+        };
+        assert!(printed.contains("LET*"));
+        assert!(printed.contains("ENSURE-METHOD"));
+        assert!(printed.contains(":SPECIALIZERS"));
+    }
+
+    #[test]
+    fn test_eval_defmethod_fast_path_with_qualifier() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(progn
+               (defgeneric dm-fast-qual (x))
+               (defmethod dm-fast-qual ((x t)) 10)
+               (defmethod dm-fast-qual :around ((x t)) (+ 1 (call-next-method)))
+               (dm-fast-qual 0))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 11),
+            other => panic!("Expected 11, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_setf_fast_path_symbol_places() {
         let (mut proc, globals) = setup_env();
         load_init_lisp(&mut proc, &globals);
@@ -7221,7 +7591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_setf_fast_path_falls_back_for_places() {
+    fn test_setf_fast_path_handles_car_place() {
         let (mut proc, globals) = setup_env();
         load_init_lisp(&mut proc, &globals);
 
@@ -7239,6 +7609,97 @@ mod tests {
             Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 9),
             other => panic!("Expected 9, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_setf_fast_path_handles_gethash_get_and_symbol_value() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr_hash = read_from_string(
+            "(let ((h (make-hash-table)) (k (cons 1 nil))) (setf (gethash k h) 5) (gethash k h))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let hash_result = interpreter.eval(expr_hash, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(hash_result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 5),
+            other => panic!("Expected hash result 5, got {:?}", other),
+        }
+
+        let expr_get = read_from_string(
+            "(let ((s (gensym))) (setf (get s 'k) 9) (get s 'k))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let get_result = interpreter.eval(expr_get, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(get_result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 9),
+            other => panic!("Expected property result 9, got {:?}", other),
+        }
+
+        let expr_symbol_value = read_from_string(
+            "(progn (setf (symbol-value 'zz-fast-path) 12) (symbol-value 'zz-fast-path))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let symbol_value_result = interpreter.eval(expr_symbol_value, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(symbol_value_result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 12),
+            other => panic!("Expected symbol-value result 12, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_setf_fast_path_handles_logical_pathname_translations_place() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(progn
+               (setf (logical-pathname-translations \"TLPFAST\")
+                     '((\"**;*.*.*\" \"tmp/logical-fast/**/*.*\")))
+               (namestring (translate-logical-pathname \"TLPFAST:foo;bar.txt\")))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        let out = match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::String(s)) => s.clone(),
+            other => panic!("Expected translated namestring, got {:?}", other),
+        };
+        let normalized = out.replace('\\', "/");
+        assert!(normalized.contains("tmp/logical-fast"));
+        assert!(normalized.ends_with("foo/bar.txt"));
+    }
+
+    #[test]
+    fn test_setf_fast_path_unknown_place_returns_none() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+
+        let place = read_from_string(
+            "(foo x)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let value = interpreter.process.make_integer(1);
+        let expanded = interpreter
+            .expand_common_lisp_setf_assignment(place, value)
+            .expect("setf assignment expansion failed");
+        assert!(expanded.is_none(), "unsupported place should fall back to macro body");
     }
 
     #[test]
@@ -7323,6 +7784,45 @@ mod tests {
             Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 5),
             other => panic!("Expected 5, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_eval_or_direct_handling() {
+        let (mut proc, globals) = setup_env();
+        load_init_lisp(&mut proc, &globals);
+
+        let mut interpreter = Interpreter::new(&mut proc, &globals);
+        let env = Environment::new();
+
+        let expr = read_from_string(
+            "(or nil nil 7)",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result = interpreter.eval(expr, &env).unwrap();
+        match interpreter.process.arena.inner.get_unchecked(result) {
+            Node::Leaf(OpaqueValue::Integer(n)) => assert_eq!(*n, 7),
+            other => panic!("Expected 7, got {:?}", other),
+        }
+
+        let expr2 = read_from_string(
+            "(multiple-value-list (or (values 1 2) 9))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result2 = interpreter.eval(expr2, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result2), vec![1]);
+
+        let expr3 = read_from_string(
+            "(multiple-value-list (or nil (values 3 4)))",
+            &mut interpreter.process.arena.inner,
+            &mut *globals.symbols.write().unwrap(),
+        )
+        .unwrap();
+        let result3 = interpreter.eval(expr3, &env).unwrap();
+        assert_eq!(list_to_ints(&interpreter.process, result3), vec![3, 4]);
     }
 
     #[test]

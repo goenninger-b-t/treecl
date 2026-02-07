@@ -878,6 +878,24 @@ pub fn register_primitives(globals: &mut crate::context::GlobalContext) {
     globals.register_primitive("DIRECTORY-NAMESTRING", cl, prim_directory_namestring);
     globals.register_primitive("TRUENAME", cl, prim_truename);
     globals.register_primitive("COMPILE-FILE-PATHNAME", cl, prim_compile_file_pathname);
+    globals.register_primitive("LOGICAL-PATHNAME", cl, prim_logical_pathname);
+    globals.register_primitive("TRANSLATE-LOGICAL-PATHNAME", cl, prim_translate_logical_pathname);
+    globals.register_primitive("TRANSLATE-PATHNAME", cl, prim_translate_pathname);
+    globals.register_primitive(
+        "LOGICAL-PATHNAME-TRANSLATIONS",
+        cl,
+        prim_logical_pathname_translations,
+    );
+    globals.register_primitive(
+        "SET-LOGICAL-PATHNAME-TRANSLATIONS",
+        cl,
+        prim_set_logical_pathname_translations,
+    );
+    globals.register_primitive(
+        "LOAD-LOGICAL-PATHNAME-TRANSLATIONS",
+        cl,
+        prim_load_logical_pathname_translations,
+    );
     globals.register_primitive("STRING-EQUAL", cl, prim_string_equal);
     globals.register_primitive("ASSERT", cl, prim_assert);
 
@@ -1516,20 +1534,8 @@ fn prim_load(
     args: &[NodeId],
 ) -> EvalResult {
     if let Some(&arg) = args.first() {
-        // Extract filename string
-        // Arg should be evaluated (string or symbol)
-        let mut filename = match proc.arena.inner.get_unchecked(arg) {
-            Node::Leaf(OpaqueValue::String(s)) => s.clone(),
-            // If it's a symbol, use name?
-            Node::Leaf(OpaqueValue::Symbol(id)) => ctx
-                .symbols
-                .read()
-                .unwrap()
-                .symbol_name(SymbolId(*id))
-                .unwrap_or("")
-                .to_string(),
-            _ => return err_helper("LOAD: filename must be string or symbol"),
-        };
+        let mut filename = path_from_designator(proc, ctx, arg, "LOAD")?;
+        filename = translate_logical_path_minimal(proc, &filename)?;
 
         // If relative with no explicit directory, try default pathname defaults or load pathname.
         if !filename.contains('/') && !filename.contains('\\') {
@@ -1836,21 +1842,496 @@ fn prim_load(
     }
 }
 
-fn translate_logical_path_minimal(path: &str) -> String {
-    let upper = path.to_uppercase();
-    let prefix = "ANSI-TESTS:";
-    if upper.starts_with(prefix) {
-        let rest = &path[prefix.len()..];
-        let rest_upper = rest.to_uppercase();
-        let mut mapped = if rest_upper.starts_with("AUX;") && rest.len() >= 4 {
-            format!("tests/ansi-test/auxiliary/{}", &rest[4..])
-        } else {
-            format!("tests/ansi-test/{}", rest)
-        };
-        mapped = mapped.replace(';', "/");
-        return mapped.to_lowercase();
+#[derive(Default, Clone)]
+struct DirectoryMatchCaptures {
+    singles: Vec<String>,
+    inferiors: Vec<String>,
+}
+
+#[derive(Default, Clone)]
+struct PathnameMatchCaptures {
+    host: Option<String>,
+    device: Option<String>,
+    directory: DirectoryMatchCaptures,
+    name: Option<String>,
+    type_: Option<String>,
+    version: Option<String>,
+}
+
+fn normalize_logical_host(host: &str) -> String {
+    host.trim().trim_end_matches(':').to_uppercase()
+}
+
+fn logical_wild_token(text: &str) -> bool {
+    text == "*" || text.eq_ignore_ascii_case("WILD")
+}
+
+fn logical_wild_inferiors_token(text: &str) -> bool {
+    text == "**" || text.eq_ignore_ascii_case("WILD-INFERIORS")
+}
+
+fn glob_match_case(pattern: &str, text: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        glob_match(&pattern.to_uppercase(), &text.to_uppercase())
+    } else {
+        glob_match(pattern, text)
     }
-    path.to_string()
+}
+
+fn match_component_capture(
+    actual: Option<&str>,
+    pattern: Option<&str>,
+    case_insensitive: bool,
+) -> Option<Option<String>> {
+    let Some(pattern) = pattern else {
+        return if actual.is_none() { Some(None) } else { None };
+    };
+
+    if logical_wild_token(pattern) {
+        return Some(actual.map(|s| s.to_string()));
+    }
+    if logical_wild_inferiors_token(pattern) {
+        return Some(actual.map(|s| s.to_string()));
+    }
+    let Some(actual) = actual else {
+        return None;
+    };
+    if pattern.contains('*') || pattern.contains('?') {
+        return if glob_match_case(pattern, actual, case_insensitive) {
+            Some(Some(actual.to_string()))
+        } else {
+            None
+        };
+    }
+
+    let matched = if case_insensitive {
+        actual.eq_ignore_ascii_case(pattern)
+    } else {
+        actual == pattern
+    };
+    if matched {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+fn match_directory_component(
+    actual: &str,
+    pattern: &str,
+    case_insensitive: bool,
+) -> Option<Option<String>> {
+    if logical_wild_token(pattern) || logical_wild_inferiors_token(pattern) {
+        return Some(Some(actual.to_string()));
+    }
+    if pattern.contains('*') || pattern.contains('?') {
+        return if glob_match_case(pattern, actual, case_insensitive) {
+            Some(Some(actual.to_string()))
+        } else {
+            None
+        };
+    }
+    let matched = if case_insensitive {
+        actual.eq_ignore_ascii_case(pattern)
+    } else {
+        actual == pattern
+    };
+    if matched {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+fn match_directory_capture(
+    actual: Option<&crate::pathname::PathnameDirectory>,
+    pattern: Option<&crate::pathname::PathnameDirectory>,
+    case_insensitive: bool,
+) -> Option<DirectoryMatchCaptures> {
+    let Some(pattern) = pattern else {
+        return if actual.is_none() || actual.is_some_and(|d| d.components.is_empty()) {
+            Some(DirectoryMatchCaptures::default())
+        } else {
+            None
+        };
+    };
+
+    let actual_absolute = actual.map(|d| d.absolute).unwrap_or(false);
+    if actual_absolute != pattern.absolute {
+        return None;
+    }
+
+    let empty = Vec::new();
+    let actual_components = actual.map(|d| &d.components).unwrap_or(&empty);
+    let pattern_components = &pattern.components;
+    let mut captures = DirectoryMatchCaptures::default();
+
+    if let Some(idx) = pattern_components
+        .iter()
+        .position(|c| logical_wild_inferiors_token(c))
+    {
+        let prefix = &pattern_components[..idx];
+        let suffix = &pattern_components[idx + 1..];
+        if actual_components.len() < prefix.len() + suffix.len() {
+            return None;
+        }
+
+        for (actual_comp, pattern_comp) in actual_components.iter().zip(prefix.iter()) {
+            let capture = match_directory_component(actual_comp, pattern_comp, case_insensitive)?;
+            if let Some(c) = capture {
+                captures.singles.push(c);
+            }
+        }
+
+        let suffix_start = actual_components.len() - suffix.len();
+        captures
+            .inferiors
+            .extend(actual_components[prefix.len()..suffix_start].iter().cloned());
+
+        for (actual_comp, pattern_comp) in actual_components[suffix_start..]
+            .iter()
+            .zip(suffix.iter())
+        {
+            let capture = match_directory_component(actual_comp, pattern_comp, case_insensitive)?;
+            if let Some(c) = capture {
+                captures.singles.push(c);
+            }
+        }
+
+        return Some(captures);
+    }
+
+    if actual_components.len() != pattern_components.len() {
+        return None;
+    }
+
+    for (actual_comp, pattern_comp) in actual_components.iter().zip(pattern_components.iter()) {
+        let capture = match_directory_component(actual_comp, pattern_comp, case_insensitive)?;
+        if let Some(c) = capture {
+            captures.singles.push(c);
+        }
+    }
+    Some(captures)
+}
+
+fn apply_component_template(template: Option<&String>, capture: &Option<String>) -> Option<String> {
+    let Some(template) = template else {
+        return None;
+    };
+
+    if logical_wild_token(template) || logical_wild_inferiors_token(template) {
+        return capture.clone();
+    }
+
+    if template.contains('*') {
+        if let Some(cap) = capture {
+            return Some(template.replace('*', cap));
+        }
+    }
+
+    Some(template.clone())
+}
+
+fn apply_directory_template(
+    template: Option<&crate::pathname::PathnameDirectory>,
+    captures: &DirectoryMatchCaptures,
+) -> Option<crate::pathname::PathnameDirectory> {
+    let Some(template) = template else {
+        return None;
+    };
+
+    let mut components = Vec::new();
+    let mut next_single = 0usize;
+    for comp in &template.components {
+        if logical_wild_inferiors_token(comp) {
+            components.extend(captures.inferiors.iter().cloned());
+            continue;
+        }
+
+        if logical_wild_token(comp) {
+            if let Some(c) = captures.singles.get(next_single) {
+                components.push(c.clone());
+                next_single += 1;
+                continue;
+            }
+        } else if comp.contains('*') {
+            if let Some(c) = captures.singles.get(next_single) {
+                components.push(comp.replace('*', c));
+                next_single += 1;
+                continue;
+            }
+        }
+        components.push(comp.clone());
+    }
+
+    if components.is_empty() && !template.absolute {
+        None
+    } else {
+        Some(crate::pathname::PathnameDirectory {
+            absolute: template.absolute,
+            components,
+        })
+    }
+}
+
+fn build_namestring_from_components(
+    host: Option<&String>,
+    directory: Option<&crate::pathname::PathnameDirectory>,
+    name: Option<&String>,
+    type_: Option<&String>,
+    version: Option<&String>,
+) -> String {
+    if host.is_some() {
+        let mut out = String::new();
+        if let Some(host) = host {
+            out.push_str(host);
+        }
+        out.push(':');
+
+        if let Some(dir) = directory {
+            if dir.absolute {
+                out.push(';');
+            }
+            for comp in &dir.components {
+                out.push_str(comp);
+                out.push(';');
+            }
+        }
+
+        if let Some(name) = name {
+            out.push_str(name);
+        }
+        if let Some(type_) = type_ {
+            if name.is_some() {
+                out.push('.');
+            } else {
+                out.push_str("*.");
+            }
+            out.push_str(type_);
+        }
+        if let Some(version) = version {
+            if name.is_some() || type_.is_some() {
+                out.push('.');
+            } else {
+                out.push_str("*.*.");
+            }
+            out.push_str(version);
+        }
+        return out;
+    }
+
+    let sep = std::path::MAIN_SEPARATOR;
+    let mut out = String::new();
+    if let Some(dir) = directory {
+        if dir.absolute {
+            out.push(sep);
+        }
+        if !dir.components.is_empty() {
+            out.push_str(&dir.components.join(&sep.to_string()));
+        }
+    }
+
+    let mut file = String::new();
+    if let Some(name) = name {
+        file.push_str(name);
+    }
+    if let Some(type_) = type_ {
+        if !file.is_empty() {
+            file.push('.');
+        }
+        file.push_str(type_);
+    }
+    if let Some(version) = version {
+        if !file.is_empty() {
+            file.push('.');
+        }
+        file.push_str(version);
+    }
+
+    if !file.is_empty() {
+        if !out.is_empty() && !out.ends_with(sep) {
+            out.push(sep);
+        }
+        out.push_str(&file);
+    } else if out.is_empty() {
+        out.push('.');
+    }
+
+    out
+}
+
+fn translate_pathname_with_wildcards(
+    source: &Pathname,
+    from_wildname: &Pathname,
+    to_wildname: &Pathname,
+) -> Option<Pathname> {
+    let case_insensitive = source.host.is_some() || from_wildname.host.is_some();
+    let mut captures = PathnameMatchCaptures::default();
+
+    captures.host = match_component_capture(
+        source.host.as_deref(),
+        from_wildname.host.as_deref(),
+        true,
+    )?;
+    captures.device = match_component_capture(
+        source.device.as_deref(),
+        from_wildname.device.as_deref(),
+        case_insensitive,
+    )?;
+    captures.directory = match_directory_capture(
+        source.directory.as_ref(),
+        from_wildname.directory.as_ref(),
+        case_insensitive,
+    )?;
+    captures.name = match_component_capture(
+        source.name.as_deref(),
+        from_wildname.name.as_deref(),
+        case_insensitive,
+    )?;
+    captures.type_ = match_component_capture(
+        source.type_.as_deref(),
+        from_wildname.type_.as_deref(),
+        case_insensitive,
+    )?;
+    captures.version = match_component_capture(
+        source.version.as_deref(),
+        from_wildname.version.as_deref(),
+        case_insensitive,
+    )?;
+
+    let host = apply_component_template(to_wildname.host.as_ref(), &captures.host)
+        .map(|s| normalize_logical_host(&s));
+    let device = apply_component_template(to_wildname.device.as_ref(), &captures.device);
+    let directory = apply_directory_template(to_wildname.directory.as_ref(), &captures.directory);
+    let name = apply_component_template(to_wildname.name.as_ref(), &captures.name);
+    let type_ = apply_component_template(to_wildname.type_.as_ref(), &captures.type_);
+    let version = apply_component_template(to_wildname.version.as_ref(), &captures.version);
+
+    let namestring = build_namestring_from_components(
+        host.as_ref(),
+        directory.as_ref(),
+        name.as_ref(),
+        type_.as_ref(),
+        version.as_ref(),
+    );
+    let mut pn = Pathname::from_namestring(&namestring);
+    pn.host = host;
+    pn.device = device;
+    pn.directory = directory;
+    pn.name = name;
+    pn.type_ = type_;
+    pn.version = version;
+    Some(pn)
+}
+
+fn make_builtin_translation_rule(host: &str, from: &str, to: &str) -> (Pathname, Pathname) {
+    let mut from_pn = Pathname::from_namestring(from);
+    from_pn.host = Some(host.to_string());
+    let to_pn = Pathname::from_namestring(to);
+    (from_pn, to_pn)
+}
+
+fn builtin_logical_pathname_translations(host: &str) -> Option<Vec<(Pathname, Pathname)>> {
+    match host {
+        "ANSI-TESTS" => Some(vec![
+            make_builtin_translation_rule("ANSI-TESTS", "AUX;**;*.*.*", "tests/ansi-test/auxiliary/**/*.*"),
+            make_builtin_translation_rule("ANSI-TESTS", "**;*.*.*", "tests/ansi-test/**/*.*"),
+        ]),
+        "CLTESTROOT" => Some(vec![make_builtin_translation_rule(
+            "CLTESTROOT",
+            "**;*.*.*",
+            "tests/ansi-test/**/*.*",
+        )]),
+        "CLTEST" => Some(vec![make_builtin_translation_rule(
+            "CLTEST",
+            "**;*.*.*",
+            "tests/ansi-test/sandbox/**/*.*",
+        )]),
+        _ => None,
+    }
+}
+
+fn ensure_logical_translations_loaded(
+    proc: &mut Process,
+    host: &str,
+) -> Result<(), ControlSignal> {
+    if proc.logical_pathname_translations.contains_key(host) {
+        return Ok(());
+    }
+    if let Some(rules) = builtin_logical_pathname_translations(host) {
+        proc.logical_pathname_translations
+            .insert(host.to_string(), rules);
+        return Ok(());
+    }
+    Err(ControlSignal::Error(
+        "LOAD-LOGICAL-PATHNAME-TRANSLATIONS: no translations found for host".to_string(),
+    ))
+}
+
+fn translate_logical_pathname_with_tables(
+    proc: &mut Process,
+    pathname: &Pathname,
+    depth: usize,
+) -> Result<Pathname, ControlSignal> {
+    if depth > 16 {
+        return Err(ControlSignal::Error(
+            "TRANSLATE-LOGICAL-PATHNAME: translation recursion limit exceeded".to_string(),
+        ));
+    }
+
+    let Some(host_raw) = pathname.host.as_ref() else {
+        return Ok(pathname.clone());
+    };
+    let host = normalize_logical_host(host_raw);
+    ensure_logical_translations_loaded(proc, &host).map_err(|_| {
+        ControlSignal::Error("TRANSLATE-LOGICAL-PATHNAME: no translation defined for host".to_string())
+    })?;
+
+    let rules = proc
+        .logical_pathname_translations
+        .get(&host)
+        .cloned()
+        .unwrap_or_default();
+
+    for (from_wildname, to_wildname) in rules {
+        if let Some(mapped) = translate_pathname_with_wildcards(pathname, &from_wildname, &to_wildname) {
+            if mapped.host.is_some() {
+                if mapped.host.as_ref().is_some_and(|h| normalize_logical_host(h) == host)
+                    && mapped.namestring() == pathname.namestring()
+                {
+                    return Err(ControlSignal::Error(
+                        "TRANSLATE-LOGICAL-PATHNAME: translation cycle detected".to_string(),
+                    ));
+                }
+                return translate_logical_pathname_with_tables(proc, &mapped, depth + 1);
+            }
+            return Ok(mapped);
+        }
+    }
+
+    Err(ControlSignal::Error(
+        "TRANSLATE-LOGICAL-PATHNAME: no translation defined for host".to_string(),
+    ))
+}
+
+fn translate_logical_path_minimal(
+    proc: &mut Process,
+    path: &str,
+) -> Result<String, ControlSignal> {
+    if !Pathname::has_logical_syntax(path) {
+        return Ok(path.to_string());
+    }
+    let pathname = Pathname::from_namestring(path);
+    if pathname.host.is_none() {
+        return Ok(path.to_string());
+    }
+    let translated = translate_logical_pathname_with_tables(proc, &pathname, 0)?;
+    if translated.host.is_some() {
+        return Err(ControlSignal::Error(
+            "Logical pathname translation did not produce a physical pathname".to_string(),
+        ));
+    }
+    Ok(translated.namestring().to_string())
 }
 
 fn prim_load_and_compile_minimal(
@@ -1866,7 +2347,7 @@ fn prim_load_and_compile_minimal(
         ControlSignal::Error("LOAD-AND-COMPILE-MINIMAL: invalid pathspec".to_string())
     })?;
 
-    path = translate_logical_path_minimal(&path);
+    path = translate_logical_path_minimal(proc, &path)?;
 
     if !path.contains('/') && !path.contains('\\') {
         let load_pn_sym = ctx
@@ -2256,6 +2737,268 @@ fn prim_namestring(
     } else {
         Ok(proc.make_nil())
     }
+}
+
+fn prim_logical_pathname(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("LOGICAL-PATHNAME requires exactly 1 argument");
+    }
+    let mut pn = pathname_from_designator(proc, ctx, args[0], "LOGICAL-PATHNAME")?;
+    if pn.host.is_none() || pn.namestring.contains('%') {
+        return Err(ControlSignal::Error(
+            "LOGICAL-PATHNAME: argument is not a logical pathname designator".to_string(),
+        ));
+    }
+    if let Some(host) = pn.host.as_ref() {
+        pn.host = Some(normalize_logical_host(host));
+    }
+    Ok(alloc_pathname(proc, pn))
+}
+
+fn logical_host_from_designator(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    node: NodeId,
+    label: &str,
+) -> Result<String, ControlSignal> {
+    let host = string_from_designator(proc, ctx, node).ok_or_else(|| {
+        ControlSignal::Error(format!("{}: host must be a string designator", label))
+    })?;
+    let normalized = normalize_logical_host(&host);
+    if normalized.is_empty() {
+        return Err(ControlSignal::Error(format!("{}: invalid host designator", label)));
+    }
+    Ok(normalized)
+}
+
+fn parse_allow_other_keys_tail(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+    label: &str,
+) -> Result<(), ControlSignal> {
+    let mut allow_other_keys = false;
+    let mut unknown_key_seen = false;
+    if args.is_empty() {
+        return Ok(());
+    }
+    if args.len() % 2 != 0 {
+        return Err(ControlSignal::Error(format!(
+            "{}: odd number of keyword arguments",
+            label
+        )));
+    }
+    for pair in args.chunks(2) {
+        let key_sym = node_to_symbol(proc, pair[0]).ok_or_else(|| {
+            ControlSignal::Error(format!("{}: keyword must be a symbol", label))
+        })?;
+        let key_name = ctx
+            .symbols
+            .read()
+            .unwrap()
+            .symbol_name(key_sym)
+            .unwrap_or("")
+            .to_uppercase();
+        if key_name == "ALLOW-OTHER-KEYS" {
+            if !allow_other_keys {
+                allow_other_keys = !node_is_nil(proc, pair[1]);
+            }
+        } else {
+            unknown_key_seen = true;
+        }
+    }
+    if unknown_key_seen && !allow_other_keys {
+        return Err(ControlSignal::Error(format!(
+            "{}: invalid keyword argument",
+            label
+        )));
+    }
+    Ok(())
+}
+
+fn parse_logical_translation_rules(
+    proc: &Process,
+    ctx: &crate::context::GlobalContext,
+    host: &str,
+    value: NodeId,
+) -> Result<Vec<(Pathname, Pathname)>, ControlSignal> {
+    if node_is_nil(proc, value) {
+        return Ok(Vec::new());
+    }
+    let rows = list_to_vec_opt(proc, value).ok_or_else(|| {
+        ControlSignal::Error(
+            "LOGICAL-PATHNAME-TRANSLATIONS: value must be a list of translation pairs".to_string(),
+        )
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let pair = list_to_vec_opt(proc, row).ok_or_else(|| {
+            ControlSignal::Error(
+                "LOGICAL-PATHNAME-TRANSLATIONS: each translation must be a proper list".to_string(),
+            )
+        })?;
+        if pair.len() < 2 {
+            return Err(ControlSignal::Error(
+                "LOGICAL-PATHNAME-TRANSLATIONS: each translation must have FROM and TO".to_string(),
+            ));
+        }
+
+        let mut from = pathname_from_designator(
+            proc,
+            ctx,
+            pair[0],
+            "LOGICAL-PATHNAME-TRANSLATIONS",
+        )?;
+        if from.host.is_none() {
+            from.host = Some(host.to_string());
+        } else if from
+            .host
+            .as_ref()
+            .is_some_and(|h| normalize_logical_host(h) != host)
+        {
+            return Err(ControlSignal::Error(
+                "LOGICAL-PATHNAME-TRANSLATIONS: FROM host does not match table host".to_string(),
+            ));
+        } else {
+            from.host = Some(host.to_string());
+        }
+
+        let to = pathname_from_designator(
+            proc,
+            ctx,
+            pair[1],
+            "LOGICAL-PATHNAME-TRANSLATIONS",
+        )?;
+        out.push((from, to));
+    }
+    Ok(out)
+}
+
+fn logical_translation_rules_to_list(
+    proc: &mut Process,
+    rules: &[(Pathname, Pathname)],
+) -> NodeId {
+    let mut list = proc.make_nil();
+    for (from, to) in rules.iter().rev() {
+        let from_node = alloc_pathname(proc, from.clone());
+        let to_node = alloc_pathname(proc, to.clone());
+        let pair = proc.make_list(&[from_node, to_node]);
+        list = proc.arena.inner.alloc(Node::Fork(pair, list));
+    }
+    list
+}
+
+fn prim_logical_pathname_translations(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("LOGICAL-PATHNAME-TRANSLATIONS requires exactly 1 argument");
+    }
+    let host = logical_host_from_designator(proc, ctx, args[0], "LOGICAL-PATHNAME-TRANSLATIONS")?;
+    ensure_logical_translations_loaded(proc, &host).map_err(|_| {
+        ControlSignal::Error(
+            "LOGICAL-PATHNAME-TRANSLATIONS: no translations found for host".to_string(),
+        )
+    })?;
+    let rules = proc
+        .logical_pathname_translations
+        .get(&host)
+        .cloned()
+        .unwrap_or_default();
+    Ok(logical_translation_rules_to_list(proc, &rules))
+}
+
+fn prim_set_logical_pathname_translations(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 2 {
+        return err_helper("SET-LOGICAL-PATHNAME-TRANSLATIONS requires host and new table");
+    }
+    let host = logical_host_from_designator(
+        proc,
+        ctx,
+        args[0],
+        "LOGICAL-PATHNAME-TRANSLATIONS",
+    )?;
+    let rules = parse_logical_translation_rules(proc, ctx, &host, args[1])?;
+    proc.logical_pathname_translations.insert(host, rules);
+    Ok(args[1])
+}
+
+fn prim_translate_pathname(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() < 3 {
+        return err_helper("TRANSLATE-PATHNAME requires at least 3 arguments");
+    }
+    parse_allow_other_keys_tail(proc, ctx, &args[3..], "TRANSLATE-PATHNAME")?;
+
+    let source = pathname_from_designator(proc, ctx, args[0], "TRANSLATE-PATHNAME")?;
+    let from_wildname = pathname_from_designator(proc, ctx, args[1], "TRANSLATE-PATHNAME")?;
+    let to_wildname = pathname_from_designator(proc, ctx, args[2], "TRANSLATE-PATHNAME")?;
+    let translated = translate_pathname_with_wildcards(&source, &from_wildname, &to_wildname)
+        .ok_or_else(|| ControlSignal::Error("TRANSLATE-PATHNAME: source does not match FROM-WILDNAME".to_string()))?;
+    Ok(alloc_pathname(proc, translated))
+}
+
+fn prim_translate_logical_pathname(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.is_empty() {
+        return err_helper("TRANSLATE-LOGICAL-PATHNAME requires at least 1 argument");
+    }
+    parse_allow_other_keys_tail(
+        proc,
+        ctx,
+        &args[1..],
+        "TRANSLATE-LOGICAL-PATHNAME",
+    )?;
+
+    // Keep object identity for physical pathname objects.
+    if let Some(pn) = node_to_pathname(proc, args[0]) {
+        if pn.host.is_none() {
+            return Ok(args[0]);
+        }
+    }
+
+    let pn = pathname_from_designator(proc, ctx, args[0], "TRANSLATE-LOGICAL-PATHNAME")?;
+    if pn.host.is_none() {
+        return Ok(alloc_pathname(proc, pn));
+    }
+
+    let mapped = translate_logical_pathname_with_tables(proc, &pn, 0)?;
+    Ok(alloc_pathname(proc, mapped))
+}
+
+fn prim_load_logical_pathname_translations(
+    proc: &mut crate::process::Process,
+    ctx: &crate::context::GlobalContext,
+    args: &[NodeId],
+) -> EvalResult {
+    if args.len() != 1 {
+        return err_helper("LOAD-LOGICAL-PATHNAME-TRANSLATIONS requires exactly 1 argument");
+    }
+    let host = logical_host_from_designator(
+        proc,
+        ctx,
+        args[0],
+        "LOAD-LOGICAL-PATHNAME-TRANSLATIONS",
+    )?;
+    ensure_logical_translations_loaded(proc, &host)?;
+    Ok(proc.make_nil())
 }
 
 fn prim_pathname_name(
@@ -2669,7 +3412,7 @@ fn prim_directory(
         return err_helper("DIRECTORY requires exactly 1 argument");
     }
     let mut path = path_from_designator(proc, ctx, args[0], "DIRECTORY")?;
-    path = translate_logical_path_minimal(&path);
+    path = translate_logical_path_minimal(proc, &path)?;
 
     let has_wildcards = path.contains('*') || path.contains('?');
     let mut entries: Vec<String> = Vec::new();
@@ -2723,7 +3466,7 @@ fn prim_delete_file(
         return err_helper("DELETE-FILE requires exactly 1 argument");
     }
     let mut path = path_from_designator(proc, ctx, args[0], "DELETE-FILE")?;
-    path = translate_logical_path_minimal(&path);
+    path = translate_logical_path_minimal(proc, &path)?;
     std::fs::remove_file(&path)
         .map_err(|e| ControlSignal::Error(format!("DELETE-FILE: {}", e)))?;
     Ok(proc.make_t(ctx))
@@ -2738,7 +3481,7 @@ fn prim_probe_file(
         return err_helper("PROBE-FILE requires exactly 1 argument");
     }
     let mut path = path_from_designator(proc, ctx, args[0], "PROBE-FILE")?;
-    path = translate_logical_path_minimal(&path);
+    path = translate_logical_path_minimal(proc, &path)?;
     if std::fs::metadata(&path).is_ok() {
         if let Ok(full) = std::fs::canonicalize(&path) {
             let full_str = full.to_string_lossy().to_string();
@@ -2758,7 +3501,7 @@ fn prim_truename(
         return err_helper("TRUENAME requires exactly 1 argument");
     }
     let mut path = path_from_designator(proc, ctx, args[0], "TRUENAME")?;
-    path = translate_logical_path_minimal(&path);
+    path = translate_logical_path_minimal(proc, &path)?;
     let full = std::fs::canonicalize(&path)
         .map_err(|e| ControlSignal::Error(format!("TRUENAME: {}", e)))?;
     let full_str = full.to_string_lossy().to_string();
@@ -2773,10 +3516,11 @@ fn prim_rename_file(
     if args.len() != 2 {
         return err_helper("RENAME-FILE requires exactly 2 arguments");
     }
+    let defaulted_new_name = pathname_from_designator(proc, ctx, args[1], "RENAME-FILE")?;
     let mut from = path_from_designator(proc, ctx, args[0], "RENAME-FILE")?;
     let mut to = path_from_designator(proc, ctx, args[1], "RENAME-FILE")?;
-    from = translate_logical_path_minimal(&from);
-    to = translate_logical_path_minimal(&to);
+    from = translate_logical_path_minimal(proc, &from)?;
+    to = translate_logical_path_minimal(proc, &to)?;
     std::fs::rename(&from, &to)
         .map_err(|e| ControlSignal::Error(format!("RENAME-FILE: {}", e)))?;
 
@@ -2784,7 +3528,7 @@ fn prim_rename_file(
         .unwrap_or_else(|_| std::path::PathBuf::from(&to))
         .to_string_lossy()
         .to_string();
-    let new_node = alloc_pathname(proc, Pathname::from_namestring(&to));
+    let new_node = alloc_pathname(proc, defaulted_new_name);
     let old_node = alloc_pathname(proc, Pathname::from_namestring(&old_true));
     let new_true_node = alloc_pathname(proc, Pathname::from_namestring(&old_true));
     Ok(set_multiple_values(proc, vec![new_node, old_node, new_true_node]))
@@ -2799,7 +3543,7 @@ fn prim_ensure_directories_exist(
         return err_helper("ENSURE-DIRECTORIES-EXIST requires exactly 1 argument");
     }
     let mut path = path_from_designator(proc, ctx, args[0], "ENSURE-DIRECTORIES-EXIST")?;
-    path = translate_logical_path_minimal(&path);
+    path = translate_logical_path_minimal(proc, &path)?;
     let path_buf = std::path::Path::new(&path);
     let has_trailing_sep = path.ends_with(std::path::MAIN_SEPARATOR);
     let is_dir = path_buf.is_dir();
@@ -3546,6 +4290,14 @@ fn prim_typep(
         "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
             matches!(proc.arena.inner.get_unchecked(obj), Node::Leaf(OpaqueValue::String(_)))
         }
+        "PATHNAME" => matches!(
+            proc.arena.inner.get_unchecked(obj),
+            Node::Leaf(OpaqueValue::Pathname(_))
+        ),
+        "LOGICAL-PATHNAME" => match proc.arena.inner.get_unchecked(obj) {
+            Node::Leaf(OpaqueValue::Pathname(pn)) => pn.host.is_some(),
+            _ => false,
+        },
         "ARRAY" | "SIMPLE-ARRAY" => matches!(
             proc.arena.inner.get_unchecked(obj),
             Node::Leaf(OpaqueValue::VectorHandle(_)) | Node::Leaf(OpaqueValue::String(_))
@@ -15305,7 +16057,7 @@ mod tests {
         let first_sym = node_to_symbol(&proc, first).unwrap();
         let sym_table = globals.symbols.read().unwrap();
         let first_name = sym_table.symbol_name(first_sym).unwrap();
-        assert_eq!(first_name, "ABSOLUTE");
+        assert_eq!(first_name, "RELATIVE");
         let second = string_from_designator(&proc, &globals, items[1]).unwrap();
         assert_eq!(second, "FOO");
 
@@ -15319,6 +16071,234 @@ mod tests {
             string_from_designator(&proc, &globals, ty).unwrap(),
             "LISP"
         );
+    }
+
+    #[test]
+    fn test_logical_pathname_and_translate_logical_pathname() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let logical = alloc_string(&mut proc, "ANSI-TESTS:AUX;foo.lsp".to_string());
+        let lp = prim_logical_pathname(&mut proc, &globals, &[logical]).unwrap();
+        let host = prim_pathname_host(&mut proc, &globals, &[lp]).unwrap();
+        assert_eq!(
+            string_from_designator(&proc, &globals, host).unwrap(),
+            "ANSI-TESTS"
+        );
+
+        let translated = prim_translate_logical_pathname(&mut proc, &globals, &[lp]).unwrap();
+        let out = string_from_designator(&proc, &globals, translated).unwrap();
+        assert!(out.ends_with("tests/ansi-test/auxiliary/foo.lsp"));
+    }
+
+    #[test]
+    fn test_logical_pathname_requires_host() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let not_logical = alloc_string(&mut proc, "foo.txt".to_string());
+        let err = prim_logical_pathname(&mut proc, &globals, &[not_logical]).unwrap_err();
+        match err {
+            ControlSignal::Error(msg) => {
+                assert!(msg.contains("LOGICAL-PATHNAME"));
+            }
+            other => panic!("Expected LOGICAL-PATHNAME error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_translate_logical_pathname_physical_identity() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let physical = alloc_pathname(&mut proc, Pathname::from_namestring("/tmp/a.lsp"));
+        let translated = prim_translate_logical_pathname(&mut proc, &globals, &[physical]).unwrap();
+        assert_eq!(translated, physical);
+    }
+
+    #[test]
+    fn test_load_logical_pathname_translations_minimal_hosts() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let host = alloc_string(&mut proc, "CLTESTROOT".to_string());
+        let res = prim_load_logical_pathname_translations(&mut proc, &globals, &[host]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(res), Node::Leaf(OpaqueValue::Nil)));
+
+        let unknown = alloc_string(&mut proc, "NO-SUCH-HOST".to_string());
+        assert!(prim_load_logical_pathname_translations(&mut proc, &globals, &[unknown]).is_err());
+    }
+
+    #[test]
+    fn test_logical_pathname_translations_set_get_and_translate() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let host = alloc_string(&mut proc, "MYHOST".to_string());
+        let from = alloc_string(&mut proc, "**;*.*.*".to_string());
+        let to = alloc_string(&mut proc, "tmp/myhost/**/*.*".to_string());
+        let pair = proc.make_list(&[from, to]);
+        let table = proc.make_list(&[pair]);
+
+        prim_set_logical_pathname_translations(&mut proc, &globals, &[host, table]).unwrap();
+        let got = prim_logical_pathname_translations(&mut proc, &globals, &[host]).unwrap();
+        let got_rows = list_to_vec_opt(&proc, got).unwrap();
+        assert_eq!(got_rows.len(), 1);
+
+        let logical = alloc_string(&mut proc, "MYHOST:foo;bar.txt".to_string());
+        let translated = prim_translate_logical_pathname(&mut proc, &globals, &[logical]).unwrap();
+        let out = string_from_designator(&proc, &globals, translated)
+            .unwrap()
+            .replace('\\', "/");
+        assert!(out.contains("tmp/myhost"));
+        assert!(out.ends_with("foo/bar.txt"));
+    }
+
+    #[test]
+    fn test_translate_logical_pathname_recursive_host_rules() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let host_a = alloc_string(&mut proc, "AHOST".to_string());
+        let a_from = alloc_string(&mut proc, "**;*.*.*".to_string());
+        let a_to = alloc_string(&mut proc, "BHOST:**;*.*.*".to_string());
+        let a_pair = proc.make_list(&[a_from, a_to]);
+        let a_table = proc.make_list(&[a_pair]);
+        prim_set_logical_pathname_translations(&mut proc, &globals, &[host_a, a_table]).unwrap();
+
+        let host_b = alloc_string(&mut proc, "BHOST".to_string());
+        let b_from = alloc_string(&mut proc, "**;*.*.*".to_string());
+        let b_to = alloc_string(&mut proc, "tmp/recursive/**/*.*".to_string());
+        let b_pair = proc.make_list(&[b_from, b_to]);
+        let b_table = proc.make_list(&[b_pair]);
+        prim_set_logical_pathname_translations(&mut proc, &globals, &[host_b, b_table]).unwrap();
+
+        let logical = alloc_string(&mut proc, "AHOST:foo;baz.txt".to_string());
+        let translated = prim_translate_logical_pathname(&mut proc, &globals, &[logical]).unwrap();
+        let out = string_from_designator(&proc, &globals, translated)
+            .unwrap()
+            .replace('\\', "/");
+        assert!(out.contains("tmp/recursive"));
+        assert!(out.ends_with("foo/baz.txt"));
+    }
+
+    #[test]
+    fn test_translate_pathname_wildcards() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let source = alloc_string(&mut proc, "SYS:src;unit;a.lsp.newest".to_string());
+        let from = alloc_string(&mut proc, "SYS:**;*.*.*".to_string());
+        let to = alloc_string(&mut proc, "tmp/out/**/*.*".to_string());
+        let translated = prim_translate_pathname(&mut proc, &globals, &[source, from, to]).unwrap();
+        let out = string_from_designator(&proc, &globals, translated)
+            .unwrap()
+            .replace('\\', "/");
+        assert!(out.contains("tmp/out"));
+        assert!(out.ends_with("src/unit/a.lsp"));
+    }
+
+    #[test]
+    fn test_typep_pathname_and_logical_pathname() {
+        let mut globals = crate::context::GlobalContext::new();
+        let mut proc = crate::process::Process::new(
+            crate::process::Pid {
+                node: 0,
+                id: 1,
+                serial: 0,
+            },
+            crate::types::NodeId(0),
+            &mut globals,
+        );
+
+        let pn = alloc_pathname(&mut proc, Pathname::from_namestring("/tmp/a.lsp"));
+        let lpn = alloc_pathname(&mut proc, Pathname::from_namestring("CLTEST:FOO.BAR"));
+
+        let pathname_sym = globals.symbols.write().unwrap().intern_in("PATHNAME", PackageId(1));
+        let logical_pathname_sym = globals
+            .symbols
+            .write()
+            .unwrap()
+            .intern_in("LOGICAL-PATHNAME", PackageId(1));
+        let pathname_type = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(pathname_sym.0)));
+        let logical_type = proc
+            .arena
+            .inner
+            .alloc(Node::Leaf(OpaqueValue::Symbol(logical_pathname_sym.0)));
+
+        let pn_is_pathname = prim_typep(&mut proc, &globals, &[pn, pathname_type]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(pn_is_pathname),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
+
+        let pn_is_logical = prim_typep(&mut proc, &globals, &[pn, logical_type]).unwrap();
+        assert!(matches!(proc.arena.inner.get_unchecked(pn_is_logical), Node::Leaf(OpaqueValue::Nil)));
+
+        let lpn_is_logical = prim_typep(&mut proc, &globals, &[lpn, logical_type]).unwrap();
+        assert!(matches!(
+            proc.arena.inner.get_unchecked(lpn_is_logical),
+            Node::Leaf(OpaqueValue::Symbol(id)) if *id == globals.t_sym.0
+        ));
     }
 
     #[test]
